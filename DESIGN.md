@@ -1,0 +1,287 @@
+# portagenty — DESIGN
+
+Architectural deep-dive. Companion to [README.md](./README.md) (vision) and [ROADMAP.md](./ROADMAP.md) (sequencing). This file is the source of truth for terminology and architectural decisions.
+
+Status: pre-code design. Schemas shown here are sketches, not committed formats.
+
+---
+
+**Table of contents**
+
+1. Vocabulary
+2. The three-tier config model
+3. Workspace file: discovery and shape
+4. State model — the "split" approach
+5. Multiplexer adapters
+6. Launch model — workspace-scoped, lazy
+7. Agent integration — agnostic core
+8. Platform notes
+9. Untracked session adoption
+10. Termux and small-screen TUI constraints
+11. WSL ↔ native Windows sync — scope
+12. Explicitly out of scope
+
+---
+
+## 1. Vocabulary
+
+These terms mean exactly one thing across the whole project. If you find yourself using one of them loosely, re-read this section.
+
+- **Project** — a directory on disk with code or content you work on. Registered with portagenty at any of three tiers (global, workspace, per-project). A project is identified by its filesystem path.
+- **Session** — one unit of execution: a shell, a process, an agent. Defined by *name + cwd + command*. A session belongs to a workspace.
+- **Workspace** — a named, curated view over one or more projects plus the sessions you use to work on them. A first-class file on disk, designed to be committable. A workspace is where "hierarchy on top of hierarchy" happens.
+- **View** — a specific ordering/filtering of projects presented in the TUI. v1 ships three: Recently Opened (LRU), Tags, Custom Groups. Views are composable with workspaces.
+- **Multiplexer** (mpx) — tmux, zellij, or WezTerm. The thing that actually owns terminal panes and keeps them alive across detaches. portagenty drives it; it does not replace it.
+- **Adapter** — code inside portagenty that speaks to one specific multiplexer. v1 will ship a tmux adapter first; zellij and WezTerm adapters follow. (A future "agent adapter" concept is deferred — see §7.)
+- **Profile** — *deferred to v1.x.* A named bundle of session defaults (shell, env, mpx settings) that multiple sessions can inherit. Lifted from `vscode-terminal-workspaces`. Not in v1.
+
+---
+
+## 2. The three-tier config model
+
+Project registration and session definitions can be declared at three layers. Any tier can register something; the TUI merges them.
+
+| Tier | Location | Typical contents | Committable? |
+|---|---|---|---|
+| **Global** | `$XDG_CONFIG_HOME/portagenty/config.toml` | Known projects you want visible everywhere; default multiplexer; user preferences. | No — personal/machine |
+| **Workspace** | A `*.portagenty.toml` file anywhere | The workspace itself: its projects, sessions, tags, custom groups. | **Yes** — primary use case |
+| **Per-project** | `portagenty.toml` at a project root | Sessions defined by the project's own repo ("start dev server" etc.) so anyone cloning gets them. | **Yes** |
+
+**Merge rules** (v1, may evolve):
+
+1. Global registry lists projects; per-project files under those paths augment with sessions.
+2. When a workspace file is "entered," its session list replaces/augments what the global+per-project combination would have shown. The workspace is the active view.
+3. Conflicts (two tiers defining a session with the same name) resolve: **workspace wins over per-project wins over global**. Closer to the user's current intent = higher priority.
+
+**Example** (sketched, not final):
+
+```
+# Global:  ~/.config/portagenty/config.toml
+default_multiplexer = "tmux"
+
+[[project]]
+path = "~/code/portagenty"
+tags = ["rust", "agentic"]
+
+[[project]]
+path = "~/code/cyberbase"
+tags = ["obsidian"]
+```
+
+```
+# Workspace: ~/workspaces/agentic-stuff.portagenty.toml
+name = "Agentic stuff"
+multiplexer = "zellij"   # overrides global default
+groups = [["portagenty", "agentic-workflow-and-tech-stack"]]
+
+[[session]]
+project = "~/code/portagenty"
+name = "claude"
+cwd = "."
+command = "cc"
+```
+
+```
+# Per-project: ~/code/portagenty/portagenty.toml
+[[session]]
+name = "tests"
+cwd = "."
+command = "cargo watch -x test"
+```
+
+---
+
+## 3. Workspace file: discovery and shape
+
+Workspace files are the interesting layer. They're how you commit a workspace definition so someone else (or future-you on another machine) can pick it up.
+
+**Three ways to find them, all coexist:**
+
+1. **Walk-up from `$PWD`** — like `.git` discovery. Starting from where you invoke `pa`, walk upward looking for a file matching `*.portagenty.toml`. First match wins. Good for "I'm `cd`'d into my workspace; just use this one."
+2. **Global registry** — the TUI home screen shows workspaces listed in `~/.config/portagenty/config.toml`. These are the workspaces you use often.
+3. **Explicit path** — `pa open ./path/to/foo.portagenty.toml`. For scripting, for trying someone else's workspace without registering it.
+
+**Opportunistic search** — if `fd` (Linux/mac/Windows) or Everything CLI (Windows) is on `PATH`, `pa` may use them for fast recursive discovery inside the TUI's "find workspace" action. Detect at runtime; never hard-depend.
+
+**Commitability rules** — a workspace file is designed to be checked in. To make that safe:
+
+- No absolute paths. Project references use paths relative to the workspace file, or a path template like `${HOME}/code/foo`.
+- No LRU, no last-attached timestamps, no machine-specific state. Those live in the split state store (§4).
+- No usernames, API keys, or machine identifiers.
+
+If a user needs machine-specific overrides (say, two laptops with different project locations), the pattern is: workspace file committed to git, plus a tiny local override file alongside it (gitignored). v1 ships without formal support for overrides; they'll be added if needed.
+
+---
+
+## 4. State model — the "split" approach
+
+portagenty splits what it knows into two categories:
+
+**Durable, user-authored**: lives in TOML files (§2).
+
+- Project registrations
+- Workspace definitions
+- Session definitions
+- Tags, groups, preferences
+- Multiplexer choices
+
+**Volatile, machine/time-local**: lives in `$XDG_STATE_HOME/portagenty/state.toml` (or equivalent on each OS).
+
+- LRU of recently opened workspaces / projects / sessions
+- Last-attached timestamps
+- User's most recent TUI view preference
+
+**Live, rebuilt on every run**: not persisted anywhere.
+
+- Which tmux/zellij/WezTerm sessions are currently running. Obtained by polling the mpx CLI at startup and on refresh. This is how untracked sessions get surfaced (see §5).
+- Current focus / selection in the TUI.
+
+**Why no SQLite?** v1 doesn't need query performance. It needs inspectability, simple atomic writes, and no migration pain. A SQLite file adds a library, a schema, a migration story, and makes the state opaque. If v2+ ever needs cross-process concurrency or fast queries across thousands of tagged projects, revisit. Until then: files.
+
+**Concurrency** — if someone runs two `pa` TUIs at once, the volatile state file is subject to last-writer-wins on LRU updates. That's fine. If it ever causes user-visible corruption, add advisory file locks. Don't pre-optimize.
+
+---
+
+## 5. Multiplexer adapters
+
+v1 ships one adapter; v1.x adds two more. All three should present the same core interface to the rest of portagenty, with capability flags for features not every mpx supports.
+
+**Core interface** (conceptual, not Rust API):
+
+- `list_sessions()` — return live sessions the adapter knows about, including ones portagenty didn't launch.
+- `session_exists(name)` / `attach(name)` / `create_and_attach(name, cwd, command)` — the attach-or-create loop.
+- `kill(name)` — close a session.
+- `detach_current()` — let user step back to the TUI.
+- `export(workspace) -> artifact` — optional; produces a native artifact (KDL layout for zellij, a shell script for tmux, whatever for WezTerm).
+
+**tmux** — the reference adapter. The stable baseline.
+
+- Session-per-workspace, window-per-session model.
+- Attach-or-create is a shell pipe: `tmux has-session -t NAME 2>/dev/null && tmux attach-session -t NAME || tmux new-session -s NAME -c CWD -d`.
+- Session/window naming: sanitize `[^a-zA-Z0-9_-]` → `_`, clamp at 50 chars. Match the VS Code extension's approach so existing sessions carry over.
+- Untracked session adoption: `tmux list-sessions -F '#{session_name}|#{session_path}|#{session_attached}'`.
+
+**zellij** — added in v1.x.
+
+- Zellij's model is different: layouts (KDL) define tabs + panes declaratively. Opening a layout spins everything up at once — fights our "lazy" default.
+- v1.x adapter runs imperative where possible (`zellij attach`, `zellij action new-tab`, `zellij action new-pane`). For workspaces where the user wants "all at once," `pa export` produces a KDL layout they can open normally.
+- Works better with OpenCode than tmux does, per the agentic-workflow README.
+
+**WezTerm** — added in v1.x, with honest caveats.
+
+- WezTerm has a built-in mux server reachable via `wezterm cli`. The only modern, cross-platform, native-on-Windows mpx with persistent panes.
+- **Known limitations**: its session-attach story is weaker than tmux's. Detaching and reattaching from arbitrary clients is rougher; some flows that feel seamless in tmux require explicit spawn/list plumbing in WezTerm. Users should expect WezTerm to be tier-1 in coverage, not tier-1 in polish. This will be called out in the TUI when WezTerm is the active adapter.
+
+**Mpx choice resolution**:
+
+1. If the current workspace declares `multiplexer = "..."`, use that.
+2. Else use the global default from `config.toml`.
+3. Else probe: if inside a tmux/zellij/WezTerm process already, use that. Else fall back to tmux if installed, then zellij, then WezTerm.
+
+---
+
+## 6. Launch model — workspace-scoped, lazy
+
+"Entering" a workspace is cheap. It does not start any processes. It loads the session definitions, checks the multiplexer for live sessions matching those names, and draws the TUI.
+
+When the user selects a session and hits Enter:
+
+1. If the mpx already has a session with that sanitized name → attach to it. (Covers both "resume something I left running" and "adopt an untracked session.")
+2. If not → create it with the session's `cwd` + `command`, then attach.
+
+This is imperative, on-demand. A workspace with 20 sessions defined never costs you 20 processes worth of startup. It costs you one process when you open one session.
+
+**Eager / "jump-in" flag** — a v1.x feature: `pa launch <workspace> --eager` or a config key that tells portagenty to spawn every session in a workspace at entry time, so long-running things (agents, dev servers) are warm by the time you tab to them. Off by default.
+
+---
+
+## 7. Agent integration — agnostic core
+
+v1 does not know what Claude Code is. A session is a command; `command = "claude"` and `command = "vim"` are indistinguishable to the core.
+
+That choice is deliberate. It's what keeps portagenty durable as the agent ecosystem shifts: new CLIs (Aider, Codex, something-else-in-six-months) don't require core changes. You just write a new session.
+
+An optional `kind:` field on a session can unlock niceties later. Sketch:
+
+```
+[[session]]
+name = "claude"
+cwd = "."
+command = "cc"
+kind = "claude-code"    # v1.x hook; ignored in v1
+```
+
+Planned `kind:` values: `claude-code`, `opencode`, `shell`, `editor`, `dev-server`. Effects (when implemented): agent-running indicators in the TUI, smart resume (`--continue` flags), session-coloring.
+
+A full plugin runtime — where third-party adapters register themselves via some extension mechanism — is a v2+ question. Not a v1 problem.
+
+---
+
+## 8. Platform notes
+
+| Platform | mpx options | Notes |
+|---|---|---|
+| **Linux** | tmux ✅, zellij ✅, WezTerm ✅ | Primary dev environment. Everything should just work. |
+| **macOS** | tmux ✅, zellij ✅, WezTerm ✅ | Same as Linux. |
+| **WSL on Windows** | tmux ✅, zellij ✅ | For users running portagenty inside WSL. WezTerm not the obvious choice here. |
+| **Windows native** | WezTerm ✅, tmux ❌, zellij ⚠️ | tmux doesn't run natively; zellij is unstable on Windows. WezTerm is the story. WezTerm's attach limitations (§5) apply here. |
+
+If the user's chosen multiplexer isn't installed, portagenty exits with a clear error and a link to installation instructions. It doesn't silently fall back to running raw terminals — that would hide the problem.
+
+---
+
+## 9. Untracked session adoption
+
+A central feature, carried over from `vscode-terminal-workspaces`.
+
+At startup and on TUI refresh, each active adapter is asked for its live sessions. Any session not referenced by the current workspace's definitions is surfaced in a distinct **"Untracked"** area of the TUI. From there the user can:
+
+- **Attach** — same as attaching to a known session.
+- **Import** — add the session's `cwd` + a derived command guess as a new session in the current workspace.
+- **Ignore** — dismiss from the view until next refresh.
+
+This bridges the gap between "what portagenty thinks is going on" and "what's actually running." It's how someone who started a tmux session outside portagenty still gets it in their TUI.
+
+---
+
+## 10. Termux and small-screen TUI constraints
+
+A primary access path for this tool is **Termux on Android → SSH → desktop → zellij → `pa`**. Portagenty never runs *on* Termux; it renders *through* it. But Termux imposes real constraints on what the TUI can assume:
+
+**Keyboard reality**: Termux has no physical Ctrl/Alt/Meta. The on-screen Extra Keys row provides Ctrl/Esc/Tab/arrows as taps (each is a second tap on top of any letter). Volume-Down often maps to Ctrl, Volume-Up to Esc, but not everyone configures it. Flow control (Ctrl+S / Ctrl+Q) freezes the terminal if not disabled.
+
+**Screen reality**: 15–25 visible rows on a typical phone in portrait. Narrow width. Mouse/touch is imprecise and awkward.
+
+**Design rules that follow from this**:
+
+- **Single-letter keybindings for all common actions.** Vim-flavored because the primitives are letters. `j`/`k` navigate, `Enter` opens, `q` quits, `/` searches, `?` shows help, `gg`/`G` jump, `tab` switches pane when present.
+- **Avoid Alt/Meta in default bindings.** Any Alt-dependent shortcut is second-class and mirrored by a non-Alt equivalent.
+- **`Esc` is always "back one level" or "cancel."** Never "close the app."
+- **Responsive layout by `$LINES`/`$COLUMNS`.** Single-column list view is the default. Two-pane (list + detail) is opt-in for wider terminals and kicks in automatically at a threshold.
+- **Mouse is never required.** Every action reachable by keys.
+- **Short text labels, column eliding.** Do not hard-assume 80 columns.
+- **Plain ANSI only.** No sixel, no alternate-screen tricks that mangle through SSH + zellij + Termux.
+- **Assume flow control is disabled.** Call it out in setup docs; do not rely on Ctrl+S for anything.
+
+The net effect: a TUI that feels generous on a desktop but remains one-handed-on-a-phone usable over SSH. That's the bar.
+
+## 11. WSL ↔ native Windows sync — scope
+
+Claude Code stores its sessions under `~/.claude/projects/<path-encoded-cwd>/`, where the encoding differs between environments (`-mnt-c-Users-X-project` on WSL, `C--Users-X-project` on PowerShell). `--resume` and `--continue` only find sessions from the current environment's encoding. Similarly, portagenty's global config under `$XDG_CONFIG_HOME/portagenty/` resolves to different paths on WSL vs. Windows native.
+
+**portagenty's position**:
+
+- **Workspace files and per-project `portagenty.toml` are designed to commit** and use relative paths (§2, §3). They cross environments trivially via git. No sync work needed there.
+- **Global config is machine-local by design.** Users who want the same registry across WSL and Windows native handle it themselves (Syncthing, dotfiles repo, symlink into a shared mount). Portagenty does not ship a sync daemon.
+- **Claude-session sync is not portagenty's problem to solve.** It's a Claude Code storage concern. If/when a tool solves it well, portagenty can reference it from docs but never embeds the logic.
+
+A **future `kind:` hint plus adapter** (see §7 and ROADMAP v2+) could, in principle, know how to present "your most-recent Claude session from the other environment" — but that's a consumer of whatever cross-env session sync tool exists, not a replacement for it. Path-encoding translation belongs in a purpose-built tool like `claudecode-project-sync` (in `agentic-workflow-and-tech-stack`) or a successor that's had more eyes on it than we have.
+
+## 12. Explicitly out of scope
+
+- **Scaffolding**. A tool for that exists (`agentic-workflow-and-tech-stack`'s `setup.sh`). Integration with a purpose-built scaffolder may happen later via a separate `pa new` subcommand that shells out.
+- **Remote-machine awareness**. If you want portagenty on another machine, SSH in and run `pa` there. No mesh, no discovery, no RPC.
+- **Agent-API wrapping**. Claude Code / OpenCode are launched as subprocesses. portagenty never speaks their APIs.
+- **GUI / web UI**. Terminal only.
+- **Syncing across machines**. Rely on git (for workspace files) and Syncthing/rsync (for anything else the user wants to sync). Not portagenty's problem.
+- **Supervisor-mode agent management**. portagenty launches agents; it does not restart them, monitor their logs, or gather telemetry.
