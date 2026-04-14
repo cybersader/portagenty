@@ -1,0 +1,8 @@
+node_modules/
+.astro/
+dist/
+.bun/
+*.log
+.DS_Store
+.env
+.env.local

@@ -1,0 +1,44 @@
+---
+title: portagenty
+description: Portable, terminal-native launcher for agent workspaces.
+template: splash
+hero:
+  tagline: A workspace despite the limitations of a hierarchical filesystem. Single static Rust binary, terminal-native, no GUI ever.
+  actions:
+    - text: Get started
+      link: /portagenty/getting-started/installation/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/cybersader/portagenty
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+<CardGrid>
+  <Card title="One binary, three platforms" icon="rocket">
+    Linux, macOS, and Windows native. `scp` it to a new machine and run.
+    No runtime to install.
+  </Card>
+  <Card title="Hierarchy on top of hierarchy" icon="open-book">
+    Projects live wherever they live on disk. Workspaces are alternative
+    views — recent, tagged, hand-curated — over the same projects.
+  </Card>
+  <Card title="Multiplexer-aware" icon="setting">
+    tmux is the v1 reference adapter. zellij and WezTerm follow in v1.x.
+    Each adapter is an attach-or-create orchestrator, never a replacement.
+  </Card>
+  <Card title="Agnostic core" icon="puzzle">
+    A session is `name + cwd + command`. Claude Code, OpenCode, vim,
+    htop — all the same to portagenty's core.
+  </Card>
+</CardGrid>
+
+## Status
+
+**Pre-release.** v1 is under active construction. See the
+[roadmap](https://github.com/cybersader/portagenty/blob/main/ROADMAP.md)
+for what lands when. The
+[design doc](https://github.com/cybersader/portagenty/blob/main/DESIGN.md)
+is the source of truth for terminology and architecture.

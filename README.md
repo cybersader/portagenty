@@ -2,7 +2,20 @@
 
 A portable, terminal-native launcher for agent workspaces. Written in Rust. Binary name: `pa`.
 
-> Status: vision + architecture. No code yet. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what gets built when.
+> Status: pre-release, **chunk A bootstrap landed**. Cargo project, CI, docs site, and module skeleton are in place; behavior is not. The TUI and tmux adapter come in chunks B–D. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what gets built when. Docs site: <https://cybersader.github.io/portagenty>.
+
+## Building (development)
+
+```sh
+cargo build                  # debug build
+cargo nextest run            # fast unit + integration tests
+bacon test                   # watch loop, sub-second feedback
+cargo build --release        # release binary at target/release/pa
+
+cd docs && bun install && bun run dev   # docs site at http://localhost:4321
+```
+
+CI runs `fmt`, `clippy -D warnings`, `nextest`, and `build` on Linux + macOS for every push and PR. Docs deploy to GitHub Pages on any push to `main` that touches `docs/**`.
 
 ## The itch
 

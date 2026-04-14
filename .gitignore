@@ -1,0 +1,26 @@
+# Rust
+target/
+Cargo.lock.bak
+*.pdb
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# insta snapshot review files
+*.pending-snap
+
+# Docs (Astro / Bun)
+docs/node_modules/
+docs/.astro/
+docs/dist/
+docs/.bun/
+docs/bun.lockb.bak
+
+# Misc
+*.log
+.env
+.env.local
