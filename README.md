@@ -2,7 +2,7 @@
 
 A portable, terminal-native launcher for agent workspaces. Written in Rust. Binary name: `pa`.
 
-> Status: pre-release, **chunk A bootstrap landed**. Cargo project, CI, docs site, and module skeleton are in place; behavior is not. The TUI and tmux adapter come in chunks B–D. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what gets built when. Docs site: <https://cybersader.github.io/portagenty>.
+> Status: pre-release, **chunk A bootstrap landed**. Cargo project, CI, docs site, and module skeleton are in place; behavior is not. The TUI and tmux adapter come in chunks B–D. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what gets built when. The repo is private for now; docs are served locally / over Tailscale (see below).
 
 ## Building (development)
 
@@ -11,11 +11,24 @@ cargo build                  # debug build
 cargo nextest run            # fast unit + integration tests
 bacon test                   # watch loop, sub-second feedback
 cargo build --release        # release binary at target/release/pa
-
-cd docs && bun install && bun run dev   # docs site at http://localhost:4321
 ```
 
-CI runs `fmt`, `clippy -D warnings`, `nextest`, and `build` on Linux + macOS for every push and PR. Docs deploy to GitHub Pages on any push to `main` that touches `docs/**`.
+## Docs site (local + Tailscale share)
+
+```sh
+cd docs
+bun install                  # first time only
+
+bun run serve                # interactive menu (dev / preview / build / tailscale / cloudflare)
+bun run serve:dev            # Astro dev with --host 0.0.0.0 (LAN/Tailscale-bindable)
+bun run serve:tailscale      # serves via `tailscale serve` and prints the share URL + tailnet IP
+bun run serve:cloudflare     # public Cloudflare Tunnel (when you actually want it public)
+bun run build                # static build → docs/dist
+```
+
+The `serve.mjs` orchestrator handles the WSL ↔ Windows rollup-binary contamination problem (auto-reinstalls when it detects a wrong-OS install). Pattern lifted from `cybersader/crosswalker`.
+
+CI runs `fmt`, `clippy -D warnings`, `nextest`, and `build` on Linux + macOS for every push and PR. A separate `docs-build` workflow verifies the docs build on `docs/**` changes — no deploy, since the repo is private.
 
 ## The itch
 

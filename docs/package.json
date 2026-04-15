@@ -5,9 +5,17 @@
   "private": true,
   "scripts": {
     "dev": "astro dev",
+    "dev:host": "astro dev --host 0.0.0.0",
     "start": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
+    "preview:host": "astro preview --host 0.0.0.0",
+    "serve": "bun scripts/serve.mjs",
+    "serve:dev": "bun scripts/serve.mjs dev",
+    "serve:preview": "bun scripts/serve.mjs preview",
+    "serve:build": "bun scripts/serve.mjs build",
+    "serve:tailscale": "bun scripts/serve.mjs tailscale",
+    "serve:cloudflare": "bun scripts/serve.mjs cloudflare",
     "astro": "astro"
   },
   "dependencies": {

@@ -6,8 +6,19 @@ import starlightThemeFlexoki from "starlight-theme-flexoki";
 
 // https://astro.build/config
 export default defineConfig({
+  // The repo is private; docs are served locally / over Tailscale via
+  // `bun scripts/serve.mjs`. `site` and `base` are kept as the eventual
+  // public URL for when the project goes public; harmless if unused.
   site: "https://cybersader.github.io",
   base: "/portagenty",
+  vite: {
+    server: {
+      // Allow access from Docker / Tailscale / LAN / cross-machine previews.
+      // Vite 6+ blocks non-localhost Host headers by default — this opens it
+      // back up. Safe for local dev only; production builds are static files.
+      allowedHosts: true,
+    },
+  },
   integrations: [
     starlight({
       title: "portagenty",

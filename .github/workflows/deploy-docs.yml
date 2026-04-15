@@ -1,4 +1,9 @@
-name: deploy-docs
+name: docs-build
+
+# This repo is private and the docs site is served locally / over Tailscale
+# via `cd docs && bun run serve` (see docs/scripts/serve.mjs). This workflow
+# only verifies that the docs build doesn't break on changes — no deploy.
+# When the repo goes public, swap this for an actual Pages deploy job.
 
 on:
   push:
@@ -6,16 +11,10 @@ on:
     paths:
       - "docs/**"
       - ".github/workflows/deploy-docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
   workflow_dispatch:
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: deploy-docs
-  cancel-in-progress: true
 
 jobs:
   build:
@@ -25,22 +24,11 @@ jobs:
         working-directory: docs
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
       - run: bun run build
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs/dist
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
