@@ -69,6 +69,16 @@ enum PickerPending {
     DeleteFile(PathBuf),
 }
 
+/// Sticky info modal contents. Distinct from `PickerPending` because
+/// info modals are non-destructive and dismissed without a y/N
+/// classifier.
+#[derive(Debug, Clone)]
+struct InfoModal {
+    title: String,
+    /// Pre-rendered lines so callers can decide colors.
+    lines: Vec<Line<'static>>,
+}
+
 /// Run the picker inside an already-initialized ratatui terminal.
 /// Terminal init + restore stay with the caller so a single
 /// `ratatui::init()` handles both the picker and the session-list
@@ -83,6 +93,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
 
     let mut help_open = false;
     let mut pending: Option<PickerPending> = None;
+    let mut info: Option<InfoModal> = None;
     let mut status = StatusLine::default();
 
     loop {
@@ -96,6 +107,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                 &mut state,
                 help_open,
                 &pending,
+                &info,
                 &status.text,
             )
         })?;
@@ -112,6 +124,12 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
         // Help overlay: any key closes it. No passthrough.
         if help_open {
             help_open = false;
+            continue;
+        }
+        // Info modal: any key closes it. No passthrough — accidental
+        // Enter shouldn't open the highlighted workspace.
+        if info.is_some() {
+            info = None;
             continue;
         }
         // Confirm modal: divert keys.
@@ -177,7 +195,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             }
             (KeyCode::Char('r'), _) => {
                 if let Some(path) = selected_workspace(&workspaces, &state) {
-                    status.set(format!("path: {}", path.display()));
+                    info = Some(build_reveal_modal(&path));
                 } else {
                     status.set("r: live-sessions row has no file path".into());
                 }
@@ -200,6 +218,61 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             }
             _ => {}
         }
+    }
+}
+
+/// Build the "reveal path" info modal. Auto-attempts to copy the
+/// path to the system clipboard so users can paste it elsewhere
+/// (especially mobile, where long-press selection inside the TUI
+/// is fiddly).
+fn build_reveal_modal(path: &std::path::Path) -> InfoModal {
+    let path_str = path.display().to_string();
+    let copy_result = crate::clipboard::copy(&path_str);
+    let copy_line = match copy_result {
+        Ok(tool) => Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "✓ copied",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" to clipboard via `{tool}`")),
+        ]),
+        Err(e) => Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "couldn't copy:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                e.to_string().lines().next().unwrap_or("").to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
+    };
+    InfoModal {
+        title: "Workspace path".into(),
+        lines: vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(path_str, Style::default().add_modifier(Modifier::BOLD)),
+            ]),
+            Line::raw(""),
+            copy_line,
+            Line::raw(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Press any key (Esc / q / Enter) to close.",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]),
+        ],
     }
 }
 
@@ -267,6 +340,7 @@ fn render(
     state: &mut ListState,
     help_open: bool,
     pending: &Option<PickerPending>,
+    info: &Option<InfoModal>,
     status: &Option<String>,
 ) {
     let area = frame.area();
@@ -408,6 +482,10 @@ fn render(
     if let Some(p) = pending {
         let (title, body) = picker_confirm_copy(p);
         crate::tui::confirm::render(frame, area, &title, &body);
+    }
+
+    if let Some(modal) = info {
+        crate::tui::confirm::render_info(frame, area, &modal.title, modal.lines.clone());
     }
 
     if help_open {

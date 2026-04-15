@@ -37,6 +37,45 @@ pub fn classify(code: crossterm::event::KeyCode) -> ConfirmKey {
     }
 }
 
+/// Render a non-destructive *info* modal — same centered, bordered
+/// presentation as the confirm modal but without the y/N prompt.
+/// Caller decides what dismisses it (typically Esc / q / any key).
+/// Used for "reveal path" so users can long-press to select on
+/// mobile without the modal vanishing under them.
+pub fn render_info(frame: &mut Frame<'_>, area: Rect, title: &str, body: Vec<Line<'static>>) {
+    let w = area.width;
+    let h = area.height;
+    let overlay_w = w.saturating_sub(4).clamp(24, 70);
+    // 2 borders + body + a couple of spacer lines.
+    let want_h: u16 = (body.len() as u16) + 4;
+    let overlay_h = want_h.min(h.saturating_sub(2)).max(5);
+    let x = area.x + (w.saturating_sub(overlay_w)) / 2;
+    let y = area.y + (h.saturating_sub(overlay_h)) / 2;
+    let region = Rect {
+        x,
+        y,
+        width: overlay_w,
+        height: overlay_h,
+    };
+
+    frame.render_widget(Clear, region);
+
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    frame.render_widget(
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        region,
+    );
+}
+
 /// Render a confirm modal centered in `area`. `title` is short (fits
 /// in the border's title slot); `body` is the 1–3-sentence description
 /// of what's about to happen. The prompt line is added automatically.

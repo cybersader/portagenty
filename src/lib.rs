@@ -5,6 +5,7 @@
 //! skeleton placeholders and will be filled in subsequent chunks.
 
 pub mod cli;
+pub mod clipboard;
 pub mod config;
 pub mod domain;
 pub mod export;
