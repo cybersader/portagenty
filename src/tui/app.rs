@@ -210,12 +210,18 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
 
+        // Column header is only useful at widths where we render
+        // columns; narrow "card" mode has no columns to label.
+        let show_col_header = area.width >= 60;
+        let header_h: u16 = if show_col_header { 1 } else { 0 };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
+                Constraint::Length(1),        // title
+                Constraint::Length(header_h), // column header
+                Constraint::Min(0),           // list
+                Constraint::Length(1),        // footer
             ])
             .split(area);
 
@@ -244,12 +250,20 @@ impl App {
         let header = Paragraph::new(title).style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_widget(header, chunks[0]);
 
-        self.render_session_list(frame, chunks[1]);
+        if show_col_header {
+            let col_header = column_header_line(area.width);
+            frame.render_widget(
+                Paragraph::new(col_header).style(Style::default().add_modifier(Modifier::DIM)),
+                chunks[1],
+            );
+        }
+
+        self.render_session_list(frame, chunks[2]);
 
         let footer_text = footer_for_width(area.width);
         let footer =
             Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
-        frame.render_widget(footer, chunks[2]);
+        frame.render_widget(footer, chunks[3]);
     }
 
     fn render_session_list(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -341,6 +355,55 @@ fn row_list_item(
     // marker when the session has a kind hint.
     let (kind_glyph, kind_style) = kind_display(row.kind);
 
+    // Narrow: render each row as a two-line "card". Line 1 is the
+    // essentials (marker + name + status tag). Line 2 is a dim,
+    // indented detail line showing command and/or cwd. User never has
+    // to guess what a cramped column means because the detail line
+    // calls each piece out explicitly.
+    if width < 60 {
+        let line1 = {
+            let mut s: Vec<Span<'static>> = Vec::with_capacity(8);
+            s.push(Span::raw(" "));
+            s.push(Span::styled(row.state.marker().to_string(), marker_style));
+            s.push(Span::raw(" "));
+            if let Some(glyph) = kind_glyph {
+                s.push(Span::styled(glyph.to_string(), kind_style));
+                s.push(Span::raw(" "));
+            } else if reserve_kind_space {
+                s.push(Span::raw("  "));
+            }
+            s.push(Span::styled(
+                row.display_name.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            s.push(Span::raw("  "));
+            s.push(Span::styled(
+                format!("[{}]", row.state.label()),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            Line::from(s)
+        };
+        // Detail line: indent under the name, show "cmd · path" with
+        // tolerable middle-truncation so it always fits the width.
+        let cmd = row.command_display.clone();
+        let path = compact_path(&row.cwd_display);
+        let detail_budget = (width as usize).saturating_sub(6).max(10);
+        let raw_detail = if cmd == "(unknown)" {
+            path
+        } else if path == "(unknown)" || path.is_empty() {
+            cmd
+        } else {
+            format!("{cmd}  ·  {path}")
+        };
+        let detail = pad_or_truncate(&raw_detail, detail_budget);
+        let line2 = Line::from(vec![
+            Span::raw("    "),
+            Span::styled(detail, Style::default().add_modifier(Modifier::DIM)),
+        ]);
+        return ListItem::new(vec![line1, line2]);
+    }
+
+    // Wide: single-line aligned table matching the column header.
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(12);
     spans.push(Span::raw(" "));
     spans.push(Span::styled(row.state.marker().to_string(), marker_style));
@@ -349,8 +412,6 @@ fn row_list_item(
         spans.push(Span::styled(glyph.to_string(), kind_style));
         spans.push(Span::raw(" "));
     } else if reserve_kind_space {
-        // Keep name column aligned across rows when some rows have a
-        // kind glyph and others don't.
         spans.push(Span::raw("  "));
     }
     let name_cell = pad_or_truncate(&row.display_name, name_col);
@@ -358,14 +419,6 @@ fn row_list_item(
         name_cell,
         Style::default().add_modifier(Modifier::BOLD),
     ));
-
-    // Responsive columns — drop non-essentials as the terminal gets
-    // narrower so the session name stays visible. Tiers tuned for
-    // Termux-over-SSH in portrait (~30–40 cols) vs. desktop.
-    //   >=80  → name · cwd · command · [status]
-    //   >=50  → name · command · [status]
-    //   >=30  → name · [status]
-    //   <30   → name only (marker + name is all that fits)
     if width >= 80 && cwd_col >= 8 {
         spans.push(Span::raw("  "));
         let cwd_cell = pad_or_truncate(&compact_path(&row.cwd_display), cwd_col);
@@ -376,31 +429,37 @@ fn row_list_item(
             cmd_cell,
             Style::default().add_modifier(Modifier::DIM),
         ));
+    } else {
+        // 60..80: no cwd column; command and status only.
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("[{}]", row.state.label()),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    } else if width >= 50 {
-        spans.push(Span::raw("  "));
-        let cmd_cell = pad_or_truncate(&row.command_display, 22);
+        let cmd_cell = pad_or_truncate(&row.command_display, 24);
         spans.push(Span::styled(
             cmd_cell,
             Style::default().add_modifier(Modifier::DIM),
         ));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("[{}]", row.state.label()),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    } else if width >= 30 {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("[{}]", row.state.label()),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
     }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("[{}]", row.state.label()),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
     ListItem::new(Line::from(spans))
+}
+
+/// Human-readable column header above the session list. Matches the
+/// layout of `row_list_item` at each width tier. Narrow widths don't
+/// use columns (they use stacked cards) so there's no header to show.
+fn column_header_line(width: u16) -> String {
+    // The visible marker is 1 cell, preceded by " highlight" (2) + space (1);
+    // the rest of the header just lines up with the data columns below.
+    if width >= 80 {
+        format!(
+            "   {:<18}  {:<30}  {:<24}  {}",
+            "SESSION", "PATH", "COMMAND", "STATUS"
+        )
+    } else {
+        format!("   {:<18}  {:<24}  {}", "SESSION", "COMMAND", "STATUS")
+    }
 }
 
 /// Does this row have a kind glyph we'd render? Used to decide
@@ -581,6 +640,17 @@ mod tests {
             .collect()
     }
 
+    /// Y-coordinate of the first body row (first session row in wide
+    /// mode, first card line in narrow). Accounts for the column
+    /// header row we add when width >= 60.
+    fn first_body_row(width: u16) -> u16 {
+        if width >= 60 {
+            2
+        } else {
+            1
+        }
+    }
+
     #[test]
     fn renders_each_session_name_in_body() {
         let ws = sample_workspace("multi", 3);
@@ -616,7 +686,7 @@ mod tests {
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 100, 5);
 
-        let body = line_at(&terminal, 1);
+        let body = line_at(&terminal, first_body_row(100));
         assert!(body.contains("claude"), "name missing: {body:?}");
         assert!(body.contains("/tmp/demo"), "cwd missing: {body:?}");
         assert!(body.contains("--resume"), "command missing: {body:?}");
@@ -628,7 +698,7 @@ mod tests {
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 60, 5);
 
-        let body = line_at(&terminal, 1);
+        let body = line_at(&terminal, first_body_row(60));
         assert!(
             body.to_lowercase().contains("no sessions"),
             "missing placeholder: {body:?}"
@@ -751,18 +821,18 @@ mod tests {
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE); // select index 1
         let terminal = render_to_backend(&mut app, 80, 10);
-        // Row 0 is the header; row 1 is the first session (index 0);
-        // row 2 is index 1 (selected). The highlight marker is "▶ ".
-        let row2 = line_at(&terminal, 2);
+        // Body starts at first_body_row(80). First session is there,
+        // second session (selected) is the next line.
+        let first = first_body_row(80);
+        let selected = line_at(&terminal, first + 1);
         assert!(
-            row2.contains("▶"),
-            "expected highlight on selected row, got: {row2:?}"
+            selected.contains("▶"),
+            "expected highlight on selected row, got: {selected:?}"
         );
-        // Non-selected rows should not have the marker.
-        let row1 = line_at(&terminal, 1);
+        let non_selected = line_at(&terminal, first);
         assert!(
-            !row1.contains("▶"),
-            "unexpected highlight on row 1: {row1:?}"
+            !non_selected.contains("▶"),
+            "unexpected highlight on non-selected row: {non_selected:?}"
         );
     }
 
@@ -980,12 +1050,13 @@ mod tests {
             vec![live_session("s0"), live_session("extra")],
         );
         let terminal = render_to_backend(&mut app, 100, 10);
-        // Body spans rows 1..h-1. Three rows expected in order:
-        // row 1 = s0 (live ●), row 2 = s1 (not-started ○),
-        // row 3 = extra (untracked ?).
-        let row1 = line_at(&terminal, 1);
-        let row2 = line_at(&terminal, 2);
-        let row3 = line_at(&terminal, 3);
+        // Body begins at first_body_row. Three rows expected in order:
+        // row N   = s0 (live ●), N+1 = s1 (not-started ○),
+        // row N+2 = extra (untracked ?).
+        let n = first_body_row(100);
+        let row1 = line_at(&terminal, n);
+        let row2 = line_at(&terminal, n + 1);
+        let row3 = line_at(&terminal, n + 2);
         assert!(row1.contains("●"), "row1 should have live marker: {row1:?}");
         assert!(
             row2.contains("○"),
@@ -1065,31 +1136,32 @@ mod tests {
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 120, 12);
 
-        // Rows 1..=7 correspond to the 7 sessions we defined.
-        let row_for = |idx: u16| line_at(&terminal, idx);
+        // Body begins at first_body_row(120); seven rows follow.
+        let base = first_body_row(120);
+        let row_for = |idx: u16| line_at(&terminal, base + idx);
         assert!(
-            row_for(1).contains(" C "),
+            row_for(0).contains(" C "),
             "claude row missing C: {:?}",
+            row_for(0)
+        );
+        assert!(
+            row_for(1).contains(" O "),
+            "opencode row missing O: {:?}",
             row_for(1)
         );
         assert!(
-            row_for(2).contains(" O "),
-            "opencode row missing O: {:?}",
+            row_for(2).contains(" E "),
+            "editor row missing E: {:?}",
             row_for(2)
         );
         assert!(
-            row_for(3).contains(" E "),
-            "editor row missing E: {:?}",
-            row_for(3)
-        );
-        assert!(
-            row_for(4).contains(" D "),
+            row_for(3).contains(" D "),
             "dev-server row missing D: {:?}",
-            row_for(4)
+            row_for(3)
         );
         // Shell/Other/None → no kind marker. Check that the row
         // doesn't stray into another kind's letter.
-        for (idx, name) in [(5u16, "shell"), (6, "other"), (7, "notype")] {
+        for (idx, name) in [(4u16, "shell"), (5, "other"), (6, "notype")] {
             let r = row_for(idx);
             assert!(r.contains(name), "row {idx} missing name {name}: {r:?}");
             // Make sure we're not accidentally emitting stray kind letters
