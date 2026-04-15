@@ -277,7 +277,104 @@ Claude Code stores its sessions under `~/.claude/projects/<path-encoded-cwd>/`, 
 
 A **future `kind:` hint plus adapter** (see §7 and ROADMAP v2+) could, in principle, know how to present "your most-recent Claude session from the other environment" — but that's a consumer of whatever cross-env session sync tool exists, not a replacement for it. Path-encoding translation belongs in a purpose-built tool like `claudecode-project-sync` (in `agentic-workflow-and-tech-stack`) or a successor that's had more eyes on it than we have.
 
-## 12. Explicitly out of scope
+## 12. Entry-point behavior — what `pa` does from any directory
+
+The `pa` command is a single entry point that fans out based on
+discoverable state. The rules below are the contract; everything else
+in the code should derive from this table, not second-guess it.
+
+### Decision order
+
+When the user runs bare `pa` (no subcommand, no `-w`):
+
+1. **Try walk-up discovery from `$PWD`.** If a `*.portagenty.toml`
+   (with non-empty prefix) exists in the current directory or any
+   ancestor, load it and open the session-list TUI for that workspace.
+   This is the fast path: in-tree invocation should feel instant and
+   local.
+2. **Walk-up fails + non-interactive shell (pipe, script, CI).** Emit
+   the discovery error and exit non-zero. Never prompt. Scripted
+   callers must get deterministic behavior.
+3. **Walk-up fails + interactive + first-time user** (no
+   `.onboarded` sentinel in `$XDG_STATE_HOME/portagenty/`). Run the
+   onboarding wizard (`src/onboarding/`). On scaffold, retry the load
+   and continue into the session-list TUI. On "skip" or "show docs",
+   exit cleanly.
+4. **Walk-up fails + interactive + returning user.** Open the
+   workspace picker TUI (`src/tui/picker.rs`). Lists every
+   `[[workspace]]` registered in `$XDG_CONFIG_HOME/portagenty/config.toml`,
+   filtering entries whose files no longer exist. Always includes a
+   trailing **"live sessions on this machine"** option for the
+   no-workspace case. On pick: load the chosen workspace inside the
+   same ratatui session (no flicker) and continue into the
+   session-list TUI.
+5. **Walk-up fails + interactive + returning user + no registered
+   workspaces.** Picker shows only the "live sessions" option, which
+   resolves to a synthetic empty workspace populated from
+   `mux.list_sessions()`.
+
+The crucial consequence: **`pa` is callable from anywhere**. There is
+no "right" directory to be in. Walk-up is an optimization, not a
+requirement.
+
+### Workspace registry — invariants
+
+- **Auto-registered on scaffold.** Both `pa init` and the onboarding
+  wizard append the new workspace to the global `[[workspace]]` list
+  via `config::register_global_workspace`. Idempotent: re-runs and
+  duplicate paths are no-ops. Preserves the rest of the config via
+  `toml_edit`.
+- **Never edited silently outside those paths.** Running `pa` or
+  `pa launch` never mutates the registry. State drift only happens
+  when the user explicitly scaffolds.
+- **Stale-tolerant.** `config::list_registered_workspaces` filters
+  entries whose `path` doesn't resolve to an existing file. The TUI
+  never shows dead rows; the config file may retain them until the
+  user cleans up (future `pa workspaces prune` is roadmap).
+- **Absolute, canonicalized paths.** Entries are stored as absolute
+  paths so they survive cwd changes. `~`/`${VAR}` expansion is done
+  at read time, not write time, so env changes don't invalidate
+  entries.
+
+### UI contract
+
+- **No stdin text prompts after onboarding.** Anything requiring user
+  choice past the first-run wizard happens in ratatui. Stdin prompts
+  were tried and reverted — they broke the TUI feel and made the app
+  look half-finished.
+- **One `ratatui::init()` / `restore()` bracket per invocation.**
+  Picker → session-list transitions inside a single live terminal.
+  Mux hand-off (create/attach) happens only after `restore()`.
+- **Pre-launch banner on every mux hand-off** (§5 already implied
+  this). Tells the user which session they're entering and the mpx-
+  specific detach chord. This is information-only; we never rebind
+  keys in the user's mpx config — that opinionated work lives in the
+  `agentic-workflow-and-tech-stack` sibling repo.
+
+### Nested-mpx refusal
+
+Running `pa` inside a client of its own target multiplexer is a
+guaranteed foot-gun (zellij refuses nested sessions entirely; tmux
+allows them but it's rarely what the user wants). Handled by:
+
+- Detecting `ZELLIJ_SESSION_NAME` / `ZELLIJ` / tmux `$TMUX` at load
+  time.
+- Refusing *before* opening the TUI with a message that names the
+  current session and the correct detach chord. Letting the TUI open
+  and then erroring post-restore buries the error in shell scrollback.
+
+### What this rules out
+
+- A "persist the last workspace and auto-open it on bare `pa`" mode —
+  ambiguous with walk-up, and breaks "call from anywhere".
+- A CLI flag to *pre-select* a workspace in the picker. Scripts that
+  know their target use `pa -w <path>` or a direct subcommand; they
+  don't need the picker.
+- Reaching for a daemon or cache to speed up repeated runs. Walk-up
+  of a `*.portagenty.toml` is O(depth) filesystem reads; on any real
+  system it's sub-millisecond. No invalidation problems to solve.
+
+## 13. Explicitly out of scope
 
 - **Scaffolding**. A tool for that exists (`agentic-workflow-and-tech-stack`'s `setup.sh`). Integration with a purpose-built scaffolder may happen later via a separate `pa new` subcommand that shells out.
 - **Remote-machine awareness**. If you want portagenty on another machine, SSH in and run `pa` there. No mesh, no discovery, no RPC.
