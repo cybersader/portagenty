@@ -454,6 +454,20 @@ fn row_list_item(
         format!("[{}]", row.state.label()),
         Style::default().add_modifier(Modifier::DIM),
     ));
+    // Relative-time hint (e.g. "2h ago") on wide rows. Only populated
+    // for Live state; other states get blank padding so the column
+    // stays aligned.
+    if width >= 80 {
+        spans.push(Span::raw("  "));
+        let rel = match row.state {
+            SessionState::Live => crate::state::relative_time(row.last_attached_unix),
+            _ => String::new(),
+        };
+        spans.push(Span::styled(
+            pad_or_truncate(&rel, 10),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
     ListItem::new(Line::from(spans))
 }
 
@@ -465,8 +479,8 @@ fn column_header_line(width: u16) -> String {
     // the rest of the header just lines up with the data columns below.
     if width >= 80 {
         format!(
-            "   {:<18}  {:<30}  {:<24}  {}",
-            "SESSION", "PATH", "COMMAND", "STATUS"
+            "   {:<18}  {:<30}  {:<24}  {:<11} {}",
+            "SESSION", "PATH", "COMMAND", "STATUS", "LAST"
         )
     } else {
         format!("   {:<18}  {:<24}  {}", "SESSION", "COMMAND", "STATUS")

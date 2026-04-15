@@ -111,6 +111,9 @@ fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState) 
             .parent()
             .map(|p| compact_path(&p.display().to_string()))
             .unwrap_or_default();
+        // Relative-time hint so the user can tell at a glance which
+        // workspace they were in last. Empty for never-launched.
+        let relative = crate::state::relative_time(crate::state::last_launch_for_workspace(path));
         items.push(ListItem::new(Line::from(vec![
             Span::raw(" "),
             Span::styled("●", Style::default().fg(Color::Cyan)),
@@ -121,6 +124,8 @@ fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState) 
             ),
             Span::raw("   "),
             Span::styled(dir, Style::default().add_modifier(Modifier::DIM)),
+            Span::raw("   "),
+            Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
         ])));
     }
     // Sentinel row: live browse.

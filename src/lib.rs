@@ -26,12 +26,14 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             workspace,
             dry_run,
             shared,
-        }) => cli::launch(&session, workspace.as_ref(), dry_run, shared),
+            resume,
+        }) => cli::launch(&session, workspace.as_ref(), dry_run, shared, resume),
         Some(Command::Claim {
             session,
             workspace,
             dry_run,
-        }) => cli::claim(session.as_deref(), workspace.as_ref(), dry_run),
+            resume,
+        }) => cli::claim(session.as_deref(), workspace.as_ref(), dry_run, resume),
         Some(Command::List { workspace }) => cli::list(workspace.as_ref()),
         Some(Command::Export {
             workspace,

@@ -67,6 +67,10 @@ pub struct SessionRow {
     /// Optional kind hint, carried through from the workspace session
     /// when present. Drives the per-row kind marker in the TUI.
     pub kind: Option<SessionKind>,
+    /// Last-attached timestamp (unix seconds) from the state store,
+    /// for rendering the "2h ago" column on Live rows. `None` when the
+    /// session has never been launched via `pa` (shown as blank).
+    pub last_attached_unix: Option<u64>,
 }
 
 /// Build the row list from a loaded workspace plus the mpx's current
@@ -86,6 +90,10 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
         } else {
             SessionState::NotStarted
         };
+        let last_attached_unix = workspace
+            .file_path
+            .as_ref()
+            .and_then(|p| crate::state::last_launch_for_session(p, &sess.name));
         rows.push(SessionRow {
             mpx_name,
             display_name: sess.name.clone(),
@@ -94,6 +102,7 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
             cwd_display: sess.cwd.display().to_string(),
             command_display: sess.command.clone(),
             kind: sess.kind,
+            last_attached_unix,
         });
     }
 
@@ -123,6 +132,7 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
                 .unwrap_or_else(|| "(unknown)".into()),
             command_display: "(unknown)".into(),
             kind: None,
+            last_attached_unix: None,
         });
     }
 

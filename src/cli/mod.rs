@@ -49,6 +49,14 @@ pub enum Command {
         /// down to the smallest client.
         #[arg(long = "shared")]
         shared: bool,
+
+        /// Resume prior state for kind-aware sessions. For
+        /// `kind = "claude-code"` this appends `--continue` to the
+        /// command string before launch. Silent no-op with a hint on
+        /// other kinds — workspace TOML command strings stay literal
+        /// so committed workspace files are reproducible.
+        #[arg(long = "resume")]
+        resume: bool,
     },
     /// "Make this device the main session." Short-form alias for
     /// `launch --takeover` that defaults the session name to the
@@ -66,6 +74,11 @@ pub enum Command {
         /// Print what would happen instead of invoking the multiplexer.
         #[arg(long = "dry-run")]
         dry_run: bool,
+
+        /// Resume prior state for kind-aware sessions. Same semantics
+        /// as `pa launch --resume`.
+        #[arg(long = "resume")]
+        resume: bool,
     },
     /// Print the currently-resolved workspace (name, multiplexer,
     /// sessions) to stdout.
@@ -325,13 +338,18 @@ pub fn launch(
     workspace: Option<&PathBuf>,
     dry_run: bool,
     shared: bool,
+    resume: bool,
 ) -> Result<()> {
-    let (sess, ws) = resolve(session, workspace)?;
+    let (mut sess, ws) = resolve(session, workspace)?;
     let mode = if shared {
         AttachMode::Shared
     } else {
         AttachMode::Takeover
     };
+
+    if resume {
+        apply_resume_modifier(&mut sess)?;
+    }
 
     if dry_run {
         let out = io::stdout();
@@ -360,11 +378,48 @@ pub fn launch(
         .with_context(|| format!("launching session {:?}", sess.name))
 }
 
+/// Mutate the session's command in-place to resume prior state,
+/// based on its `kind:` hint. For unknown kinds we leave the command
+/// alone and print a one-liner to stderr so the user knows `--resume`
+/// was a no-op on this row (vs. silently ignored).
+///
+/// Never mutates the workspace TOML on disk; this is a per-invocation
+/// command transform. Committed workspace files stay literal and
+/// reproducible.
+fn apply_resume_modifier(sess: &mut crate::domain::Session) -> Result<()> {
+    use crate::domain::SessionKind;
+    match sess.kind {
+        Some(SessionKind::ClaudeCode) => {
+            if !sess.command.contains("--continue") && !sess.command.contains("--resume") {
+                sess.command.push_str(" --continue");
+            }
+        }
+        Some(SessionKind::Opencode) => {
+            // No stable resume flag we trust yet; surface honestly.
+            eprintln!(
+                "  --resume: no known resume flag for opencode kind yet; launching unchanged."
+            );
+        }
+        _ => {
+            eprintln!(
+                "  --resume: session {:?} has no resumable kind (kind={:?}); launching unchanged.",
+                sess.name, sess.kind
+            );
+        }
+    }
+    Ok(())
+}
+
 /// "Make this device the main session" — `pa claim`. Always uses
 /// Takeover mode. Defaults the session name to the first one in the
 /// workspace so the common case (only one agent-per-project) is a
 /// single-arg command.
-pub fn claim(session: Option<&str>, workspace: Option<&PathBuf>, dry_run: bool) -> Result<()> {
+pub fn claim(
+    session: Option<&str>,
+    workspace: Option<&PathBuf>,
+    dry_run: bool,
+    resume: bool,
+) -> Result<()> {
     let name_owned: String;
     let name: &str = match session {
         Some(s) => s,
@@ -384,7 +439,7 @@ pub fn claim(session: Option<&str>, workspace: Option<&PathBuf>, dry_run: bool) 
     };
 
     // Always takeover; that's the whole point of the verb.
-    launch(name, workspace, dry_run, /* shared = */ false)
+    launch(name, workspace, dry_run, /* shared = */ false, resume)
 }
 
 fn attach_mode_label(mode: AttachMode) -> &'static str {

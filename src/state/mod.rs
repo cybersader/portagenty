@@ -146,6 +146,51 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Most-recent launch timestamp (unix seconds) for a given workspace
+/// file, across any session. `None` if the workspace has never been
+/// launched via `pa`. Used by the picker to sort workspaces by
+/// recency.
+pub fn last_launch_for_workspace(workspace_file: &Path) -> Option<u64> {
+    let state = load().ok()?;
+    state
+        .recent
+        .iter()
+        .filter(|e| e.workspace_file == workspace_file)
+        .map(|e| e.launched_at_unix)
+        .max()
+}
+
+/// Most-recent launch timestamp for a specific (workspace, session)
+/// pair. `None` if this session has never been launched via `pa`.
+/// Used by the session list to render a "2h ago" column on live rows.
+pub fn last_launch_for_session(workspace_file: &Path, session_name: &str) -> Option<u64> {
+    let state = load().ok()?;
+    state
+        .recent
+        .iter()
+        .find(|e| e.workspace_file == workspace_file && e.session_name == session_name)
+        .map(|e| e.launched_at_unix)
+}
+
+/// Format a unix timestamp as a terse relative-time string suitable
+/// for a one-column display ("just now", "5m ago", "2h ago", "3d
+/// ago", "2w ago"). Anchors to current wall-clock time. Returns an
+/// empty string for `None` input so callers can pad unconditionally.
+pub fn relative_time(ts_unix: Option<u64>) -> String {
+    let Some(ts) = ts_unix else {
+        return String::new();
+    };
+    let now = now_unix();
+    let delta = now.saturating_sub(ts);
+    match delta {
+        0..=30 => "just now".to_string(),
+        31..=3599 => format!("{}m ago", delta / 60),
+        3600..=86_399 => format!("{}h ago", delta / 3600),
+        86_400..=604_799 => format!("{}d ago", delta / 86_400),
+        _ => format!("{}w ago", delta / 604_800),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -89,6 +89,23 @@ cwd = "."
 command = "cargo watch -x test"
 ```
 
+### Registry vs. gatekeeper
+
+The global `[[project]]` list is an **index**, not a gatekeeper. A
+workspace file can declare `projects = [...]` containing paths that
+have never been globally registered; the workspace loads fine, and
+those projects show up normally in the session list. Global
+registration exists to power cross-workspace views (the picker's
+recency sort, tag grouping, future custom-group curation) — it is
+not a requirement for a workspace to reference a project.
+
+The symmetric rule for sessions: the merge precedence (workspace >
+per-project > global) applies when the *same* session name appears at
+multiple tiers. A session declared only in a per-project file is
+still visible in any workspace that `projects = [...]`-lists that
+project's directory. Registration is additive across tiers, conflict
+resolution is precedence-based.
+
 ---
 
 ## 3. Workspace file: discovery and shape

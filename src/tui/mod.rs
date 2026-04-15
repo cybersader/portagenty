@@ -105,7 +105,21 @@ pub fn run() -> Result<()> {
 fn show_picker(
     terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<Option<crate::domain::Workspace>> {
-    let registered = crate::config::list_registered_workspaces().unwrap_or_default();
+    let mut registered = crate::config::list_registered_workspaces().unwrap_or_default();
+    // Recency sort: workspaces with a recorded launch come first,
+    // most-recent at the top; workspaces never launched fall to the
+    // bottom in alphabetical order. The "live sessions" sentinel is
+    // added by the picker itself and always trails.
+    registered.sort_by(|a, b| {
+        let ra = crate::state::last_launch_for_workspace(a);
+        let rb = crate::state::last_launch_for_workspace(b);
+        match (ra, rb) {
+            (Some(x), Some(y)) => y.cmp(&x), // more recent first
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.file_name().cmp(&b.file_name()),
+        }
+    });
     match picker::run(terminal, &registered)? {
         picker::PickerOutcome::Quit => Ok(None),
         picker::PickerOutcome::LiveBrowse => Ok(Some(synthetic_browse_workspace()?)),
