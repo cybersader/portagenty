@@ -34,20 +34,51 @@ Explicitly **not** in v1:
 
 ---
 
-## v1.x — Follow-ons, in rough order
+## v1.x — Follow-ons
 
-1. **zellij adapter.** Second mpx. Proves the adapter abstraction holds.
-2. **WezTerm adapter.** Unlocks Windows native. Document attach limitations honestly.
-3. **Untracked session adoption.** The feature carried over from `vscode-terminal-workspaces`. Ship once all three adapters land, so the UX is consistent.
-4. **Tags view, polished.** Tag editing from the TUI. Tag-based filtering and grouping.
-5. **Custom ordered groups.** Hand-curated named groups ("playlists"). Drag-in-TUI or edit via keybinding.
-6. **State/activity decorations.** Visual indicators (live session, has uncommitted git changes, etc.). Purely decorative overlay on existing views, per decision — *not* a new view.
-7. **Declarative export.** `pa export` emits zellij KDL layouts and tmux scripts from a workspace definition.
-8. **Eager / "jump-in" launch.** `--eager` flag and/or workspace-level config key.
-9. **`kind:` session hints.** Small integrations: "agent running" indicator, smart resume for Claude Code (`--continue`) and OpenCode.
-10. **Session schema extensions.** Env vars, pre/post commands, profile references. Lifted selectively from the VS Code extension's schema.
-11. **`fd` / Everything CLI search integration.** Opportunistic fast discovery where available.
-12. **Termux polish pass.** Measure the TUI over SSH-from-Termux, fix anything that assumes a desktop keyboard. Core keybindings are already Termux-safe by default (`DESIGN.md` §10); this is verification + any rough edges found in real use.
+### Shipped
+
+1. **zellij adapter** (`af963c3…`). List/has/kill via imperative CLI;
+   create + attach via generated KDL layout files. Inside-zellij
+   detection returns a clear "detach first" error instead of the
+   opaque nesting failure. 7 e2e tests against real zellij on Linux
+   CI.
+3. **Untracked session adoption.** The TUI merges `mux.list_sessions`
+   with workspace definitions and surfaces three row states — Live,
+   NotStarted, Untracked — each with a distinct color marker.
+   Enter routes to `attach` for Live/Untracked and `create_and_attach`
+   for NotStarted.
+6. **State/activity decorations.** Delivered alongside untracked
+   adoption: ● (green) live, ○ (dim) idle, ? (yellow) untracked,
+   plus a `[label]` tag on each row.
+9. **`kind:` session hints.** Optional `kind` field on sessions
+   (claude-code / opencode / editor / dev-server / shell / other).
+   Currently display-only — the TUI shows a one-letter color-coded
+   glyph (C / O / E / D) next to the state marker. Smart-resume
+   behaviors deferred to a later commit if we find they're worth
+   the added branching.
+
+### Still to ship (rough priority order)
+
+2. **WezTerm adapter.** Unlocks Windows native. Document attach
+   limitations honestly.
+4. **Tags view, polished.** Tag editing from the TUI. Tag-based
+   filtering and grouping. Thread `tags` from the global registry
+   into the resolved `Workspace`.
+5. **Custom ordered groups.** Hand-curated named groups
+   ("playlists"). Drag-in-TUI or edit via keybinding.
+7. **Declarative export.** `pa export` emits zellij KDL layouts
+   and tmux scripts from a workspace definition.
+8. **Eager / "jump-in" launch.** `--eager` flag and/or
+   workspace-level config key.
+10. **Session schema extensions.** Env vars, pre/post commands,
+    profile references. Lifted selectively from the VS Code
+    extension's schema.
+11. **`fd` / Everything CLI search integration.** Opportunistic
+    fast discovery where available.
+12. **Termux polish pass.** Over-SSH verification + any rough
+    edges found in real use. Core keybindings are already
+    Termux-safe by default (`DESIGN.md` §10).
 
 ---
 
