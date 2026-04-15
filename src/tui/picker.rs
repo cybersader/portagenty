@@ -38,9 +38,10 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
     state.select(Some(0));
 
     let total = workspaces.len() + 1; // +1 for the "live sessions" row
+    let mut help_open = false;
 
     loop {
-        terminal.draw(|frame| render(frame, workspaces, &mut state))?;
+        terminal.draw(|frame| render(frame, workspaces, &mut state, help_open))?;
 
         let Event::Key(key) = event::read()? else {
             continue;
@@ -48,7 +49,17 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        // Help overlay: any key closes it. No passthrough — we don't
+        // want `Enter` on a "dismiss help" press to also open a
+        // workspace the user hadn't seen yet.
+        if help_open {
+            help_open = false;
+            continue;
+        }
         match (key.code, key.modifiers) {
+            (KeyCode::Char('?'), _) => {
+                help_open = true;
+            }
             (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return Ok(PickerOutcome::Quit),
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 return Ok(PickerOutcome::Quit);
@@ -80,7 +91,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
     }
 }
 
-fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState) {
+fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState, help_open: bool) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -156,9 +167,13 @@ fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState) 
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, chunks[2], state);
 
-    let footer = Paragraph::new(" j/k: nav · Enter: open · q: quit ")
+    let footer = Paragraph::new(" j/k · Enter: open · ?: help · q: quit ")
         .style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(footer, chunks[3]);
+
+    if help_open {
+        crate::tui::help::render_overlay(frame, area, crate::tui::help::HelpContext::Picker);
+    }
 }
 
 fn compact_path(p: &str) -> String {

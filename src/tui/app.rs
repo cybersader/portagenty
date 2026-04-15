@@ -60,6 +60,10 @@ pub struct App {
     rows: Vec<SessionRow>,
     list_state: ListState,
     should_quit: bool,
+    /// True while the `?` help overlay is visible. While open, key
+    /// handling is short-circuited: any key press closes the overlay
+    /// and returns `Action::None` (no accidental nav / launch).
+    help_open: bool,
 }
 
 impl App {
@@ -79,6 +83,7 @@ impl App {
             rows,
             list_state,
             should_quit: false,
+            help_open: false,
         }
     }
 
@@ -183,7 +188,18 @@ impl App {
     /// produced. Split from `handle_event` so tests drive input
     /// synchronously without faking a crossterm event stream.
     pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Action {
+        // Help overlay: any key closes it, with a light special-case
+        // so `?` toggles (press once to open, again to close rather
+        // than being hot-swapped for an underlying-screen keystroke).
+        if self.help_open {
+            self.help_open = false;
+            return Action::None;
+        }
         match (code, mods) {
+            (KeyCode::Char('?'), _) => {
+                self.help_open = true;
+                Action::None
+            }
             (KeyCode::Char('q'), _) => {
                 self.should_quit = true;
                 Action::Quit
@@ -303,6 +319,15 @@ impl App {
         let footer =
             Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
         frame.render_widget(footer, chunks[3]);
+
+        // Help overlay renders last so it sits on top of everything.
+        if self.help_open {
+            crate::tui::help::render_overlay(
+                frame,
+                area,
+                crate::tui::help::HelpContext::SessionList,
+            );
+        }
     }
 
     fn render_session_list(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -363,11 +388,11 @@ impl App {
 /// DESIGN.md §10 for the mobile constraints that drive this.
 fn footer_for_width(width: u16) -> &'static str {
     if width >= 60 {
-        " j/k: nav · Enter: launch · Esc: back · q: quit "
+        " j/k · Enter · Esc: back · ?: help · q: quit "
     } else if width >= 30 {
-        " j/k · Esc: back · q: quit "
+        " j/k · Esc · ? help · q: quit "
     } else {
-        " Esc · q: quit "
+        " ? help · q: quit "
     }
 }
 
