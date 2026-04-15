@@ -15,16 +15,20 @@
  */
 
 import { spawn, execSync } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { existsSync, rmSync, statSync } from "node:fs";
+import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const docsDir = resolve(__dirname, "..");
+const distDir = resolve(docsDir, "dist");
 
 const DOCS_PORT = 4321;
+const PREFIX = "/portagenty";
 const isWindows = process.platform === "win32";
+
+let staticServer = null;
 
 const mode = process.argv[2] || "interactive";
 const children = [];
@@ -129,8 +133,80 @@ function cleanup() {
       c.kill();
     } catch {}
   }
+  if (staticServer) {
+    try {
+      staticServer.stop(true);
+    } catch {}
+    staticServer = null;
+  }
   const ts = getTailscale();
-  if (ts) run(`${ts} serve off 2>/dev/null`);
+  // `reset` is the modern (1.50+) verb to tear down all serves; the older
+  // `serve off` was deprecated and errors with "handler does not exist"
+  // when nothing is currently being served.
+  if (ts) run(`${ts} serve reset 2>/dev/null`);
+}
+
+// MIME / static-server pair shared by tailscale + cloudflare share modes.
+// Same shape as docs/scripts/smoke.mjs's static server — kept inline so
+// serve.mjs has no internal deps. astro preview is silent on some WSL +
+// Astro 6 setups; Bun.serve is reliable everywhere.
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript",
+  ".mjs": "application/javascript",
+  ".css": "text/css",
+  ".json": "application/json",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".xml": "application/xml",
+  ".txt": "text/plain; charset=utf-8",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+};
+function contentType(p) {
+  return MIME[p.slice(p.lastIndexOf("."))] || "application/octet-stream";
+}
+
+function startStaticServer(port) {
+  log(`Starting static server (Bun.serve) on http://127.0.0.1:${port}...`);
+  staticServer = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    fetch(req) {
+      const url = new URL(req.url);
+      let pathname = decodeURIComponent(url.pathname);
+      // Strip the configured Astro base so local paths mirror what GitHub
+      // Pages does in production (Astro emits absolute URLs with the base
+      // prefix, but writes files to dist/ without it).
+      if (pathname === PREFIX || pathname.startsWith(`${PREFIX}/`)) {
+        pathname = pathname.slice(PREFIX.length) || "/";
+      }
+      let filePath = join(distDir, pathname);
+      try {
+        if (existsSync(filePath) && statSync(filePath).isDirectory()) {
+          filePath = join(filePath, "index.html");
+        }
+        if (!existsSync(filePath)) {
+          if (existsSync(`${filePath}.html`)) {
+            filePath = `${filePath}.html`;
+          } else {
+            return new Response("Not found", { status: 404 });
+          }
+        }
+        return new Response(Bun.file(filePath), {
+          headers: { "Content-Type": contentType(filePath) },
+        });
+      } catch (err) {
+        return new Response(`Error: ${err.message}`, { status: 500 });
+      }
+    },
+  });
+  log(`Static server ready.`);
 }
 
 process.on("SIGINT", () => {
@@ -250,22 +326,45 @@ function runBuild() {
   });
 }
 
+async function waitForLocalReady(port, timeoutMs) {
+  const url = `http://127.0.0.1:${port}/portagenty/`;
+  const deadline = Date.now() + timeoutMs;
+  log(`Waiting for dev server at ${url}...`);
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(1500) });
+      if (res.status >= 200 && res.status < 500) {
+        log(`Dev server is ready (HTTP ${res.status}).`);
+        return;
+      }
+    } catch {
+      // not yet
+    }
+    await sleep(300);
+  }
+  log(`WARNING: dev server didn't respond within ${timeoutMs}ms; continuing anyway.`);
+}
+
 async function tailscaleServe(port) {
   const ts = getTailscale();
   if (!ts) {
     log("Tailscale not found. Install it from https://tailscale.com.");
     return;
   }
-  run(`${ts} serve off 2>/dev/null`);
-  spawn(ts, ["serve", String(port)], { stdio: "ignore" });
-  await sleep(2000);
+  // Tear down any existing serve handlers, then daemonize a new one. `--bg`
+  // is the modern way to run `serve` non-interactively; without it the
+  // command sits in the foreground waiting for Ctrl+C.
+  run(`${ts} serve reset 2>/dev/null`);
+  run(`${ts} serve --bg ${port}`);
+  await sleep(1500);
   const status = run(`${ts} serve status 2>/dev/null`);
-  const url = status.match(/(https:\/\/[^\s]+)/)?.[1];
+  const url = status.match(/(https:\/\/[^\s]+\.ts\.net)/)?.[1];
   const ip = run(`${ts} ip -4 2>/dev/null`);
   console.log("");
-  if (url) log(`Public-on-tailnet: ${url}`);
-  if (ip) log(`Direct: http://${ip}:${port} (tailnet only)`);
-  if (!url && !ip) log(`http://localhost:${port}`);
+  if (url) log(`Public-on-tailnet: ${url}/portagenty/`);
+  if (ip) log(`Direct: http://${ip}:${port}/portagenty/ (tailnet only)`);
+  if (!url && !ip) log(`http://localhost:${port}/portagenty/`);
+  log(`Stop sharing: tailscale serve reset`);
 }
 
 function startCloudflareTunnel(port) {
@@ -293,14 +392,25 @@ async function main() {
       await runBuild();
       process.exit(0);
     case "tailscale":
-      startDev();
-      await sleep(3000);
+      // Build the site fresh, then serve dist via Bun.serve, then expose via
+      // tailscale serve. Built site is what you'd want share recipients to
+      // see (production rendering), and Bun.serve sidesteps astro dev's
+      // silent-startup issues on some WSL + Astro 6 environments.
+      await runBuild();
+      startStaticServer(DOCS_PORT);
+      await waitForLocalReady(DOCS_PORT, 10_000);
       await tailscaleServe(DOCS_PORT);
+      log("Press Ctrl+C to stop sharing.");
+      // Keep the process alive so the static server keeps serving until SIGINT
+      await new Promise(() => {});
       break;
     case "cloudflare":
-      startDev();
-      await sleep(3000);
+      await runBuild();
+      startStaticServer(DOCS_PORT);
+      await waitForLocalReady(DOCS_PORT, 10_000);
       startCloudflareTunnel(DOCS_PORT);
+      log("Press Ctrl+C to stop sharing.");
+      await new Promise(() => {});
       break;
     default:
       console.error(`Unknown mode: ${chosen}`);
