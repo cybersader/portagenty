@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     prelude::*,
-    widgets::{List, ListItem, Paragraph},
+    widgets::{List, ListItem, ListState, Paragraph},
     DefaultTerminal,
 };
 
@@ -22,15 +22,59 @@ pub struct App {
     workspace: Workspace,
     #[allow(dead_code)] // wired to mux in a later commit
     mux: Box<dyn Multiplexer>,
+    list_state: ListState,
     should_quit: bool,
 }
 
 impl App {
     pub fn new(workspace: Workspace, mux: Box<dyn Multiplexer>) -> Self {
+        let mut list_state = ListState::default();
+        if !workspace.sessions.is_empty() {
+            list_state.select(Some(0));
+        }
         Self {
             workspace,
             mux,
+            list_state,
             should_quit: false,
+        }
+    }
+
+    /// Currently-selected session index, if any. `None` when the
+    /// workspace has no sessions.
+    pub fn selected(&self) -> Option<usize> {
+        self.list_state.selected()
+    }
+
+    fn select_next(&mut self) {
+        let n = self.workspace.sessions.len();
+        if n == 0 {
+            return;
+        }
+        let sel = self.list_state.selected().unwrap_or(0);
+        self.list_state.select(Some((sel + 1) % n));
+    }
+
+    fn select_prev(&mut self) {
+        let n = self.workspace.sessions.len();
+        if n == 0 {
+            return;
+        }
+        let sel = self.list_state.selected().unwrap_or(0);
+        let next = if sel == 0 { n - 1 } else { sel - 1 };
+        self.list_state.select(Some(next));
+    }
+
+    fn select_first(&mut self) {
+        if !self.workspace.sessions.is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    fn select_last(&mut self) {
+        let n = self.workspace.sessions.len();
+        if n > 0 {
+            self.list_state.select(Some(n - 1));
         }
     }
 
@@ -50,20 +94,30 @@ impl App {
             if key.kind != KeyEventKind::Press {
                 return Ok(());
             }
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.should_quit = true,
-                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                    self.should_quit = true;
-                }
-                _ => {}
-            }
+            self.handle_key(key.code, key.modifiers);
         }
         Ok(())
     }
 
+    /// Apply a single key press. Split out of `handle_event` so tests
+    /// drive selection without faking a crossterm event stream.
+    pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        match (code, mods) {
+            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.should_quit = true,
+            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.select_next(),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.select_prev(),
+            (KeyCode::Char('g'), _) | (KeyCode::Home, _) => self.select_first(),
+            (KeyCode::Char('G'), _) | (KeyCode::End, _) => self.select_last(),
+            _ => {}
+        }
+    }
+
     /// Render a single frame. Pulled out so tests can call it against
     /// a `TestBackend` without needing the event loop.
-    pub fn render(&self, frame: &mut Frame<'_>) {
+    pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
 
         let chunks = Layout::default()
@@ -90,13 +144,13 @@ impl App {
 
         self.render_session_list(frame, chunks[1]);
 
-        let footer_text = " q / Esc: quit ";
+        let footer_text = " j/k: nav · g/G: top/bottom · q: quit ";
         let footer =
             Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
         frame.render_widget(footer, chunks[2]);
     }
 
-    fn render_session_list(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_session_list(&mut self, frame: &mut Frame<'_>, area: Rect) {
         if self.workspace.sessions.is_empty() {
             let empty = Paragraph::new(" No sessions defined in this workspace. ")
                 .style(Style::default().add_modifier(Modifier::DIM));
@@ -120,8 +174,15 @@ impl App {
             .map(|s| session_row(s, name_col))
             .collect();
 
-        let list = List::new(items);
-        frame.render_widget(list, area);
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 }
 
@@ -174,7 +235,7 @@ mod tests {
         }
     }
 
-    fn render_to_backend(app: &App, w: u16, h: u16) -> Terminal<TestBackend> {
+    fn render_to_backend(app: &mut App, w: u16, h: u16) -> Terminal<TestBackend> {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.render(f)).unwrap();
@@ -184,8 +245,8 @@ mod tests {
     #[test]
     fn renders_header_with_workspace_name_and_session_count() {
         let ws = sample_workspace("Agentic", 3);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let terminal = render_to_backend(&app, 60, 10);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&mut app, 60, 10);
 
         let buffer = terminal.backend().buffer();
         let first_line: String = (0..60)
@@ -204,8 +265,8 @@ mod tests {
     #[test]
     fn renders_singular_when_one_session() {
         let ws = sample_workspace("Solo", 1);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let terminal = render_to_backend(&app, 60, 10);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&mut app, 60, 10);
 
         let buffer = terminal.backend().buffer();
         let first_line: String = (0..60)
@@ -218,8 +279,8 @@ mod tests {
     #[test]
     fn renders_footer_with_quit_hint() {
         let ws = sample_workspace("X", 0);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let terminal = render_to_backend(&app, 60, 5);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&mut app, 60, 5);
 
         let buffer = terminal.backend().buffer();
         let last_line: String = (0..60)
@@ -232,16 +293,16 @@ mod tests {
     fn handles_narrow_terminal_without_panic() {
         // Termux / small-screen constraint: single-column, tight rows.
         let ws = sample_workspace("narrow", 5);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let _ = render_to_backend(&app, 20, 10);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let _ = render_to_backend(&mut app, 20, 10);
     }
 
     #[test]
     fn handles_very_short_terminal() {
         // Minimum: header + one row for body + footer = 3 rows.
         let ws = sample_workspace("tiny", 0);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let _ = render_to_backend(&app, 80, 3);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let _ = render_to_backend(&mut app, 80, 3);
     }
 
     fn line_at(t: &Terminal<TestBackend>, y: u16) -> String {
@@ -255,8 +316,8 @@ mod tests {
     #[test]
     fn renders_each_session_name_in_body() {
         let ws = sample_workspace("multi", 3);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let terminal = render_to_backend(&app, 100, 10);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&mut app, 100, 10);
 
         // Body lives on rows 1..h-1 (row 0 = header, row h-1 = footer).
         let body: String = (1..9)
@@ -282,8 +343,8 @@ mod tests {
                 command: "claude --resume".into(),
             }],
         };
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let terminal = render_to_backend(&app, 100, 5);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&mut app, 100, 5);
 
         let body = line_at(&terminal, 1);
         assert!(body.contains("claude"), "name missing: {body:?}");
@@ -294,8 +355,8 @@ mod tests {
     #[test]
     fn empty_workspace_shows_placeholder() {
         let ws = sample_workspace("empty", 0);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let terminal = render_to_backend(&app, 60, 5);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&mut app, 60, 5);
 
         let body = line_at(&terminal, 1);
         assert!(
@@ -309,7 +370,94 @@ mod tests {
         // 80 sessions into a 20-row terminal — ratatui's List handles
         // overflow by truncating; we just confirm we don't panic.
         let ws = sample_workspace("big", 80);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let _ = render_to_backend(&mut app, 80, 20);
+    }
+
+    #[test]
+    fn selection_starts_at_zero_for_non_empty() {
+        let ws = sample_workspace("x", 3);
         let app = App::new(ws, Box::new(MockMultiplexer::new()));
-        let _ = render_to_backend(&app, 80, 20);
+        assert_eq!(app.selected(), Some(0));
+    }
+
+    #[test]
+    fn selection_is_none_for_empty_workspace() {
+        let ws = sample_workspace("x", 0);
+        let app = App::new(ws, Box::new(MockMultiplexer::new()));
+        assert_eq!(app.selected(), None);
+    }
+
+    #[test]
+    fn j_key_advances_selection_wrapping() {
+        let ws = sample_workspace("x", 3);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(1));
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(2));
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(0), "should wrap");
+    }
+
+    #[test]
+    fn k_key_retreats_selection_wrapping() {
+        let ws = sample_workspace("x", 3);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(2), "should wrap to last");
+        app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(1));
+    }
+
+    #[test]
+    fn arrow_keys_are_equivalent_to_jk() {
+        let ws = sample_workspace("x", 4);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(2));
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(1));
+    }
+
+    #[test]
+    fn g_goes_to_top_capital_g_to_bottom() {
+        let ws = sample_workspace("x", 5);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(app.selected(), Some(4));
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(0));
+    }
+
+    #[test]
+    fn navigation_is_noop_on_empty_workspace() {
+        let ws = sample_workspace("x", 0);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(app.selected(), None);
+    }
+
+    #[test]
+    fn highlight_symbol_appears_next_to_selected_row() {
+        let ws = sample_workspace("x", 3);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE); // select index 1
+        let terminal = render_to_backend(&mut app, 80, 10);
+        // Row 0 is the header; row 1 is the first session (index 0);
+        // row 2 is index 1 (selected). The highlight marker is "▶ ".
+        let row2 = line_at(&terminal, 2);
+        assert!(
+            row2.contains("▶"),
+            "expected highlight on selected row, got: {row2:?}"
+        );
+        // Non-selected rows should not have the marker.
+        let row1 = line_at(&terminal, 1);
+        assert!(
+            !row1.contains("▶"),
+            "unexpected highlight on row 1: {row1:?}"
+        );
     }
 }
