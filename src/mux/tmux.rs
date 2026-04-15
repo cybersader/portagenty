@@ -66,15 +66,16 @@ impl TmuxAdapter {
             return Ok(());
         }
         ensure_cwd_exists(&session.cwd)?;
-        let status = self
-            .cmd()
-            .arg("new-session")
-            .arg("-d")
-            .arg("-s")
-            .arg(&name)
-            .arg("-c")
-            .arg(&session.cwd)
-            .arg(&session.command)
+        let mut cmd = self.cmd();
+        cmd.arg("new-session").arg("-d").arg("-s").arg(&name);
+        // -e KEY=VAL flags: tmux applies these to the session's
+        // environment, so the spawned shell + child processes see
+        // them. Order is deterministic because session.env is BTreeMap.
+        for (k, v) in &session.env {
+            cmd.arg("-e").arg(format!("{k}={v}"));
+        }
+        cmd.arg("-c").arg(&session.cwd).arg(&session.command);
+        let status = cmd
             .status()
             .map_err(|e| friendly_io_err("spawning tmux new-session", e))?;
         if !status.success() {
@@ -279,5 +280,56 @@ mod tests {
     #[test]
     fn attach_mode_default_is_takeover() {
         assert_eq!(AttachMode::default(), AttachMode::Takeover);
+    }
+
+    /// Build the args `create_detached` would pass for a given session
+    /// without actually spawning tmux. Mirrors the impl above.
+    fn create_args_for(name: &str, cwd: &str, env: &[(&str, &str)], cmd: &str) -> Vec<String> {
+        use std::collections::BTreeMap;
+        let mut env_map = BTreeMap::new();
+        for (k, v) in env {
+            env_map.insert(k.to_string(), v.to_string());
+        }
+
+        let mut tcmd = Command::new("tmux");
+        tcmd.arg("new-session").arg("-d").arg("-s").arg(name);
+        for (k, v) in &env_map {
+            tcmd.arg("-e").arg(format!("{k}={v}"));
+        }
+        tcmd.arg("-c").arg(cwd).arg(cmd);
+        tcmd.get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn create_detached_args_include_dash_e_per_env_var() {
+        let args = create_args_for("s", "/tmp", &[("A", "1"), ("B", "two")], "echo hi");
+        // BTreeMap orders alphabetically: A first, B second.
+        assert_eq!(
+            args,
+            vec![
+                "new-session",
+                "-d",
+                "-s",
+                "s",
+                "-e",
+                "A=1",
+                "-e",
+                "B=two",
+                "-c",
+                "/tmp",
+                "echo hi",
+            ]
+        );
+    }
+
+    #[test]
+    fn create_detached_args_omit_dash_e_when_env_empty() {
+        let args = create_args_for("s", "/tmp", &[], "echo hi");
+        assert_eq!(
+            args,
+            vec!["new-session", "-d", "-s", "s", "-c", "/tmp", "echo hi"]
+        );
     }
 }

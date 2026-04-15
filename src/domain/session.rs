@@ -8,6 +8,7 @@
 //! affects how a row renders in the TUI.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Optional hint about what kind of thing a session runs. Purely
@@ -69,6 +70,11 @@ pub struct Session {
     /// generic and omits the kind marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<SessionKind>,
+    /// Per-session env vars. BTreeMap so serialization order is
+    /// stable across runs (matters for tests + diffing committed
+    /// workspace files).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -82,6 +88,7 @@ mod tests {
             cwd: PathBuf::from("/home/user/code/portagenty"),
             command: "claude".into(),
             kind: None,
+            env: std::collections::BTreeMap::new(),
         };
         let encoded = toml::to_string(&s).expect("serialize");
         assert!(
@@ -107,6 +114,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 command: "c".into(),
                 kind: Some(kind),
+                env: BTreeMap::new(),
             };
             let encoded = toml::to_string(&s).unwrap();
             assert!(
@@ -150,5 +158,49 @@ command = "claude"
     fn shell_and_other_have_no_marker() {
         assert_eq!(SessionKind::Shell.marker(), None);
         assert_eq!(SessionKind::Other.marker(), None);
+    }
+
+    #[test]
+    fn serde_round_trip_with_env() {
+        let mut env = BTreeMap::new();
+        env.insert("ANTHROPIC_API_KEY".into(), "sk-test".into());
+        env.insert("RUST_LOG".into(), "debug".into());
+
+        let s = Session {
+            name: "claude".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "claude".into(),
+            kind: None,
+            env,
+        };
+        let encoded = toml::to_string(&s).unwrap();
+        assert!(
+            encoded.contains("ANTHROPIC_API_KEY"),
+            "env missing: {encoded}"
+        );
+        assert!(encoded.contains("RUST_LOG"), "env missing: {encoded}");
+
+        let decoded: Session = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.env.len(), 2);
+        assert_eq!(
+            decoded.env.get("RUST_LOG").map(String::as_str),
+            Some("debug")
+        );
+    }
+
+    #[test]
+    fn empty_env_is_skipped_in_serialized_form() {
+        let s = Session {
+            name: "x".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "c".into(),
+            kind: None,
+            env: BTreeMap::new(),
+        };
+        let encoded = toml::to_string(&s).unwrap();
+        assert!(
+            !encoded.contains("env"),
+            "env key shouldn't appear: {encoded}"
+        );
     }
 }

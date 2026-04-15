@@ -53,6 +53,7 @@ mod tests {
                 cwd: PathBuf::from("/home/user/code/portagenty"),
                 command: "cargo nextest run".into(),
                 kind: None,
+                env: std::collections::BTreeMap::new(),
             }],
         };
         let encoded = toml::to_string(&p).expect("serialize");

@@ -395,6 +395,7 @@ mod tests {
                     cwd: PathBuf::from("/tmp"),
                     command: "true".into(),
                     kind: None,
+                    env: std::collections::BTreeMap::new(),
                 })
                 .collect(),
         }
@@ -507,6 +508,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp/demo"),
                 command: "claude --resume".into(),
                 kind: None,
+                env: std::collections::BTreeMap::new(),
             }],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
@@ -940,6 +942,7 @@ mod tests {
                     cwd: PathBuf::from("/tmp"),
                     command: "c".into(),
                     kind,
+                    env: std::collections::BTreeMap::new(),
                 })
                 .collect(),
         }

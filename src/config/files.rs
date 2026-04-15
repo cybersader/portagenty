@@ -89,6 +89,11 @@ pub struct RawSession {
     /// verbatim; see that module for the enum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<crate::domain::SessionKind>,
+    /// Per-session env vars. Passed through to the mpx adapter which
+    /// decides how to apply them (tmux uses `-e KEY=VAL`; zellij
+    /// wraps the command in `env KEY=VAL ...`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Read a TOML file and parse it into `T`. Preserves the path in the

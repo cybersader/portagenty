@@ -201,12 +201,30 @@ fn escape_kdl(s: &str) -> String {
 /// a session with a specific cwd + command. Single pane running
 /// `bash -c "<command>"` so shell metacharacters in the command work
 /// the same as when the user runs them from their own shell.
+///
+/// When the session has env vars set, we route through `env(1)` —
+/// each `KEY=VAL` is a separate KDL string arg, which avoids shell-
+/// escape gymnastics inside the bash -c payload. zellij invokes
+/// `env KEY1=val1 KEY2=val2 bash -c <cmd>`, env sets the vars and
+/// execs bash, and bash runs the user's command with the vars set.
 fn render_layout(session: &Session) -> String {
     let cwd = escape_kdl(&session.cwd.display().to_string());
     let cmd = escape_kdl(&session.command);
-    format!(
-        "layout {{\n    pane cwd=\"{cwd}\" {{\n        command \"bash\"\n        args \"-c\" \"{cmd}\"\n    }}\n}}\n"
-    )
+
+    if session.env.is_empty() {
+        format!(
+            "layout {{\n    pane cwd=\"{cwd}\" {{\n        command \"bash\"\n        args \"-c\" \"{cmd}\"\n    }}\n}}\n"
+        )
+    } else {
+        let mut env_args = String::new();
+        for (k, v) in &session.env {
+            let pair = format!("{k}={v}");
+            env_args.push_str(&format!(" \"{}\"", escape_kdl(&pair)));
+        }
+        format!(
+            "layout {{\n    pane cwd=\"{cwd}\" {{\n        command \"env\"\n        args{env_args} \"bash\" \"-c\" \"{cmd}\"\n    }}\n}}\n"
+        )
+    }
 }
 
 /// Write the layout to a deterministic path under `$TMPDIR`. One file
@@ -368,6 +386,7 @@ mod tests {
             cwd: PathBuf::from("/home/u/code"),
             command: "claude --resume".into(),
             kind: None,
+            env: std::collections::BTreeMap::new(),
         };
         let layout = render_layout(&s);
         assert!(layout.contains(r#"cwd="/home/u/code""#));
@@ -382,11 +401,62 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             command: r#"echo "hi""#.into(),
             kind: None,
+            env: std::collections::BTreeMap::new(),
         };
         let layout = render_layout(&s);
         assert!(
             layout.contains(r#"args "-c" "echo \"hi\"""#),
             "bad escape in layout:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_routes_through_env_when_env_present() {
+        use std::collections::BTreeMap;
+        let mut env = BTreeMap::new();
+        env.insert("A".into(), "1".into());
+        env.insert("B".into(), "two words".into());
+        let s = Session {
+            name: "x".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "claude".into(),
+            kind: None,
+            env,
+        };
+        let layout = render_layout(&s);
+        assert!(
+            layout.contains(r#"command "env""#),
+            "missing env command:\n{layout}"
+        );
+        // BTreeMap → alphabetical args.
+        assert!(layout.contains(r#""A=1""#), "missing A=1:\n{layout}");
+        assert!(
+            layout.contains(r#""B=two words""#),
+            "missing B with spaces:\n{layout}"
+        );
+        assert!(
+            layout.contains(r#""bash" "-c" "claude""#),
+            "missing bash tail:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_without_env_is_plain_bash() {
+        let s = Session {
+            name: "x".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "claude".into(),
+            kind: None,
+            env: std::collections::BTreeMap::new(),
+        };
+        let layout = render_layout(&s);
+        assert!(
+            layout.contains(r#"command "bash""#),
+            "should use bash directly:\n{layout}"
+        );
+        assert!(
+            !layout.contains(r#"command "env""#),
+            "should not route through env:\n{layout}"
         );
     }
 }

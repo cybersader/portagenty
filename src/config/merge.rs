@@ -81,6 +81,7 @@ fn to_session(rs: &RawSession, cwd_base: &Path) -> Result<Session> {
             .with_context(|| format!("resolving cwd for session {:?}", rs.name))?,
         command: rs.command.clone(),
         kind: rs.kind,
+        env: rs.env.clone(),
     })
 }
 
@@ -161,6 +162,7 @@ mod tests {
             cwd: cwd.into(),
             command: cmd.into(),
             kind: None,
+            env: std::collections::BTreeMap::new(),
         }
     }
 

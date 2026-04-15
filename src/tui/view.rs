@@ -148,6 +148,7 @@ mod tests {
                     cwd: PathBuf::from("/tmp"),
                     command: cmd.into(),
                     kind: None,
+                    env: std::collections::BTreeMap::new(),
                 })
                 .collect(),
         }
@@ -166,6 +167,7 @@ mod tests {
                     cwd: PathBuf::from("/tmp"),
                     command: "c".into(),
                     kind,
+                    env: std::collections::BTreeMap::new(),
                 })
                 .collect(),
         }

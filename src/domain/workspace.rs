@@ -105,6 +105,7 @@ mod tests {
                 cwd: PathBuf::from("/home/u/code/portagenty"),
                 command: "claude".into(),
                 kind: None,
+                env: std::collections::BTreeMap::new(),
             }],
         };
         let encoded = toml::to_string(&w).unwrap();
