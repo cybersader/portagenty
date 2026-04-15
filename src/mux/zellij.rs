@@ -311,11 +311,17 @@ impl Multiplexer for ZellijAdapter {
         ensure_cwd_exists(&session.cwd)?;
         let layout = write_layout_file(session, &name)?;
 
+        // `--layout` + `--session` is ambiguous in zellij (>=0.40): with
+        // --session set, --layout tries to *add tabs to an existing
+        // session of that name*, and fails with "Session not found" if
+        // it doesn't exist yet. `--new-session-with-layout` (aka -n)
+        // unambiguously forces a fresh session — what we want for
+        // create-and-attach.
         let status = self
             .cmd()
             .arg("--session")
             .arg(&name)
-            .arg("--layout")
+            .arg("--new-session-with-layout")
             .arg(&layout)
             .status()
             .map_err(|e| friendly_io_err("spawning zellij with layout", e))?;
