@@ -351,6 +351,34 @@ requirement.
   keys in the user's mpx config — that opinionated work lives in the
   `agentic-workflow-and-tech-stack` sibling repo.
 
+### Navigation — Android-back semantics
+
+The workspace picker is the **home screen**. Navigation has exactly
+one back-stack and `Esc` means the same thing everywhere:
+
+- **Session TUI**: `Esc` → picker. Always. Regardless of whether the
+  user entered via walk-up, wizard-scaffold, or picker. There is no
+  "entry-path mode" to track.
+- **Picker (home)**: `Esc` or `q` → exit `pa`. One more Esc from home
+  closes the app, analogous to Android's back button on a launcher.
+- **Session TUI**: `q` / `Ctrl+C` → exit `pa` directly, bypassing the
+  picker. Useful when the user knows they're done.
+- **Enter** always opens the highlighted row. On a workspace row
+  (picker) this loads the workspace and drops into its session TUI.
+  On a session row (session TUI) this attaches or create-and-
+  attaches via the mux.
+
+Entry-flow-specific wrinkles:
+
+- Walk-up-entered users still see the picker once they press Esc.
+  This is a feature: the picker doubles as a "jump to another
+  registered workspace" affordance without needing to exit `pa` and
+  cd somewhere else first.
+- If the picker's own registry is empty (no workspaces registered,
+  no pinned mpx with live sessions) the picker still renders with
+  the "live sessions on this machine" option as the only row, so
+  Esc-to-home never leaves the user at a dead end.
+
 ### Nested-mpx refusal
 
 Running `pa` inside a client of its own target multiplexer is a
