@@ -15,6 +15,29 @@ pub use session_info::SessionInfo;
 pub use tmux::TmuxAdapter;
 pub use zellij::ZellijAdapter;
 
+/// How an attach behaves with respect to any clients already connected
+/// to the same session.
+///
+/// Driven by the cross-device use case: SSH in from a phone, run
+/// `pa claim` or `pa launch`, the session instantly reshapes to the
+/// current terminal's size because the previous (desktop) client
+/// gets detached. The session itself keeps running — this is not
+/// a kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttachMode {
+    /// Detach any other clients first, then attach. This is
+    /// `tmux attach -d` semantics. Session is preserved; only the
+    /// other device's *client* is disconnected and can re-attach
+    /// later. Fixes the "screen size stuck to whichever client was
+    /// smallest" issue inherent to multi-client mpx sessions.
+    #[default]
+    Takeover,
+    /// Attach without touching other clients. Multiple devices can
+    /// watch the same session at once. Useful for pair-style
+    /// workflows or when you explicitly want read-only shadowing.
+    Shared,
+}
+
 use anyhow::Result;
 
 use crate::domain::Session;
@@ -35,13 +58,15 @@ pub trait Multiplexer {
     fn has_session(&self, name: &str) -> Result<bool>;
 
     /// Attach the current TTY to an existing session. The process
-    /// blocks until the user detaches from the mpx.
-    fn attach(&self, name: &str) -> Result<()>;
+    /// blocks until the user detaches from the mpx. `mode` controls
+    /// whether other clients currently attached to the same session
+    /// get bumped or left in place; see [`AttachMode`].
+    fn attach(&self, name: &str, mode: AttachMode) -> Result<()>;
 
-    /// Create a session from `session` (name already sanitized by the
-    /// caller, cwd absolute, command raw) and attach. Equivalent to
-    /// the DESIGN §5 "attach-or-create" shell idiom done imperatively.
-    fn create_and_attach(&self, session: &Session) -> Result<()>;
+    /// Create a session from `session` and attach. `mode` applies to
+    /// the attach step — a freshly-created session has no other
+    /// clients, so mode only matters when the session already exists.
+    fn create_and_attach(&self, session: &Session, mode: AttachMode) -> Result<()>;
 
     /// Kill a session by sanitized name. No-op when the session does
     /// not exist.

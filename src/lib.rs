@@ -22,7 +22,13 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             session,
             workspace,
             dry_run,
-        }) => cli::launch(&session, workspace.as_ref(), dry_run),
+            shared,
+        }) => cli::launch(&session, workspace.as_ref(), dry_run, shared),
+        Some(Command::Claim {
+            session,
+            workspace,
+            dry_run,
+        }) => cli::claim(session.as_deref(), workspace.as_ref(), dry_run),
         Some(Command::List { workspace }) => cli::list(workspace.as_ref()),
     }
 }

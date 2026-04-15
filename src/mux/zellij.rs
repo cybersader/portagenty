@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Result};
 
 use crate::domain::Session;
-use crate::mux::{sanitize_session_name, Multiplexer, SessionInfo};
+use crate::mux::{sanitize_session_name, AttachMode, Multiplexer, SessionInfo};
 
 /// zellij-backed [`Multiplexer`].
 #[derive(Debug, Clone, Default)]
@@ -97,6 +97,43 @@ impl ZellijAdapter {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         bail!("zellij session {name:?} was created but did not appear in list within 1s")
+    }
+
+    /// Best-effort "are other clients attached to this session?"
+    /// check via `zellij action list-clients`. Returns true only when
+    /// we can confirm at least one client is connected — unknowns are
+    /// treated as false because we don't want to spam a warning in
+    /// the common case where list-clients isn't useful for us.
+    pub fn other_clients_attached(&self, _name: &str) -> bool {
+        // `zellij action list-clients` lists clients on the session
+        // the invoker is inside, not an arbitrary named session, so
+        // from outside zellij there isn't a reliable CLI probe. We
+        // hedge: if we're inside zellij AND can list clients, report
+        // what we see; otherwise pessimistically return false.
+        if !Self::is_inside_zellij() {
+            return false;
+        }
+        let out = self.cmd().arg("action").arg("list-clients").output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                // One client per line (approximately). If more than
+                // one line of real content, there are other clients.
+                stdout.lines().filter(|l| !l.trim().is_empty()).count() > 1
+            }
+            _ => false,
+        }
+    }
+
+    fn warn_if_other_clients(&self, name: &str) {
+        if self.other_clients_attached(name) {
+            eprintln!(
+                "  warning: other clients may be attached to zellij session {name:?}. \
+                zellij has no CLI to force-detach them; if you see screen-size weirdness \
+                after attaching, detach the other device manually (Ctrl+Q on the other \
+                end) and re-attach here."
+            );
+        }
     }
 
     /// Kill + delete the named session. Each step is best-effort so a
@@ -217,11 +254,19 @@ impl Multiplexer for ZellijAdapter {
         Ok(sessions.iter().any(|s| s.name == name))
     }
 
-    fn attach(&self, name: &str) -> Result<()> {
+    fn attach(&self, name: &str, mode: AttachMode) -> Result<()> {
         if Self::is_inside_zellij() {
             bail!(
                 "already inside a zellij session; detach first (Ctrl+Q by default) before attaching to {name:?}"
             );
+        }
+        // zellij has no CLI-level "detach other clients" flag. On
+        // Takeover, warn the user so they can manually detach the
+        // other device if they hit screen-size issues. Attach either
+        // way — same behavior zellij would give you from a plain
+        // `zellij attach`.
+        if mode == AttachMode::Takeover {
+            self.warn_if_other_clients(name);
         }
         let status = self
             .cmd()
@@ -235,10 +280,10 @@ impl Multiplexer for ZellijAdapter {
         Ok(())
     }
 
-    fn create_and_attach(&self, session: &Session) -> Result<()> {
+    fn create_and_attach(&self, session: &Session, mode: AttachMode) -> Result<()> {
         let name = sanitize_session_name(&session.name);
         if self.has_session(&name)? {
-            return self.attach(&name);
+            return self.attach(&name, mode);
         }
         if Self::is_inside_zellij() {
             bail!(

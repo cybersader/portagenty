@@ -75,7 +75,80 @@ fn launch_dry_run_prints_what_would_happen() {
         .success()
         .stdout(contains("would launch"))
         .stdout(contains("claude"))
-        .stdout(contains("echo hi"));
+        .stdout(contains("echo hi"))
+        .stdout(contains("takeover"));
+}
+
+#[test]
+fn launch_with_shared_flag_reports_shared_mode() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["launch", "claude", "--dry-run", "--shared"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("shared"))
+        .stdout(contains("other clients stay"));
+}
+
+#[test]
+fn claim_with_explicit_name_dry_runs_as_takeover() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["claim", "tests", "--dry-run"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("would launch"))
+        .stdout(contains("tests"))
+        .stdout(contains("takeover"));
+}
+
+#[test]
+fn claim_without_name_defaults_to_first_session() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    // demo workspace has two sessions: "claude" (declared first) and "tests".
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["claim", "--dry-run"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("claude"))
+        .stdout(contains("takeover"));
+}
+
+#[test]
+fn claim_errors_when_workspace_has_no_sessions() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("empty.portagenty.toml")
+        .write_str(
+            r#"
+name = "Empty"
+multiplexer = "tmux"
+"#,
+        )
+        .unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["claim", "--dry-run"])
+        .arg("--workspace")
+        .arg(tmp.child("empty.portagenty.toml").path())
+        .assert()
+        .failure()
+        .stderr(contains("no sessions to claim"));
 }
 
 #[test]

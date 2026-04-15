@@ -37,19 +37,24 @@ pub fn run() -> Result<()> {
     let result = app.run(&mut terminal);
     ratatui::restore();
 
+    // TUI Enter defaults to takeover — "I'm here now, this is the
+    // main client." Matches the cross-device ergonomic DESIGN sketch
+    // has always implied. A future key could offer shared-attach if
+    // there's demand.
+    let mode = crate::mux::AttachMode::Takeover;
     match result? {
         (AppOutcome::Quit, _) => Ok(()),
         (AppOutcome::Launch(LaunchKind::Create { session }), mux) => {
             if let Some(path) = &workspace_file {
                 let _ = crate::state::record_launch(path, &session.name);
             }
-            mux.create_and_attach(&session)
+            mux.create_and_attach(&session, mode)
         }
         (AppOutcome::Launch(LaunchKind::Attach { mpx_name }), mux) => {
             if let Some(path) = &workspace_file {
                 let _ = crate::state::record_launch(path, &mpx_name);
             }
-            mux.attach(&mpx_name)
+            mux.attach(&mpx_name, mode)
         }
     }
 }

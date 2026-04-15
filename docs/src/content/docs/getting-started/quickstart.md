@@ -58,7 +58,45 @@ pa list                     # print the resolved workspace to stdout
 pa launch claude            # skip the TUI, launch a session by name
 pa launch claude --dry-run  # print what would happen without running it
 pa launch claude -w ./my.portagenty.toml   # explicit workspace file
+
+# "Make this device the main session." Defaults the session name to the
+# first one in the workspace — the common one-agent-per-project case.
+pa claim
+pa claim tests              # specific session by name
 ```
+
+## 5. Cross-device: take over from a different machine
+
+When you SSH in from a phone (or any other device) and attach to a
+session that's already attached on your desktop, tmux (and by extension
+`pa`) will shrink the session to the smaller client's terminal size and
+keep it that way. That's the infamous "stuck in a weird size" bug.
+
+`pa`'s default behavior fixes this for you:
+
+- `pa`, `pa launch <name>`, and `pa claim` all default to **takeover**
+  mode. On attach, any other clients get detached so the session
+  reshapes to the current device.
+- The session itself keeps running — the other device's *client* is
+  disconnected, not the session. You can re-attach from the other
+  device later; it'll just reconnect to the still-running session.
+- Pass `--shared` to opt out:
+
+  ```sh
+  pa launch claude --shared    # multiple devices can watch concurrently
+  ```
+
+`pa claim` is a shorter verb for the common "I moved devices, make this
+one the main" flow — it's the same as `pa launch <first-session>` but
+without having to remember the session name.
+
+**Multiplexer caveats:**
+
+- **tmux**: uses `tmux attach -d` internally — takeover works cleanly.
+- **zellij**: has no CLI equivalent to force-detach other clients.
+  `pa` warns when other clients appear to be attached, but you may
+  need to manually detach the other device (Ctrl+Q on the other end)
+  if screen-size weirdness persists.
 
 ## What gets recorded
 

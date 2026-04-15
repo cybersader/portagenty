@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::domain::Session;
-use crate::mux::{sanitize_session_name, Multiplexer, SessionInfo};
+use crate::mux::{sanitize_session_name, AttachMode, Multiplexer, SessionInfo};
 
 /// Wrap a std::io::Error that fired during a tmux invocation. We
 /// lift `NotFound` into a clear "tmux isn't installed or isn't in
@@ -162,12 +162,15 @@ impl Multiplexer for TmuxAdapter {
         Ok(status.success())
     }
 
-    fn attach(&self, name: &str) -> Result<()> {
-        let status = self
-            .cmd()
-            .arg("attach-session")
-            .arg("-t")
-            .arg(name)
+    fn attach(&self, name: &str, mode: AttachMode) -> Result<()> {
+        let mut cmd = self.cmd();
+        cmd.arg("attach-session").arg("-t").arg(name);
+        if mode == AttachMode::Takeover {
+            // tmux's `-d` detaches other clients on attach. Session
+            // keeps running; only the other *clients* get bumped.
+            cmd.arg("-d");
+        }
+        let status = cmd
             .status()
             .map_err(|e| friendly_io_err("spawning tmux attach-session", e))?;
         if !status.success() {
@@ -176,10 +179,10 @@ impl Multiplexer for TmuxAdapter {
         Ok(())
     }
 
-    fn create_and_attach(&self, session: &Session) -> Result<()> {
+    fn create_and_attach(&self, session: &Session, mode: AttachMode) -> Result<()> {
         self.create_detached(session)?;
         let name = sanitize_session_name(&session.name);
-        self.attach(&name)
+        self.attach(&name, mode)
     }
 
     fn kill(&self, name: &str) -> Result<()> {
@@ -245,5 +248,36 @@ mod tests {
         assert!(is_no_server_error("error connecting to /tmp/sock"));
         assert!(is_no_server_error("no sessions"));
         assert!(!is_no_server_error("some unrelated tmux error"));
+    }
+
+    /// Build the args `attach` would pass to the `tmux` binary, without
+    /// actually spawning it. Used only by the test below — mirrors the
+    /// logic in `impl Multiplexer for TmuxAdapter::attach`.
+    fn attach_args_for(name: &str, mode: AttachMode) -> Vec<String> {
+        let mut cmd = Command::new("tmux");
+        cmd.arg("attach-session").arg("-t").arg(name);
+        if mode == AttachMode::Takeover {
+            cmd.arg("-d");
+        }
+        cmd.get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn attach_in_takeover_mode_includes_dash_d() {
+        let args = attach_args_for("claude", AttachMode::Takeover);
+        assert_eq!(args, vec!["attach-session", "-t", "claude", "-d"]);
+    }
+
+    #[test]
+    fn attach_in_shared_mode_omits_dash_d() {
+        let args = attach_args_for("claude", AttachMode::Shared);
+        assert_eq!(args, vec!["attach-session", "-t", "claude"]);
+    }
+
+    #[test]
+    fn attach_mode_default_is_takeover() {
+        assert_eq!(AttachMode::default(), AttachMode::Takeover);
     }
 }

@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{load, LoadOptions};
 use crate::domain::{Multiplexer as MpxEnum, Session, Workspace};
-use crate::mux::{Multiplexer, TmuxAdapter, ZellijAdapter};
+use crate::mux::{AttachMode, Multiplexer, TmuxAdapter, ZellijAdapter};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -26,7 +26,10 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Attach to (or create-and-attach) a session by name, without
-    /// entering the TUI.
+    /// entering the TUI. Defaults to takeover mode — any other client
+    /// attached to the same session gets bumped so the terminal size
+    /// adjusts to this device. Pass `--shared` to keep the other
+    /// client(s) attached.
     Launch {
         /// Session name as declared in the workspace.
         session: String,
@@ -38,6 +41,29 @@ pub enum Command {
 
         /// Print what would be launched instead of actually running
         /// the multiplexer. Useful for scripts + tests.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Don't detach other clients on attach. Multiple devices
+        /// can watch the session at once; screen size is negotiated
+        /// down to the smallest client.
+        #[arg(long = "shared")]
+        shared: bool,
+    },
+    /// "Make this device the main session." Short-form alias for
+    /// `launch --takeover` that defaults the session name to the
+    /// first session declared in the workspace.
+    Claim {
+        /// Optional session name. When omitted, the first session in
+        /// the workspace is used. Errors if the workspace has no
+        /// sessions.
+        session: Option<String>,
+
+        /// Explicit path to a `*.portagenty.toml` file.
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+
+        /// Print what would happen instead of invoking the multiplexer.
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
@@ -96,13 +122,29 @@ fn build_mux(kind: MpxEnum) -> Result<Box<dyn Multiplexer>> {
     }
 }
 
-pub fn launch(session: &str, workspace: Option<&PathBuf>, dry_run: bool) -> Result<()> {
+pub fn launch(
+    session: &str,
+    workspace: Option<&PathBuf>,
+    dry_run: bool,
+    shared: bool,
+) -> Result<()> {
     let (sess, ws) = resolve(session, workspace)?;
+    let mode = if shared {
+        AttachMode::Shared
+    } else {
+        AttachMode::Takeover
+    };
 
     if dry_run {
         let out = io::stdout();
         let mut out = out.lock();
-        writeln!(out, "would launch {:?} via {:?}", sess.name, ws.multiplexer)?;
+        writeln!(
+            out,
+            "would launch {:?} via {:?} ({})",
+            sess.name,
+            ws.multiplexer,
+            attach_mode_label(mode),
+        )?;
         writeln!(out, "  cwd:     {}", sess.cwd.display())?;
         writeln!(out, "  command: {}", sess.command)?;
         return Ok(());
@@ -116,8 +158,42 @@ pub fn launch(session: &str, workspace: Option<&PathBuf>, dry_run: bool) -> Resu
     }
 
     let mux = build_mux(ws.multiplexer)?;
-    mux.create_and_attach(&sess)
+    mux.create_and_attach(&sess, mode)
         .with_context(|| format!("launching session {:?}", sess.name))
+}
+
+/// "Make this device the main session" — `pa claim`. Always uses
+/// Takeover mode. Defaults the session name to the first one in the
+/// workspace so the common case (only one agent-per-project) is a
+/// single-arg command.
+pub fn claim(session: Option<&str>, workspace: Option<&PathBuf>, dry_run: bool) -> Result<()> {
+    let name_owned: String;
+    let name: &str = match session {
+        Some(s) => s,
+        None => {
+            // Peek at the workspace to find the first session name.
+            let ws = crate::config::load(&crate::config::LoadOptions {
+                workspace_path: workspace.cloned(),
+                ..Default::default()
+            })?;
+            if let Some(first) = ws.sessions.first() {
+                name_owned = first.name.clone();
+                name_owned.as_str()
+            } else {
+                return Err(anyhow!("workspace {:?} has no sessions to claim", ws.name));
+            }
+        }
+    };
+
+    // Always takeover; that's the whole point of the verb.
+    launch(name, workspace, dry_run, /* shared = */ false)
+}
+
+fn attach_mode_label(mode: AttachMode) -> &'static str {
+    match mode {
+        AttachMode::Takeover => "takeover: other clients will be detached",
+        AttachMode::Shared => "shared: other clients stay attached",
+    }
 }
 
 pub fn list(workspace: Option<&PathBuf>) -> Result<()> {
