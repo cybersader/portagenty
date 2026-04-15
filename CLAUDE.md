@@ -14,7 +14,7 @@ If any of those three conflict with this file, update this file to match — not
 
 ## Current stage
 
-**Pre-code.** The repo contains vision + architecture + roadmap docs only. Do not scaffold Rust code, add `Cargo.toml`, or create `src/` until the user explicitly asks for it.
+**v1.x feature-complete and usable daily.** Core binary ships: TUI with workspace picker home screen, session list with recency/color/mpx badges, tmux + zellij adapters, full CLI lifecycle (`init/add/rm/edit`), onboarding wizard, bundled snippets, shell completions, declarative export, `pa claim` cross-device takeover, `--resume` for Claude Code. See [ROADMAP.md](./ROADMAP.md) for the shipped list and what's next. When making changes, keep DESIGN.md and ROADMAP.md in sync — those are the contract; stale docs here are a worse failure mode than verbose docs.
 
 ## Hard constraints (locked)
 

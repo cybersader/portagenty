@@ -2,7 +2,7 @@
 
 Architectural deep-dive. Companion to [README.md](./README.md) (vision) and [ROADMAP.md](./ROADMAP.md) (sequencing). This file is the source of truth for terminology and architectural decisions.
 
-Status: pre-code design. Schemas shown here are sketches, not committed formats.
+Status: v1.x implementation. Schemas shown here are the committed on-disk formats unless explicitly labeled as "future" or "deferred".
 
 ---
 
@@ -19,7 +19,8 @@ Status: pre-code design. Schemas shown here are sketches, not committed formats.
 9. Untracked session adoption
 10. Termux and small-screen TUI constraints
 11. WSL ↔ native Windows sync — scope
-12. Explicitly out of scope
+12. Entry-point behavior — what `pa` does from any directory
+13. Explicitly out of scope
 
 ---
 
@@ -30,9 +31,9 @@ These terms mean exactly one thing across the whole project. If you find yoursel
 - **Project** — a directory on disk with code or content you work on. Registered with portagenty at any of three tiers (global, workspace, per-project). A project is identified by its filesystem path.
 - **Session** — one unit of execution: a shell, a process, an agent. Defined by *name + cwd + command*. A session belongs to a workspace.
 - **Workspace** — a named, curated view over one or more projects plus the sessions you use to work on them. A first-class file on disk, designed to be committable. A workspace is where "hierarchy on top of hierarchy" happens.
-- **View** — a specific ordering/filtering of projects presented in the TUI. v1 ships three: Recently Opened (LRU), Tags, Custom Groups. Views are composable with workspaces.
-- **Multiplexer** (mpx) — tmux, zellij, or WezTerm. The thing that actually owns terminal panes and keeps them alive across detaches. portagenty drives it; it does not replace it.
-- **Adapter** — code inside portagenty that speaks to one specific multiplexer. v1 will ship a tmux adapter first; zellij and WezTerm adapters follow. (A future "agent adapter" concept is deferred — see §7.)
+- **View** — a specific ordering/filtering of projects presented in the TUI. Three planned: Recently Opened (LRU), Tags, Custom Groups. v1.x ships Recently Opened (picker + session-list). Tags and Custom Groups are roadmapped. Views are composable with workspaces.
+- **Multiplexer** (mpx) — tmux or zellij. The thing that actually owns terminal panes and keeps them alive across detaches. portagenty drives it; it does not replace it. **WezTerm is intentionally not supported** — its mux model is built around the GUI terminal's own windowing rather than the headless detach/reattach pattern portagenty depends on. See ROADMAP v1.x for the full rationale. The `Multiplexer::Wezterm` enum variant still exists so workspace files don't fail-parse, but `build_mux` returns a clear "use tmux or zellij" message.
+- **Adapter** — code inside portagenty that speaks to one specific multiplexer. v1 shipped tmux as the reference adapter; v1.x added zellij. (A future "agent adapter" concept is deferred — see §7.)
 - **Profile** — *deferred to v1.x.* A named bundle of session defaults (shell, env, mpx settings) that multiple sessions can inherit. Lifted from `vscode-terminal-workspaces`. Not in v1.
 
 ---
@@ -161,7 +162,7 @@ portagenty splits what it knows into two categories:
 
 ## 5. Multiplexer adapters
 
-v1 ships one adapter; v1.x adds two more. All three should present the same core interface to the rest of portagenty, with capability flags for features not every mpx supports.
+v1 shipped the tmux adapter as the reference baseline. v1.x added zellij. WezTerm is intentionally not supported (see §1 Vocabulary and ROADMAP v1.x for the rationale). Both shipping adapters present the same core interface to the rest of portagenty, with capability flags for features only one mpx supports.
 
 **Core interface** (conceptual, not Rust API):
 

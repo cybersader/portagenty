@@ -39,6 +39,7 @@ entering the TUI.
 | `-w`, `--workspace <path>` | walk-up | Explicit workspace file |
 | `--dry-run` | off | Print what would happen, don't run it |
 | `--shared` | off | Don't detach other clients (see [attach modes](../../concepts/#attach-mode-takeover--shared)) |
+| `--resume` | off | Kind-aware resume. For `kind = "claude-code"` sessions, appends `--continue` before launch so Claude picks up its prior conversation. Other kinds print a one-line hint to stderr and launch unchanged. The workspace TOML command string is never mutated on disk. |
 
 Examples:
 
@@ -47,6 +48,7 @@ pa launch claude
 pa launch claude --dry-run
 pa launch claude -w ~/code/my.portagenty.toml
 pa launch claude --shared            # leave other devices attached
+pa launch claude --resume            # claude-code → appends --continue
 ```
 
 ## `pa claim [session]`
@@ -59,6 +61,7 @@ the workspace.
 |---|---|---|
 | `-w`, `--workspace <path>` | walk-up | Explicit workspace file |
 | `--dry-run` | off | Print what would happen |
+| `--resume` | off | Same semantics as `pa launch --resume`: appends `--continue` for `kind = "claude-code"` sessions, one-line hint for other kinds. |
 
 Examples:
 
@@ -66,6 +69,7 @@ Examples:
 pa claim                  # first session in workspace
 pa claim tests            # specific session
 pa claim --dry-run        # peek without touching
+pa claim claude --resume  # takeover + resume the Claude conversation
 ```
 
 ## `pa list`
@@ -218,3 +222,72 @@ new-session -d` per session + `tmux attach-session -d` to the
 first) or a KDL layout with one tab per session for `--format
 zellij`. Both respect env vars declared on sessions and sanitize
 session names the same way `pa` does at runtime.
+
+## `pa onboard`
+
+Re-run the first-run wizard at any time. Interactive; walks you
+through workspace scaffolding, multiplexer choice (with installed /
+not-found annotations), optional Claude Code starter session, and
+offers to set or change the machine-default multiplexer. Writes a
+`<name>.portagenty.toml` in the current directory and auto-registers
+it in the global workspace index so `pa` from anywhere can find it.
+
+```sh
+pa onboard
+```
+
+No flags — the wizard is fully interactive. Safe to re-run: an
+existing workspace file in the current directory is left untouched.
+
+## `pa snippets`
+
+Bundled bash ergonomics shipped inside the `pa` binary. Idempotent:
+installing twice replaces the block in-place via a marker comment so
+your rc file never accumulates duplicates.
+
+### `pa snippets list`
+
+Print the bundled snippet catalog with one-line descriptions.
+
+```sh
+pa snippets list
+```
+
+### `pa snippets show <name>`
+
+Print a snippet's contents to stdout. Review before installing.
+
+```sh
+pa snippets show pa-aliases
+```
+
+### `pa snippets install <name>`
+
+Install (or update) a snippet in your rc file.
+
+| Flag | Default | What |
+|---|---|---|
+| `name` (positional) | — (required) | Snippet name from `pa snippets list` |
+| `--to <path>` | `~/.bashrc` | Target rc file |
+| `--dry-run` | off | Preview the result without writing |
+
+```sh
+pa snippets install pa-aliases
+pa snippets install termux-friendly --to ~/.zshrc
+pa snippets install pa-aliases --dry-run
+```
+
+### `pa snippets uninstall <name>`
+
+Remove a previously-installed snippet from your rc file. Surrounding
+user content is preserved byte-for-byte.
+
+| Flag | Default | What |
+|---|---|---|
+| `name` (positional) | — (required) | Snippet name to remove |
+| `--from <path>` | `~/.bashrc` | Target rc file |
+| `--dry-run` | off | Preview the result without writing |
+
+```sh
+pa snippets uninstall pa-aliases
+```

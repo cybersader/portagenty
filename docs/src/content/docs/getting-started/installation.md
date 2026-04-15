@@ -81,24 +81,3 @@ pa launch shell -w /tmp/smoke.portagenty.toml
 The first command should print the resolved workspace; the second
 attaches you to a new tmux session running `bash` in `/tmp`. Detach
 with `Ctrl-b d`.
-
-## Smoke-test your setup
-
-```sh
-cat > /tmp/smoke.portagenty.toml <<'EOF'
-name = "Smoke"
-multiplexer = "tmux"
-
-[[session]]
-name = "shell"
-cwd = "/tmp"
-command = "bash"
-EOF
-
-pa list -w /tmp/smoke.portagenty.toml
-pa launch shell -w /tmp/smoke.portagenty.toml
-```
-
-The first command should print the resolved workspace; the second
-attaches you to a new tmux session running `bash` in `/tmp`. Detach
-with `Ctrl-b d`.

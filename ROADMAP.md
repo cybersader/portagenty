@@ -67,11 +67,44 @@ Explicitly **not** in v1:
    Pre/post commands + profile refs (item 10's other halves) still
    to ship.
 
-Plus an **unplanned win**: cross-device takeover (`pa claim` + the
-default `AttachMode::Takeover`). Solves the "screen size stuck after
-attaching from a smaller device" issue inherent to multi-client
-tmux sessions. tmux uses `-d` natively; zellij warns when other
-clients appear attached (no equivalent CLI). See README quickstart.
+Plus several **unplanned wins** that dropped out of dogfooding on
+real projects:
+
+- **`pa claim` cross-device takeover.** Solves the "screen size
+  stuck after attaching from a smaller device" issue inherent to
+  multi-client tmux sessions. tmux uses `-d` natively; zellij warns
+  when other clients appear attached (no equivalent CLI).
+- **Full no-editor session lifecycle.** `pa init / add / rm / edit`
+  with comment-preserving toml_edit writes. Makes phone-over-SSH
+  authoring practical.
+- **Onboarding wizard** (`pa onboard`). Progressive 30-second first-
+  run flow: pick workspace name, multiplexer (with install-detection
+  badges), Claude-Code starter session. Auto-registers the new
+  workspace in the global index.
+- **Workspace picker "home screen"** in the TUI. When `pa` runs
+  outside any walk-up tree, a ratatui picker lists registered
+  workspaces + a "live sessions on this machine" sentinel. Android-
+  back navigation: Esc from session TUI always returns to the
+  picker; q / Ctrl+C exits.
+- **Workspace recency** across the picker (sort + "X ago" column)
+  and session list (LAST column on Live rows at ≥80 cols). Reads
+  from the state store written since v1.
+- **Bundled bash snippets** (`pa snippets install pa-aliases` /
+  `termux-friendly`). Idempotent marker-block install into `~/.bashrc`
+  or equivalent.
+- **Shell completion** (`pa completions bash|zsh|fish|elvish|powershell`).
+  Static subcommand + flag + closed-enum-value completion.
+- **`pa launch --resume` / `pa claim --resume`.** For sessions with
+  `kind = "claude-code"`, appends `--continue` before launch. Other
+  kinds get a one-line hint. Workspace TOML stays literal.
+- **Visual differentiation pass.** Title shows an mpx badge
+  (cyan `[tmux]` / magenta `[zellij]`). Session-name color matches
+  state (green/dim/yellow). Live rows show attached-client count
+  when tmux reports it (`[live · 2 clients]`).
+- **Pre-launch banner.** Just before handing off to the mpx,
+  prints `pa → <mpx> session "<name>"  ·  detach: <chord>  ·
+  re-attach: pa claim <name>` so the user sees the exit path on
+  their actual shell.
 
 ### Still to ship (rough priority order)
 
@@ -90,9 +123,19 @@ clients appear attached (no equivalent CLI). See README quickstart.
    tmux or zellij" message until/unless the upstream model evolves.
 4. **Tags view, polished.** Tag editing from the TUI. Tag-based
    filtering and grouping. Thread `tags` from the global registry
-   into the resolved `Workspace`.
+   into the resolved `Workspace`. Design intent: tags are a
+   picker-level perspective (group registered workspaces by project
+   tags), not a session-level filter.
 5. **Custom ordered groups.** Hand-curated named groups
    ("playlists"). Drag-in-TUI or edit via keybinding.
+5a. **Datetime-out-front in the session explorer.** Promote the
+   relative-time hint ("2h ago") to an absolute wall-clock column
+   visible near the left of each live row (e.g. "Tue 14:32" or
+   "2026-04-15 14:32" depending on width). Makes it obvious which
+   session you were *just* in versus one from last week without
+   doing mental math. The `state::last_launch_for_session` lookup
+   and `relative_time` formatter are already in place; this is
+   purely a render-layer change plus a width-tier decision.
 8. **Eager / "jump-in" launch.** `pa up` / `--eager` flag to
    pre-spawn all workspace sessions in detached mode (fully
    supported on tmux; partial on zellij due to the

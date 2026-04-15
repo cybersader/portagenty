@@ -2,7 +2,7 @@
 
 A portable, terminal-native launcher for agent workspaces. Written in Rust. Binary name: `pa`.
 
-> Status: **v1 feature-complete, pre-release**. `pa` loads a workspace, shows its sessions in a TUI, and launches the selected session in tmux. `pa launch <name>` and `pa list` work headlessly. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what's shipped and what's next (v1.x: zellij + WezTerm adapters, untracked-session adoption, Recent/Tags/Groups views, declarative export). Docs site: <https://cybersader.github.io/portagenty/>. Local + Tailscale preview also supported (see below).
+> Status: **v1.x feature-complete and usable daily.** Core flows ship end-to-end: walk up to find a workspace, render the session list, pick one, attach — in **tmux or zellij**. Most v1.x extras shipped: zellij adapter, untracked session adoption, `pa claim` cross-device takeover, `kind:` session hints, per-session env, declarative `pa export`, onboarding wizard, bundled bash snippets, full no-editor session management (`pa init / add / rm / edit`), workspace picker home screen with recency sort, Android-back navigation, `pa launch --resume` for Claude Code. Still roadmapped: Tags/Groups perspectives, `pa up` eager-launch, datetime column in the session explorer. WezTerm intentionally deferred — see [ROADMAP.md](./ROADMAP.md) for rationale. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive. Docs site: <https://cybersader.github.io/portagenty/>. Local + Tailscale preview also supported (see below).
 
 ## Install
 
