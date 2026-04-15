@@ -411,6 +411,137 @@ fn add_errors_when_no_workspace_found() {
 }
 
 #[test]
+fn snippets_list_shows_known_snippets() {
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["snippets", "list"])
+        .assert()
+        .success()
+        .stdout(contains("pa-aliases"))
+        .stdout(contains("termux-friendly"));
+}
+
+#[test]
+fn snippets_show_prints_file_contents() {
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["snippets", "show", "pa-aliases"])
+        .assert()
+        .success()
+        .stdout(contains("alias p='pa'"))
+        .stdout(contains("alias pc='pa claim'"));
+}
+
+#[test]
+fn snippets_show_errors_on_unknown_name() {
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["snippets", "show", "nope"])
+        .assert()
+        .failure()
+        .stderr(contains("no snippet"));
+}
+
+#[test]
+fn snippets_install_writes_to_target_file() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let rc = tmp.child(".bashrc");
+    rc.write_str("# my shell config\nexport FOO=bar\n").unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["snippets", "install", "pa-aliases"])
+        .arg("--to")
+        .arg(rc.path())
+        .assert()
+        .success()
+        .stdout(contains("installed snippet"));
+
+    let contents = std::fs::read_to_string(rc.path()).unwrap();
+    assert!(
+        contents.contains("export FOO=bar"),
+        "user content preserved"
+    );
+    assert!(
+        contents.contains("pa snippet: pa-aliases"),
+        "marker present"
+    );
+    assert!(contents.contains("alias p='pa'"), "snippet body present");
+}
+
+#[test]
+fn snippets_install_is_idempotent() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let rc = tmp.child(".bashrc");
+    rc.write_str("").unwrap();
+
+    for _ in 0..3 {
+        Command::cargo_bin("pa")
+            .unwrap()
+            .args(["snippets", "install", "pa-aliases", "--to"])
+            .arg(rc.path())
+            .assert()
+            .success();
+    }
+
+    let contents = std::fs::read_to_string(rc.path()).unwrap();
+    // Exactly one pair of markers (2 matches: begin + end).
+    let marker_count = contents.matches("pa snippet: pa-aliases").count();
+    assert_eq!(
+        marker_count, 2,
+        "expected exactly one begin+end marker pair after 3 installs, got {marker_count}"
+    );
+}
+
+#[test]
+fn snippets_uninstall_removes_block_and_keeps_user_content() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let rc = tmp.child(".bashrc");
+    rc.write_str("export FOO=bar\n").unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["snippets", "install", "pa-aliases", "--to"])
+        .arg(rc.path())
+        .assert()
+        .success();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["snippets", "uninstall", "pa-aliases", "--from"])
+        .arg(rc.path())
+        .assert()
+        .success()
+        .stdout(contains("removed snippet"));
+
+    let contents = std::fs::read_to_string(rc.path()).unwrap();
+    assert!(contents.contains("export FOO=bar"), "user content survived");
+    assert!(
+        !contents.contains("pa snippet: pa-aliases"),
+        "snippet block should be gone"
+    );
+}
+
+#[test]
+fn snippets_install_dry_run_leaves_file_untouched() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let rc = tmp.child(".bashrc");
+    rc.write_str("original\n").unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["snippets", "install", "pa-aliases", "--dry-run", "--to"])
+        .arg(rc.path())
+        .assert()
+        .success()
+        .stdout(contains("DRY RUN"))
+        .stdout(contains("alias p='pa'"));
+
+    let contents = std::fs::read_to_string(rc.path()).unwrap();
+    assert_eq!(contents, "original\n", "file should not be modified");
+}
+
+#[test]
 fn list_walks_up_when_no_workspace_flag() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let _ = write_demo_workspace(&tmp);

@@ -115,6 +115,10 @@ pub enum Command {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<PathBuf>,
     },
+    /// Manage bundled bash snippets — opt-in ergonomics
+    /// (aliases, Termux-friendly tweaks) that ship with pa.
+    #[command(subcommand)]
+    Snippets(SnippetsCommand),
     /// Render the resolved workspace as a starter script (tmux) or
     /// layout (zellij). Useful for committing a per-machine launcher
     /// alongside the workspace TOML.
@@ -163,6 +167,43 @@ pub enum AddKindArg {
     DevServer,
     Shell,
     Other,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SnippetsCommand {
+    /// List every bundled snippet with a one-line description.
+    List,
+    /// Print a snippet's contents to stdout.
+    Show {
+        /// Snippet name (see `pa snippets list`).
+        name: String,
+    },
+    /// Append or update a snippet in your rc file. Idempotent —
+    /// repeated installs replace the block in-place instead of
+    /// duplicating. Other content in the rc file is preserved
+    /// verbatim.
+    Install {
+        /// Snippet name.
+        name: String,
+        /// Target file. Defaults to `$HOME/.bashrc`. Pass your
+        /// actual rc (`~/.zshrc`, `~/.config/fish/config.fish`,
+        /// etc.) if bash isn't your shell — the snippets are
+        /// POSIX-ish and will run under zsh; fish users should
+        /// translate by hand until we ship fish snippets.
+        #[arg(long = "to")]
+        to: Option<PathBuf>,
+        /// Print what would be written without modifying the file.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Remove a previously-installed snippet from your rc file.
+    Uninstall {
+        name: String,
+        #[arg(long = "from")]
+        from: Option<PathBuf>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
 }
 
 impl From<AddKindArg> for crate::domain::SessionKind {
@@ -460,6 +501,98 @@ pub fn add(
     let out = io::stdout();
     let mut out = out.lock();
     writeln!(out, "added session {name:?} to {}", ws_path.display())?;
+    Ok(())
+}
+
+pub fn snippets(cmd: SnippetsCommand) -> Result<()> {
+    use crate::snippets as sn;
+    let out = io::stdout();
+    let mut out = out.lock();
+    match cmd {
+        SnippetsCommand::List => {
+            writeln!(out, "bundled pa snippets:")?;
+            for s in sn::SNIPPETS {
+                writeln!(out, "  {:<20}  {}", s.name, s.description)?;
+            }
+            writeln!(
+                out,
+                "\nInstall one with: pa snippets install <name>  (default target: ~/.bashrc)"
+            )?;
+        }
+        SnippetsCommand::Show { name } => {
+            let s = sn::lookup(&name)?;
+            writeln!(out, "# {} — {}", s.name, s.description)?;
+            out.write_all(s.contents.as_bytes())?;
+        }
+        SnippetsCommand::Install { name, to, dry_run } => {
+            let s = sn::lookup(&name)?;
+            let target = match to {
+                Some(p) => p,
+                None => sn::default_rcfile()?,
+            };
+            if dry_run {
+                let existing = std::fs::read_to_string(&target).unwrap_or_default();
+                let new = sn::install_into(&existing, s);
+                writeln!(
+                    out,
+                    "# DRY RUN: would write the following to {}:",
+                    target.display()
+                )?;
+                out.write_all(new.as_bytes())?;
+            } else {
+                sn::install(&target, s)?;
+                writeln!(
+                    out,
+                    "installed snippet {:?} into {}",
+                    s.name,
+                    target.display()
+                )?;
+                writeln!(
+                    out,
+                    "reload your shell or `source {}` to pick up the changes.",
+                    target.display()
+                )?;
+            }
+        }
+        SnippetsCommand::Uninstall {
+            name,
+            from,
+            dry_run,
+        } => {
+            let target = match from {
+                Some(p) => p,
+                None => sn::default_rcfile()?,
+            };
+            if dry_run {
+                let existing = std::fs::read_to_string(&target).unwrap_or_default();
+                match sn::uninstall_from(&existing, &name) {
+                    Some(new) => {
+                        writeln!(
+                            out,
+                            "# DRY RUN: would write the following to {} (snippet {:?} removed):",
+                            target.display(),
+                            name
+                        )?;
+                        out.write_all(new.as_bytes())?;
+                    }
+                    None => writeln!(
+                        out,
+                        "snippet {name:?} is not installed in {}",
+                        target.display()
+                    )?,
+                }
+            } else {
+                match sn::uninstall(&target, &name)? {
+                    Some(_) => writeln!(out, "removed snippet {name:?} from {}", target.display())?,
+                    None => writeln!(
+                        out,
+                        "snippet {name:?} was not installed in {}",
+                        target.display()
+                    )?,
+                }
+            }
+        }
+    }
     Ok(())
 }
 
