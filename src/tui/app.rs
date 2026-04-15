@@ -31,6 +31,10 @@ pub enum LaunchKind {
 #[derive(Debug, Clone)]
 pub enum AppOutcome {
     Quit,
+    /// User pressed Esc to go back. The outer driver routes this:
+    /// - if the picker was the entry point, re-open it;
+    /// - otherwise (walk-up path) treat the same as Quit.
+    Back,
     Launch(LaunchKind),
 }
 
@@ -41,6 +45,9 @@ pub enum AppOutcome {
 pub enum Action {
     None,
     Quit,
+    /// Esc pressed — ask the outer driver to back out to the picker
+    /// (or quit if the picker wasn't in the chain).
+    Back,
     LaunchSelected,
 }
 
@@ -149,6 +156,7 @@ impl App {
         match action {
             Action::None => None,
             Action::Quit => Some(AppOutcome::Quit),
+            Action::Back => Some(AppOutcome::Back),
             Action::LaunchSelected => self.selected().and_then(|i| {
                 let row = self.rows.get(i)?;
                 let kind = match row.state {
@@ -176,7 +184,7 @@ impl App {
     /// synchronously without faking a crossterm event stream.
     pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Action {
         match (code, mods) {
-            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+            (KeyCode::Char('q'), _) => {
                 self.should_quit = true;
                 Action::Quit
             }
@@ -184,6 +192,9 @@ impl App {
                 self.should_quit = true;
                 Action::Quit
             }
+            // Esc backs out one level — to the picker when we came in
+            // through it, else quit. Driver in `tui::run` decides.
+            (KeyCode::Esc, _) => Action::Back,
             (KeyCode::Enter, _) => Action::LaunchSelected,
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
                 self.select_next();
@@ -324,11 +335,11 @@ impl App {
 /// DESIGN.md §10 for the mobile constraints that drive this.
 fn footer_for_width(width: u16) -> &'static str {
     if width >= 60 {
-        " j/k: nav · g/G: top/bottom · Enter: launch · q: quit "
+        " j/k: nav · Enter: launch · Esc: back · q: quit "
     } else if width >= 30 {
-        " j/k · Enter: launch · q: quit "
+        " j/k · Esc: back · q: quit "
     } else {
-        " q: quit "
+        " Esc · q: quit "
     }
 }
 
@@ -803,9 +814,10 @@ mod tests {
 
     #[test]
     fn quit_keys_return_quit_action() {
+        // q and Ctrl+C still quit; Esc is now Back (handled by outer
+        // driver — see tui::run). Tested separately below.
         for key in [
             (KeyCode::Char('q'), KeyModifiers::NONE),
-            (KeyCode::Esc, KeyModifiers::NONE),
             (KeyCode::Char('c'), KeyModifiers::CONTROL),
         ] {
             let ws = sample_workspace("x", 2);
@@ -813,6 +825,14 @@ mod tests {
             let action = app.handle_key(key.0, key.1);
             assert_eq!(action, Action::Quit, "key {key:?} should return Quit");
         }
+    }
+
+    #[test]
+    fn esc_returns_back_action() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let action = app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(action, Action::Back);
     }
 
     #[test]

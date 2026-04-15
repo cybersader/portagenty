@@ -17,75 +17,125 @@ use crate::mux::TmuxAdapter;
 /// workspace + live mpx sessions, runs the TUI, and — if the user
 /// picked a row — restores the terminal and hands off to the mpx.
 pub fn run() -> Result<()> {
-    // Three-phase load:
-    //   1. Try normal walk-up discovery.
-    //   2. On failure: if we're interactive + first-time, run the
-    //      onboarding wizard.
-    //   3. Otherwise (interactive but already onboarded): show a
-    //      ratatui workspace picker if any are registered, else fall
-    //      through to a synthetic "live sessions only" workspace.
-    //
-    // The picker path loads its chosen workspace inside the same
-    // ratatui session so there's no flicker between screens — one
-    // `init()` / `restore()` bracket covers the whole interaction.
-    let (workspace, use_existing_terminal) = match load(&LoadOptions::default()) {
-        Ok(w) => (w, None),
-        Err(load_err) => {
-            if !crate::onboarding::is_interactive() {
-                return Err(load_err);
-            }
-            if !crate::onboarding::has_onboarded() {
-                use crate::onboarding::OnboardOutcome;
-                match crate::onboarding::run_wizard(false)? {
-                    OnboardOutcome::Scaffolded { .. } => (load(&LoadOptions::default())?, None),
-                    OnboardOutcome::ShowedDocs | OnboardOutcome::Skipped => return Ok(()),
-                }
-            } else {
-                // TUI picker for registered workspaces + live browse.
-                let registered = crate::config::list_registered_workspaces().unwrap_or_default();
+    // See DESIGN.md §12 for the full entry-point contract. In short:
+    //   walk-up → (wizard first-time) → (picker returning) → session TUI
+    // with Esc from the session TUI routing back to the picker when
+    // the picker was the entry point.
+    let walked_up = load(&LoadOptions::default()).ok();
+
+    // If walk-up succeeded, run the session TUI directly. Esc here
+    // means "quit" because there's no picker to go back to.
+    if let Some(ws) = walked_up {
+        let mut terminal = ratatui::init();
+        let result = run_session_tui(&mut terminal, ws);
+        ratatui::restore();
+        return finalize(result);
+    }
+
+    // Walk-up failed.
+    if !crate::onboarding::is_interactive() {
+        return Err(anyhow::anyhow!(
+            "no *.portagenty.toml found walking up from {}",
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "?".into())
+        ));
+    }
+
+    if !crate::onboarding::has_onboarded() {
+        use crate::onboarding::OnboardOutcome;
+        match crate::onboarding::run_wizard(false)? {
+            OnboardOutcome::Scaffolded { .. } => {
+                let ws = load(&LoadOptions::default())?;
                 let mut terminal = ratatui::init();
-                let outcome = picker::run(&mut terminal, &registered);
-                match outcome {
-                    Ok(picker::PickerOutcome::Workspace(path)) => {
-                        let opts = LoadOptions {
-                            workspace_path: Some(path),
-                            ..Default::default()
-                        };
-                        match load(&opts) {
-                            Ok(w) => (w, Some(terminal)),
-                            Err(e) => {
-                                ratatui::restore();
-                                return Err(e);
-                            }
-                        }
-                    }
-                    Ok(picker::PickerOutcome::LiveBrowse) => {
-                        (synthetic_browse_workspace()?, Some(terminal))
-                    }
-                    Ok(picker::PickerOutcome::Quit) => {
-                        ratatui::restore();
-                        return Ok(());
-                    }
+                let result = run_session_tui(&mut terminal, ws);
+                ratatui::restore();
+                return finalize(result);
+            }
+            OnboardOutcome::ShowedDocs | OnboardOutcome::Skipped => return Ok(()),
+        }
+    }
+
+    // Returning interactive user with no walkable workspace. Loop
+    // picker ↔ session TUI so Esc from the session list returns here.
+    let mut terminal = ratatui::init();
+    loop {
+        let registered = crate::config::list_registered_workspaces().unwrap_or_default();
+        let picker_outcome = match picker::run(&mut terminal, &registered) {
+            Ok(o) => o,
+            Err(e) => {
+                ratatui::restore();
+                return Err(e);
+            }
+        };
+        let ws = match picker_outcome {
+            picker::PickerOutcome::Quit => {
+                ratatui::restore();
+                return Ok(());
+            }
+            picker::PickerOutcome::LiveBrowse => synthetic_browse_workspace()?,
+            picker::PickerOutcome::Workspace(path) => {
+                let opts = LoadOptions {
+                    workspace_path: Some(path),
+                    ..Default::default()
+                };
+                match load(&opts) {
+                    Ok(w) => w,
                     Err(e) => {
                         ratatui::restore();
                         return Err(e);
                     }
                 }
             }
+        };
+        let result = run_session_tui(&mut terminal, ws);
+        match result {
+            // User pressed Esc in the session TUI — back to picker.
+            Ok(SessionRunOutcome::Back) => continue,
+            Ok(SessionRunOutcome::Quit) => {
+                ratatui::restore();
+                return Ok(());
+            }
+            Ok(SessionRunOutcome::Launched(r)) => {
+                ratatui::restore();
+                return finalize_launch(r);
+            }
+            Err(e) => {
+                ratatui::restore();
+                return Err(e);
+            }
         }
-    };
+    }
+}
+
+/// Outcome of a single session-TUI run, as seen by the outer driver.
+enum SessionRunOutcome {
+    /// Esc — caller should return to the picker (or quit if no picker).
+    Back,
+    /// q / Ctrl+C — caller should exit cleanly.
+    Quit,
+    /// User picked a session; deferred launch result for the caller.
+    Launched(Result<()>),
+}
+
+/// Runs the session-list TUI against an already-initialized terminal.
+/// Does *not* restore the terminal — caller owns init/restore so the
+/// picker can share one ratatui session with the session list.
+fn run_session_tui(
+    terminal: &mut ratatui::DefaultTerminal,
+    workspace: crate::domain::Workspace,
+) -> Result<SessionRunOutcome> {
     let workspace_file = workspace.file_path.clone();
     let mpx_kind = workspace.multiplexer;
     let mux: Box<dyn crate::mux::Multiplexer> = match workspace.multiplexer {
         crate::domain::Multiplexer::Tmux => Box::new(TmuxAdapter::new()),
         crate::domain::Multiplexer::Zellij => {
-            // zellij refuses nested sessions, and erroring out *after*
-            // the TUI tears down leaves the message liable to scroll
-            // off-screen. Catch it up front so the user sees a clean
-            // actionable error on the shell they launched `pa` from.
             if crate::mux::ZellijAdapter::is_inside_zellij() {
                 let cur =
                     std::env::var("ZELLIJ_SESSION_NAME").unwrap_or_else(|_| "<unknown>".into());
+                // Restore before bailing so the user sees the message
+                // on their shell, not over the ratatui buffer.
+                ratatui::restore();
                 anyhow::bail!(
                     "refusing to open the TUI: you're already inside zellij session {cur:?}.\n\
                      zellij can't attach to another session from within a client. Options:\n\
@@ -101,51 +151,53 @@ pub fn run() -> Result<()> {
         }
     };
 
-    // Best-effort live-session snapshot. A failure here shouldn't
-    // block the TUI — the user might not have tmux / zellij running
-    // yet, and we can still show workspace sessions.
     let live = mux.list_sessions().unwrap_or_default();
-
     let app = App::new(workspace, mux, live);
+    let (outcome, mux) = app.run(terminal)?;
 
-    // Re-use the picker's ratatui terminal if we already initialized
-    // one, else init fresh. Either way, restore once at the end so
-    // the user's shell is in a sane state.
-    let mut terminal = use_existing_terminal.unwrap_or_else(ratatui::init);
-    let result = app.run(&mut terminal);
-    ratatui::restore();
-
-    // TUI Enter defaults to takeover — "I'm here now, this is the
-    // main client." Matches the cross-device ergonomic DESIGN sketch
-    // has always implied. A future key could offer shared-attach if
-    // there's demand.
     let mode = crate::mux::AttachMode::Takeover;
-    let launch_result = match result? {
-        (AppOutcome::Quit, _) => return Ok(()),
-        (AppOutcome::Launch(LaunchKind::Create { session }), mux) => {
+    Ok(match outcome {
+        AppOutcome::Back => SessionRunOutcome::Back,
+        AppOutcome::Quit => SessionRunOutcome::Quit,
+        AppOutcome::Launch(LaunchKind::Create { session }) => {
             if let Some(path) = &workspace_file {
                 let _ = crate::state::record_launch(path, &session.name);
             }
+            // Restore terminal so the mpx takes a clean tty and the
+            // pre-launch banner prints to the user's real shell.
+            ratatui::restore();
             print_launch_banner(mpx_kind, &session.name);
-            mux.create_and_attach(&session, mode)
+            SessionRunOutcome::Launched(mux.create_and_attach(&session, mode))
         }
-        (AppOutcome::Launch(LaunchKind::Attach { mpx_name }), mux) => {
+        AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
             if let Some(path) = &workspace_file {
                 let _ = crate::state::record_launch(path, &mpx_name);
             }
+            ratatui::restore();
             print_launch_banner(mpx_kind, &mpx_name);
-            mux.attach(&mpx_name, mode)
+            SessionRunOutcome::Launched(mux.attach(&mpx_name, mode))
         }
-    };
-    // A post-TUI error on a freshly-restored terminal can be easy to
-    // miss — the next shell prompt scrolls it. Emit a loud header so
-    // the user sees that something actually went wrong.
-    if let Err(e) = &launch_result {
+    })
+}
+
+/// Collapse a walk-up session-TUI outcome (Back or Quit both exit
+/// cleanly; Launched is deferred to [`finalize_launch`]).
+fn finalize(r: Result<SessionRunOutcome>) -> Result<()> {
+    match r? {
+        SessionRunOutcome::Back | SessionRunOutcome::Quit => Ok(()),
+        SessionRunOutcome::Launched(launch) => finalize_launch(launch),
+    }
+}
+
+/// Emit the loud post-restore banner on launch failure so the error
+/// survives the user's next shell prompt.
+fn finalize_launch(launch: Result<()>) -> Result<()> {
+    if let Err(e) = &launch {
         eprintln!();
         eprintln!("  pa: couldn't launch the selected session.");
         eprintln!("  {e:#}");
     }
-    launch_result
+    launch
 }
 
 /// Build a synthetic empty workspace so the TUI can render
