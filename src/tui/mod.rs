@@ -2,8 +2,10 @@
 //! responsive layout for Termux/small-screen use. See `DESIGN.md` §10.
 
 pub mod app;
+pub mod view;
 
 pub use app::{Action, App, AppOutcome};
+pub use view::{build_rows, SessionRow, SessionState};
 
 use anyhow::Result;
 
