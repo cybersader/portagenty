@@ -16,7 +16,30 @@ use crate::mux::TmuxAdapter;
 /// workspace + live mpx sessions, runs the TUI, and — if the user
 /// picked a row — restores the terminal and hands off to the mpx.
 pub fn run() -> Result<()> {
-    let workspace = load(&LoadOptions::default())?;
+    // Two-phase load: try to find a workspace. If walk-up fails AND
+    // we're in an interactive shell AND the user hasn't seen
+    // onboarding yet, offer the first-run wizard instead of just
+    // erroring. Scripted / piped / CI runs bypass the wizard and
+    // get the original error.
+    let workspace = match load(&LoadOptions::default()) {
+        Ok(w) => w,
+        Err(e) => {
+            if crate::onboarding::is_interactive() && !crate::onboarding::has_onboarded() {
+                use crate::onboarding::OnboardOutcome;
+                match crate::onboarding::run_wizard(false)? {
+                    OnboardOutcome::Scaffolded { .. } => {
+                        // File was just created in cwd — retry load.
+                        load(&LoadOptions::default())?
+                    }
+                    OnboardOutcome::ShowedDocs | OnboardOutcome::Skipped => {
+                        return Ok(());
+                    }
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    };
     let workspace_file = workspace.file_path.clone();
     let mux: Box<dyn crate::mux::Multiplexer> = match workspace.multiplexer {
         crate::domain::Multiplexer::Tmux => Box::new(TmuxAdapter::new()),

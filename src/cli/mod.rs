@@ -119,6 +119,10 @@ pub enum Command {
     /// (aliases, Termux-friendly tweaks) that ship with pa.
     #[command(subcommand)]
     Snippets(SnippetsCommand),
+    /// Walk through the first-run wizard at any time. Scaffolds a
+    /// workspace in the current directory, picks a multiplexer,
+    /// optionally pre-populates a Claude Code session. Safe to re-run.
+    Onboard,
     /// Render the resolved workspace as a starter script (tmux) or
     /// layout (zellij). Useful for committing a per-machine launcher
     /// alongside the workspace TOML.
@@ -501,6 +505,11 @@ pub fn add(
     let out = io::stdout();
     let mut out = out.lock();
     writeln!(out, "added session {name:?} to {}", ws_path.display())?;
+    Ok(())
+}
+
+pub fn onboard() -> Result<()> {
+    crate::onboarding::run_wizard(true)?;
     Ok(())
 }
 

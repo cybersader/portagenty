@@ -9,6 +9,7 @@ pub mod config;
 pub mod domain;
 pub mod export;
 pub mod mux;
+pub mod onboarding;
 pub mod snippets;
 pub mod state;
 pub mod tui;
@@ -39,6 +40,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }) => cli::export(workspace.as_ref(), format, output.as_ref()),
         Some(Command::Init { name, mpx, force }) => cli::init(name, mpx, force),
         Some(Command::Snippets(cmd)) => cli::snippets(cmd),
+        Some(Command::Onboard) => cli::onboard(),
         Some(Command::Add {
             name,
             command,
