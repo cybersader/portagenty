@@ -32,10 +32,13 @@ const isWindows = process.platform === "win32";
 // against the response body — keeps the test honest beyond a 200.
 const CHECKS = [
   { path: `${PREFIX}/`, mustContain: "portagenty" },
-  { path: `${PREFIX}/getting-started/installation/`, mustContain: "Installation" },
+  { path: `${PREFIX}/getting-started/installation/`, mustContain: "install" },
   { path: `${PREFIX}/getting-started/quickstart/`, mustContain: "Quickstart" },
   { path: `${PREFIX}/getting-started/dev/`, mustContain: "Tailscale" },
+  { path: `${PREFIX}/getting-started/termux/`, mustContain: "Termux" },
   { path: `${PREFIX}/concepts/`, mustContain: "Workspace" },
+  { path: `${PREFIX}/reference/commands/`, mustContain: "pa launch" },
+  { path: `${PREFIX}/reference/schema/`, mustContain: "session" },
   { path: `${PREFIX}/pagefind/pagefind.js`, mustContain: "" }, // 200 is enough
   { path: `${PREFIX}/sitemap-index.xml`, mustContain: "<sitemap>" },
 ];

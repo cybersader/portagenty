@@ -17,28 +17,44 @@ hero:
 import { Card, CardGrid } from "@astrojs/starlight/components";
 
 <CardGrid>
-  <Card title="One binary, three platforms" icon="rocket">
-    Linux, macOS, and Windows native. `scp` it to a new machine and run.
-    No runtime to install.
+  <Card title="One command to install" icon="rocket">
+    `cargo install --git https://github.com/cybersader/portagenty`.
+    Nothing else to clone, nothing to compile by hand. Single static
+    Rust binary at `~/.cargo/bin/pa`.
   </Card>
-  <Card title="Hierarchy on top of hierarchy" icon="open-book">
-    Projects live wherever they live on disk. Workspaces are alternative
-    views — recent, tagged, hand-curated — over the same projects.
+  <Card title="Cross-device takeover" icon="seti:config">
+    SSH in from your phone, run `pa claim`, and the session instantly
+    reshapes to the new device. No more "stuck at my laptop's
+    terminal width" when you hop between machines.
+  </Card>
+  <Card title="Works with what's already running" icon="approve-check">
+    Tmux / zellij sessions you started outside portagenty show up in
+    the TUI as Untracked, ready to attach. Nothing is deleted; you
+    just see what's live.
   </Card>
   <Card title="Multiplexer-aware" icon="setting">
-    tmux is the v1 reference adapter. zellij and WezTerm follow in v1.x.
-    Each adapter is an attach-or-create orchestrator, never a replacement.
-  </Card>
-  <Card title="Agnostic core" icon="puzzle">
-    A session is `name + cwd + command`. Claude Code, OpenCode, vim,
-    htop — all the same to portagenty's core.
+    tmux + zellij first-class. Renders native starter artifacts for
+    both via `pa export` so teammates can launch without installing
+    pa.
   </Card>
 </CardGrid>
 
 ## Status
 
-**Pre-release.** v1 is under active construction. See the
-[roadmap](https://github.com/cybersader/portagenty/blob/main/ROADMAP.md)
-for what lands when. The
-[design doc](https://github.com/cybersader/portagenty/blob/main/DESIGN.md)
+**v1 is feature-complete and usable daily.** Core flows work
+end-to-end: walk up to find a workspace, render the session list,
+pick one, attach — in tmux or zellij.
+
+Several v1.x items are also shipped: zellij adapter, untracked
+session adoption, cross-device takeover, `kind:` hints, per-session
+env vars, declarative export (`pa export`). Session schema
+extensions (pre/post commands), tag + custom-group views, and a
+`pa up` eager-launch are still on the [roadmap](https://github.com/cybersader/portagenty/blob/main/ROADMAP.md).
+
+WezTerm is **intentionally not supported** — its mux is built around
+the GUI emulator's window model, not the headless detach/reattach
+pattern portagenty's cross-device work depends on. See the roadmap
+for the rationale.
+
+The [design doc](https://github.com/cybersader/portagenty/blob/main/DESIGN.md)
 is the source of truth for terminology and architecture.

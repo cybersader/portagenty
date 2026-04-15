@@ -50,13 +50,12 @@ export default defineConfig({
           autogenerate: { directory: "concepts" },
         },
         {
-          label: "Design",
-          autogenerate: { directory: "design" },
-          collapsed: true,
-        },
-        {
           label: "Reference",
           autogenerate: { directory: "reference" },
+        },
+        {
+          label: "Design",
+          autogenerate: { directory: "design" },
           collapsed: true,
         },
       ],
