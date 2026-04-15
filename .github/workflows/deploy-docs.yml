@@ -32,3 +32,5 @@ jobs:
           bun-version: latest
       - run: bun install --frozen-lockfile
       - run: bun run build
+      - name: Smoke-test built site
+        run: bun run smoke:no-build

@@ -16,6 +16,8 @@
     "serve:build": "bun scripts/serve.mjs build",
     "serve:tailscale": "bun scripts/serve.mjs tailscale",
     "serve:cloudflare": "bun scripts/serve.mjs cloudflare",
+    "smoke": "bun scripts/smoke.mjs",
+    "smoke:no-build": "bun scripts/smoke.mjs --no-build",
     "astro": "astro"
   },
   "dependencies": {
