@@ -260,19 +260,37 @@ impl App {
             return;
         }
 
+        let width = area.width;
+        // Compute column widths once, shared across all rows so the
+        // table is actually aligned. Name column caps at 20; cwd and
+        // command get proportional budgets based on remaining width.
         let name_col = self
             .rows
             .iter()
             .map(|r| r.display_name.chars().count())
             .max()
             .unwrap_or(0)
-            .min(24);
+            .clamp(4, 20);
 
-        let width = area.width;
+        // Fixed overhead:
+        //   2 highlight symbol, 1 gutter, 1 marker, 1 sep,
+        //   0–2 kind glyph, 1 sep, name_col, 2 sep, status (~11),
+        //   2 sep padding for safety.
+        let kind_space = if self.rows.iter().any(|r| kind_glyph_present(r.kind)) {
+            2
+        } else {
+            0
+        };
+        let fixed = 2 + 1 + 1 + 1 + kind_space + 1 + name_col + 2 + 11 + 2;
+        let remaining = (width as usize).saturating_sub(fixed);
+        // Split remaining between cwd and command roughly 55/45.
+        let cwd_col = (remaining * 55 / 100).min(40);
+        let cmd_col = remaining.saturating_sub(cwd_col + 2);
+
         let items: Vec<ListItem> = self
             .rows
             .iter()
-            .map(|r| row_list_item(r, name_col, width))
+            .map(|r| row_list_item(r, name_col, width, cwd_col, cmd_col, kind_space > 0))
             .collect();
 
         let list = List::new(items)
@@ -300,17 +318,14 @@ fn footer_for_width(width: u16) -> &'static str {
     }
 }
 
-fn row_list_item(row: &SessionRow, name_col: usize, width: u16) -> ListItem<'static> {
-    let padded_name = if row.display_name.chars().count() >= name_col {
-        row.display_name.clone()
-    } else {
-        format!(
-            "{:<width$}",
-            row.display_name,
-            width = name_col.saturating_add(1)
-        )
-    };
-
+fn row_list_item(
+    row: &SessionRow,
+    name_col: usize,
+    width: u16,
+    cwd_col: usize,
+    cmd_col: usize,
+    reserve_kind_space: bool,
+) -> ListItem<'static> {
     // State marker (● ○ ?) — color encodes Live/NotStarted/Untracked.
     let marker_style = match row.state {
         SessionState::Live => Style::default()
@@ -323,8 +338,7 @@ fn row_list_item(row: &SessionRow, name_col: usize, width: u16) -> ListItem<'sta
     };
 
     // Kind marker — small per-kind glyph shown right after the state
-    // marker when the session has a kind hint. Covered by v1.x
-    // item 9 in ROADMAP.md.
+    // marker when the session has a kind hint.
     let (kind_glyph, kind_style) = kind_display(row.kind);
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(12);
@@ -334,9 +348,14 @@ fn row_list_item(row: &SessionRow, name_col: usize, width: u16) -> ListItem<'sta
     if let Some(glyph) = kind_glyph {
         spans.push(Span::styled(glyph.to_string(), kind_style));
         spans.push(Span::raw(" "));
+    } else if reserve_kind_space {
+        // Keep name column aligned across rows when some rows have a
+        // kind glyph and others don't.
+        spans.push(Span::raw("  "));
     }
+    let name_cell = pad_or_truncate(&row.display_name, name_col);
     spans.push(Span::styled(
-        padded_name,
+        name_cell,
         Style::default().add_modifier(Modifier::BOLD),
     ));
 
@@ -347,12 +366,14 @@ fn row_list_item(row: &SessionRow, name_col: usize, width: u16) -> ListItem<'sta
     //   >=50  → name · command · [status]
     //   >=30  → name · [status]
     //   <30   → name only (marker + name is all that fits)
-    if width >= 80 {
+    if width >= 80 && cwd_col >= 8 {
         spans.push(Span::raw("  "));
-        spans.push(Span::raw(row.cwd_display.clone()));
+        let cwd_cell = pad_or_truncate(&compact_path(&row.cwd_display), cwd_col);
+        spans.push(Span::raw(cwd_cell));
         spans.push(Span::raw("  "));
+        let cmd_cell = pad_or_truncate(&row.command_display, cmd_col.max(4));
         spans.push(Span::styled(
-            row.command_display.clone(),
+            cmd_cell,
             Style::default().add_modifier(Modifier::DIM),
         ));
         spans.push(Span::raw("  "));
@@ -362,8 +383,9 @@ fn row_list_item(row: &SessionRow, name_col: usize, width: u16) -> ListItem<'sta
         ));
     } else if width >= 50 {
         spans.push(Span::raw("  "));
+        let cmd_cell = pad_or_truncate(&row.command_display, 22);
         spans.push(Span::styled(
-            row.command_display.clone(),
+            cmd_cell,
             Style::default().add_modifier(Modifier::DIM),
         ));
         spans.push(Span::raw("  "));
@@ -379,6 +401,58 @@ fn row_list_item(row: &SessionRow, name_col: usize, width: u16) -> ListItem<'sta
         ));
     }
     ListItem::new(Line::from(spans))
+}
+
+/// Does this row have a kind glyph we'd render? Used to decide
+/// whether to reserve space on rows that *don't* have one, so the
+/// table stays aligned.
+fn kind_glyph_present(kind: Option<crate::domain::SessionKind>) -> bool {
+    kind_display(kind).0.is_some()
+}
+
+/// Pad the string with spaces to exactly `width` chars, or truncate
+/// with a middle ellipsis if it's too long. Width is measured in
+/// chars (proxy for cells — good enough for ASCII-mostly session
+/// names / paths).
+fn pad_or_truncate(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count == width {
+        s.to_string()
+    } else if count < width {
+        format!("{s}{}", " ".repeat(width - count))
+    } else if width <= 1 {
+        s.chars().take(width).collect()
+    } else {
+        // Middle ellipsis: keep the start and the end, drop the middle.
+        // Paths are more recognizable by their leaf, so bias the split
+        // toward preserving the trailing portion.
+        let ell = "…";
+        let keep = width - 1;
+        let tail = (keep * 2).div_ceil(3);
+        let head = keep - tail;
+        let head_str: String = s.chars().take(head).collect();
+        let tail_start = count - tail;
+        let tail_str: String = s.chars().skip(tail_start).collect();
+        format!("{head_str}{ell}{tail_str}")
+    }
+}
+
+/// Compact a filesystem path for display:
+///   - replace the user's $HOME prefix with `~`
+///   - leave the rest alone (truncation happens at padding time)
+fn compact_path(p: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            if p == home {
+                return "~".to_string();
+            }
+            let home_slash = format!("{home}/");
+            if let Some(rest) = p.strip_prefix(&home_slash) {
+                return format!("~/{rest}");
+            }
+        }
+    }
+    p.to_string()
 }
 
 /// Per-kind display — glyph + style. `None` for Shell/Other since the
