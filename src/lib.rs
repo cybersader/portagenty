@@ -18,7 +18,11 @@ use cli::{Cli, Command};
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         None => tui::run(),
-        Some(Command::Launch { target }) => cli::launch(&target),
-        Some(Command::List) => cli::list(),
+        Some(Command::Launch {
+            session,
+            workspace,
+            dry_run,
+        }) => cli::launch(&session, workspace.as_ref(), dry_run),
+        Some(Command::List { workspace }) => cli::list(workspace.as_ref()),
     }
 }
