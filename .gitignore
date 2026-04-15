@@ -24,3 +24,8 @@ docs/bun.lockb.bak
 *.log
 .env
 .env.local
+
+# Any stray workspace file left by running `pa init` inside the repo
+# itself during manual testing. The repo isn't a pa workspace.
+*.portagenty.toml
+portagenty.toml
