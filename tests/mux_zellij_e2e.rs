@@ -139,11 +139,21 @@ fn session_info_cwd_and_attached_are_none_from_list() {
     a.create_background(&name).unwrap();
     guard.track(&name);
 
-    let list = a.list_sessions().unwrap();
-    let found = list
-        .iter()
-        .find(|s| s.name == name)
-        .expect("session should be in list");
+    // Under CI load zellij's session registry propagation can trail
+    // create_background's own poll by a beat or two when other e2e
+    // tests are racing create/kill on the same $XDG_RUNTIME_DIR.
+    // Retry the lookup briefly rather than failing on the first miss —
+    // same contract, just with slack matching real observed timing.
+    let mut found = None;
+    for _ in 0..20 {
+        let list = a.list_sessions().unwrap();
+        if let Some(info) = list.iter().find(|s| s.name == name) {
+            found = Some(info.clone());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let found = found.expect("session should be in list within 1s");
     // zellij doesn't expose these; adapter reports None to match the
     // SessionInfo contract.
     assert_eq!(found.cwd, None);

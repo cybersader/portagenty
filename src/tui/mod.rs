@@ -41,6 +41,7 @@ pub fn run() -> Result<()> {
         }
     };
     let workspace_file = workspace.file_path.clone();
+    let mpx_kind = workspace.multiplexer;
     let mux: Box<dyn crate::mux::Multiplexer> = match workspace.multiplexer {
         crate::domain::Multiplexer::Tmux => Box::new(TmuxAdapter::new()),
         crate::domain::Multiplexer::Zellij => {
@@ -88,12 +89,14 @@ pub fn run() -> Result<()> {
             if let Some(path) = &workspace_file {
                 let _ = crate::state::record_launch(path, &session.name);
             }
+            print_launch_banner(mpx_kind, &session.name);
             mux.create_and_attach(&session, mode)
         }
         (AppOutcome::Launch(LaunchKind::Attach { mpx_name }), mux) => {
             if let Some(path) = &workspace_file {
                 let _ = crate::state::record_launch(path, &mpx_name);
             }
+            print_launch_banner(mpx_kind, &mpx_name);
             mux.attach(&mpx_name, mode)
         }
     };
@@ -106,4 +109,28 @@ pub fn run() -> Result<()> {
         eprintln!("  {e:#}");
     }
     launch_result
+}
+
+/// Print a one-line hand-off banner just before we replace the TUI
+/// with the multiplexer client. Tells the user which session they're
+/// entering and the mpx-specific detach chord they'll need to get
+/// back out. Keeping this info local to `pa` (no keybind rebinding,
+/// no config mutation) means we don't couple to any specific zellij
+/// or tmux version's defaults — users with custom configs just ignore
+/// the hint and use their own chord.
+fn print_launch_banner(mpx: crate::domain::Multiplexer, session: &str) {
+    let detach = match mpx {
+        crate::domain::Multiplexer::Tmux => "Ctrl+B then d",
+        crate::domain::Multiplexer::Zellij => "Ctrl+O then d",
+        crate::domain::Multiplexer::Wezterm => "see wezterm docs",
+    };
+    let mpx_name = match mpx {
+        crate::domain::Multiplexer::Tmux => "tmux",
+        crate::domain::Multiplexer::Zellij => "zellij",
+        crate::domain::Multiplexer::Wezterm => "wezterm",
+    };
+    eprintln!();
+    eprintln!("  pa → {mpx_name} session \"{session}\"");
+    eprintln!("        detach: {detach}  ·  re-attach: pa claim {session}");
+    eprintln!();
 }
