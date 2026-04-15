@@ -472,6 +472,10 @@ kind = "shell"
 
     std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
 
+    // Register globally so `pa` can list this workspace from any
+    // directory without relying on walk-up. Best-effort.
+    let _ = crate::config::register_global_workspace(&path);
+
     let out = io::stdout();
     let mut out = out.lock();
     writeln!(out, "created {}", path.display())?;

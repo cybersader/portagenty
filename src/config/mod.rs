@@ -58,6 +58,81 @@ pub fn set_global_default_multiplexer(mpx: crate::domain::Multiplexer) -> Result
     Ok(())
 }
 
+/// Append a workspace file path to the global registry, idempotently.
+/// Lets `pa` from any directory list known workspaces so users don't
+/// have to walk into the project tree to see it. Preserves the rest
+/// of the global config verbatim via toml_edit.
+pub fn register_global_workspace(ws_path: &Path) -> Result<()> {
+    let cfg_path = global_config_path()?;
+    let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .with_context(|| format!("parsing existing global config {}", cfg_path.display()))?;
+
+    let canonical = ws_path
+        .canonicalize()
+        .unwrap_or_else(|_| ws_path.to_path_buf());
+    let wanted = canonical.display().to_string();
+
+    // Walk existing [[workspace]] entries; skip if already present.
+    let already = doc
+        .get("workspace")
+        .and_then(|i| i.as_array_of_tables())
+        .map(|arr| {
+            arr.iter().any(|t| {
+                t.get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == wanted)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if already {
+        return Ok(());
+    }
+
+    if !doc.contains_key("workspace") {
+        doc["workspace"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    let arr = doc["workspace"]
+        .as_array_of_tables_mut()
+        .ok_or_else(|| anyhow!("global config has a non-array 'workspace' field"))?;
+    let mut t = toml_edit::Table::new();
+    t["path"] = toml_edit::value(wanted);
+    arr.push(t);
+
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&cfg_path, doc.to_string())
+        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    Ok(())
+}
+
+/// List all workspace files registered globally, as absolute paths.
+/// Paths that start with `~` or `${HOME}` are expanded. Missing
+/// entries (files that no longer exist on disk) are filtered out so
+/// the TUI doesn't render stale rows.
+pub fn list_registered_workspaces() -> Result<Vec<PathBuf>> {
+    let path = match global_config_path() {
+        Ok(p) => p,
+        Err(_) => return Ok(vec![]),
+    };
+    if !path.is_file() {
+        return Ok(vec![]);
+    }
+    let global: GlobalFile = load_toml(&path)?;
+    let mut out = Vec::with_capacity(global.workspaces.len());
+    for entry in &global.workspaces {
+        let expanded = resolve_path(&entry.path, std::path::Path::new("."))?;
+        if expanded.is_file() {
+            out.push(expanded);
+        }
+    }
+    Ok(out)
+}
+
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 

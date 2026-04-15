@@ -38,8 +38,13 @@ pub fn run() -> Result<()> {
                 }
             } else {
                 // Interactive + already onboarded + no workspace here.
-                // Fall into "browse live sessions" mode.
-                synthetic_browse_workspace()?
+                // Before falling into "browse live sessions" mode,
+                // surface any globally-registered workspaces so users
+                // can jump into one without cd'ing into its tree.
+                match offer_registered_workspaces()? {
+                    Some(ws) => ws,
+                    None => synthetic_browse_workspace()?,
+                }
             }
         }
     };
@@ -112,6 +117,60 @@ pub fn run() -> Result<()> {
         eprintln!("  {e:#}");
     }
     launch_result
+}
+
+/// If there are globally-registered workspaces, print a numbered
+/// picker so the user can pick one without cd'ing anywhere. Returns:
+///   - `Ok(Some(workspace))` — user picked one, we loaded it
+///   - `Ok(None)` — no registered workspaces, or user opted to skip
+///   - `Err(_)` — only on IO errors from reading stdin
+fn offer_registered_workspaces() -> Result<Option<crate::domain::Workspace>> {
+    use std::io::{BufRead, Write};
+
+    let registered = crate::config::list_registered_workspaces().unwrap_or_default();
+    if registered.is_empty() {
+        return Ok(None);
+    }
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  No workspace here. Pick one of your registered workspaces:"
+    )?;
+    for (i, path) in registered.iter().enumerate() {
+        // Best-effort name extraction from file stem; we don't parse
+        // the TOML here to keep this cheap. Users recognize their own
+        // projects by the filename.
+        let label = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_suffix(".portagenty"))
+            .unwrap_or_else(|| path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
+        writeln!(out, "    [{}] {}  ({})", i + 1, label, path.display())?;
+    }
+    writeln!(out, "    [0] just show live sessions on this machine")?;
+    write!(out, "  Choice [0]: ")?;
+    out.flush()?;
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    let choice = line.trim();
+    if choice.is_empty() || choice == "0" {
+        return Ok(None);
+    }
+    let idx: usize = match choice.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= registered.len() => n - 1,
+        _ => return Ok(None),
+    };
+    let picked = &registered[idx];
+    let opts = LoadOptions {
+        workspace_path: Some(picked.clone()),
+        ..Default::default()
+    };
+    Ok(Some(load(&opts)?))
 }
 
 /// Build a synthetic empty workspace so the TUI can render

@@ -272,6 +272,15 @@ fn scaffold_flow<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<
 
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
 
+    // Register globally so `pa` from any directory can see this
+    // workspace without the user having to walk back into the tree.
+    // Best-effort: a registry failure shouldn't break a successful
+    // scaffold — the local file still works via walk-up.
+    if let Err(e) = crate::config::register_global_workspace(&path) {
+        writeln!(output)?;
+        writeln!(output, "  warning: couldn't register in global index: {e}")?;
+    }
+
     writeln!(output)?;
     writeln!(output, "  ✓ Created {}", path.display())?;
     writeln!(output, "  Run `pa` here to open the TUI.")?;
