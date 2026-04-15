@@ -5,12 +5,26 @@
 //! share the user's default server; tests pass a per-test socket so
 //! concurrent nextest runs don't collide.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::domain::Session;
 use crate::mux::{sanitize_session_name, Multiplexer, SessionInfo};
+
+/// Wrap a std::io::Error that fired during a tmux invocation. We
+/// lift `NotFound` into a clear "tmux isn't installed or isn't in
+/// PATH" message instead of surfacing the raw os error 2.
+fn friendly_io_err(context: &str, err: io::Error) -> anyhow::Error {
+    if err.kind() == io::ErrorKind::NotFound {
+        anyhow!(
+            "{context}: tmux binary not found. Install tmux (`sudo apt install tmux` on Debian/Ubuntu, `brew install tmux` on macOS, or your distro's package manager) or `cargo install` a `tmux-bin` equivalent and make sure it's on PATH."
+        )
+    } else {
+        anyhow::Error::new(err).context(context.to_string())
+    }
+}
 
 /// tmux-backed [`Multiplexer`].
 ///
@@ -62,7 +76,7 @@ impl TmuxAdapter {
             .arg(&session.cwd)
             .arg(&session.command)
             .status()
-            .context("spawning tmux new-session")?;
+            .map_err(|e| friendly_io_err("spawning tmux new-session", e))?;
         if !status.success() {
             bail!("tmux new-session failed for session {name:?}");
         }
@@ -102,7 +116,7 @@ impl Multiplexer for TmuxAdapter {
             .arg("-F")
             .arg("#{session_name}|#{session_path}|#{session_attached}")
             .output()
-            .context("spawning tmux list-sessions")?;
+            .map_err(|e| friendly_io_err("spawning tmux list-sessions", e))?;
 
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -144,7 +158,7 @@ impl Multiplexer for TmuxAdapter {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .context("spawning tmux has-session")?;
+            .map_err(|e| friendly_io_err("spawning tmux has-session", e))?;
         Ok(status.success())
     }
 
@@ -155,7 +169,7 @@ impl Multiplexer for TmuxAdapter {
             .arg("-t")
             .arg(name)
             .status()
-            .context("spawning tmux attach-session")?;
+            .map_err(|e| friendly_io_err("spawning tmux attach-session", e))?;
         if !status.success() {
             bail!("tmux attach-session failed for {name:?}");
         }
@@ -180,7 +194,7 @@ impl Multiplexer for TmuxAdapter {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .context("spawning tmux kill-session")?;
+            .map_err(|e| friendly_io_err("spawning tmux kill-session", e))?;
         if !status.success() {
             bail!("tmux kill-session failed for {name:?}");
         }
@@ -192,7 +206,7 @@ impl Multiplexer for TmuxAdapter {
             .cmd()
             .arg("detach-client")
             .status()
-            .context("spawning tmux detach-client")?;
+            .map_err(|e| friendly_io_err("spawning tmux detach-client", e))?;
         if !status.success() {
             bail!("tmux detach-client failed");
         }

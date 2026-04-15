@@ -2,7 +2,39 @@
 
 A portable, terminal-native launcher for agent workspaces. Written in Rust. Binary name: `pa`.
 
-> Status: pre-release, **chunk A bootstrap landed**. Cargo project, CI, docs site, and module skeleton are in place; behavior is not. The TUI and tmux adapter come in chunks B–D. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what gets built when. Docs site: <https://cybersader.github.io/portagenty/>. Local + Tailscale preview also supported (see below).
+> Status: **v1 feature-complete, pre-release**. `pa` loads a workspace, shows its sessions in a TUI, and launches the selected session in tmux. `pa launch <name>` and `pa list` work headlessly. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what's shipped and what's next (v1.x: zellij + WezTerm adapters, untracked-session adoption, Recent/Tags/Groups views, declarative export). Docs site: <https://cybersader.github.io/portagenty/>. Local + Tailscale preview also supported (see below).
+
+## Quickstart (using `pa`)
+
+```sh
+# 1. Install tmux if you don't have it.
+sudo apt install tmux    # or: brew install tmux
+
+# 2. Build pa.
+cargo install --path .   # or: cargo build --release
+
+# 3. Drop a workspace file anywhere.
+cat > ~/code/my.portagenty.toml <<'EOF'
+name = "My stuff"
+multiplexer = "tmux"
+projects = ["~/code/one", "~/code/two"]
+
+[[session]]
+name = "claude"
+cwd = "~/code/one"
+command = "claude"
+
+[[session]]
+name = "dev"
+cwd = "~/code/two"
+command = "bun run dev"
+EOF
+
+# 4. From any directory under the workspace file:
+pa                       # opens TUI; pick a session, Enter to launch
+pa list                  # prints the resolved workspace
+pa launch claude         # one-shot: skip TUI, go straight to tmux
+```
 
 ## Building (development)
 
