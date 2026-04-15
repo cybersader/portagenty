@@ -43,7 +43,24 @@ pub fn run() -> Result<()> {
     let workspace_file = workspace.file_path.clone();
     let mux: Box<dyn crate::mux::Multiplexer> = match workspace.multiplexer {
         crate::domain::Multiplexer::Tmux => Box::new(TmuxAdapter::new()),
-        crate::domain::Multiplexer::Zellij => Box::new(crate::mux::ZellijAdapter::new()),
+        crate::domain::Multiplexer::Zellij => {
+            // zellij refuses nested sessions, and erroring out *after*
+            // the TUI tears down leaves the message liable to scroll
+            // off-screen. Catch it up front so the user sees a clean
+            // actionable error on the shell they launched `pa` from.
+            if crate::mux::ZellijAdapter::is_inside_zellij() {
+                let cur =
+                    std::env::var("ZELLIJ_SESSION_NAME").unwrap_or_else(|_| "<unknown>".into());
+                anyhow::bail!(
+                    "refusing to open the TUI: you're already inside zellij session {cur:?}.\n\
+                     zellij can't attach to another session from within a client. Options:\n\
+                       - Detach first (Ctrl+Q by default), then run `pa` again.\n\
+                       - Or launch into the existing session directly: `zellij attach <name>`.\n\
+                     Current live zellij sessions: run `zellij list-sessions -n -s` to see them."
+                );
+            }
+            Box::new(crate::mux::ZellijAdapter::new())
+        }
         crate::domain::Multiplexer::Wezterm => {
             anyhow::bail!("the wezterm multiplexer adapter is not implemented yet (v1.x)")
         }
@@ -65,8 +82,8 @@ pub fn run() -> Result<()> {
     // has always implied. A future key could offer shared-attach if
     // there's demand.
     let mode = crate::mux::AttachMode::Takeover;
-    match result? {
-        (AppOutcome::Quit, _) => Ok(()),
+    let launch_result = match result? {
+        (AppOutcome::Quit, _) => return Ok(()),
         (AppOutcome::Launch(LaunchKind::Create { session }), mux) => {
             if let Some(path) = &workspace_file {
                 let _ = crate::state::record_launch(path, &session.name);
@@ -79,5 +96,14 @@ pub fn run() -> Result<()> {
             }
             mux.attach(&mpx_name, mode)
         }
+    };
+    // A post-TUI error on a freshly-restored terminal can be easy to
+    // miss — the next shell prompt scrolls it. Emit a loud header so
+    // the user sees that something actually went wrong.
+    if let Err(e) = &launch_result {
+        eprintln!();
+        eprintln!("  pa: couldn't launch the selected session.");
+        eprintln!("  {e:#}");
     }
+    launch_result
 }
