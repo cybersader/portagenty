@@ -2,7 +2,7 @@
 
 A portable, terminal-native launcher for agent workspaces. Written in Rust. Binary name: `pa`.
 
-> Status: pre-release, **chunk A bootstrap landed**. Cargo project, CI, docs site, and module skeleton are in place; behavior is not. The TUI and tmux adapter come in chunks B–D. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what gets built when. The repo is private for now; docs are served locally / over Tailscale (see below).
+> Status: pre-release, **chunk A bootstrap landed**. Cargo project, CI, docs site, and module skeleton are in place; behavior is not. The TUI and tmux adapter come in chunks B–D. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what gets built when. Docs site: <https://cybersader.github.io/portagenty/>. Local + Tailscale preview also supported (see below).
 
 ## Building (development)
 

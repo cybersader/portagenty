@@ -1,9 +1,4 @@
-name: docs-build
-
-# This repo is private and the docs site is served locally / over Tailscale
-# via `cd docs && bun run serve` (see docs/scripts/serve.mjs). This workflow
-# only verifies that the docs build doesn't break on changes — no deploy.
-# When the repo goes public, swap this for an actual Pages deploy job.
+name: deploy-docs
 
 on:
   push:
@@ -15,6 +10,15 @@ on:
     paths:
       - "docs/**"
   workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: deploy-docs
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -34,3 +38,19 @@ jobs:
       - run: bun run build
       - name: Smoke-test built site
         run: bun run smoke:no-build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/dist
+
+  deploy:
+    # Only deploy from main; PR builds just verify the build + smoke.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
