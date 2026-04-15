@@ -4,10 +4,30 @@ use assert_cmd::Command;
 use assert_fs::prelude::*;
 use predicates::str::contains;
 
+/// Shared tempdir used as the test process's XDG_CONFIG_HOME. Pointing
+/// every spawned `pa` at an isolated config dir keeps tests from
+/// polluting the real user's `~/.config/portagenty/config.toml` when
+/// they exercise code paths that register workspaces globally
+/// (`pa init`, `pa onboard`, etc.).
+fn test_xdg_config_home() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<assert_fs::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| assert_fs::TempDir::new().unwrap())
+        .path()
+}
+
+/// Wrapper around `Command::cargo_bin("pa")` that pins an isolated
+/// XDG_CONFIG_HOME so writes to the global config stay inside the
+/// test sandbox.
+fn pa_cmd() -> Command {
+    let mut c = Command::cargo_bin("pa").unwrap();
+    c.env("XDG_CONFIG_HOME", test_xdg_config_home());
+    c
+}
+
 #[test]
 fn version_flag_prints_version() {
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .arg("--version")
         .assert()
         .success()
@@ -16,8 +36,7 @@ fn version_flag_prints_version() {
 
 #[test]
 fn help_flag_mentions_workspaces() {
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .arg("--help")
         .assert()
         .success()
@@ -30,8 +49,7 @@ fn launch_errors_when_no_workspace_found() {
     let empty = tmp.child("empty");
     empty.create_dir_all().unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["launch", "claude"])
         .current_dir(empty.path())
         .assert()
@@ -66,8 +84,7 @@ fn launch_dry_run_prints_what_would_happen() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["launch", "claude", "--dry-run"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -84,8 +101,7 @@ fn launch_with_shared_flag_reports_shared_mode() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["launch", "claude", "--dry-run", "--shared"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -100,8 +116,7 @@ fn claim_with_explicit_name_dry_runs_as_takeover() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["claim", "tests", "--dry-run"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -118,8 +133,7 @@ fn claim_without_name_defaults_to_first_session() {
     let ws_path = write_demo_workspace(&tmp);
 
     // demo workspace has two sessions: "claude" (declared first) and "tests".
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["claim", "--dry-run"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -134,8 +148,7 @@ fn export_to_stdout_uses_workspace_default_format() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["export"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -152,8 +165,7 @@ fn export_with_zellij_format_emits_kdl() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["export", "--format", "zellij"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -170,8 +182,7 @@ fn export_writes_to_output_path_when_dash_o_given() {
     let ws_path = write_demo_workspace(&tmp);
     let out = tmp.child("starter.sh");
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["export", "--format", "tmux"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -198,8 +209,7 @@ multiplexer = "tmux"
         )
         .unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["claim", "--dry-run"])
         .arg("--workspace")
         .arg(tmp.child("empty.portagenty.toml").path())
@@ -213,8 +223,7 @@ fn launch_errors_on_unknown_session_name() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["launch", "nonexistent", "--dry-run"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -230,8 +239,7 @@ fn list_prints_workspace_summary() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["list"])
         .arg("--workspace")
         .arg(&ws_path)
@@ -247,8 +255,7 @@ fn list_prints_workspace_summary() {
 fn init_creates_starter_workspace_with_sane_defaults() {
     let tmp = assert_fs::TempDir::new().unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["init", "my-space"])
         .current_dir(tmp.path())
         .assert()
@@ -271,8 +278,7 @@ fn init_creates_starter_workspace_with_sane_defaults() {
 fn init_with_zellij_mpx_flag_pins_zellij() {
     let tmp = assert_fs::TempDir::new().unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["init", "zj-space", "--mpx", "zellij"])
         .current_dir(tmp.path())
         .assert()
@@ -288,8 +294,7 @@ fn init_errors_when_file_already_exists_unless_force() {
     let tmp = assert_fs::TempDir::new().unwrap();
     tmp.child("dup.portagenty.toml").write_str("").unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["init", "dup"])
         .current_dir(tmp.path())
         .assert()
@@ -297,8 +302,7 @@ fn init_errors_when_file_already_exists_unless_force() {
         .stderr(contains("--force"));
 
     // With --force it overwrites.
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["init", "dup", "--force"])
         .current_dir(tmp.path())
         .assert()
@@ -311,8 +315,7 @@ fn init_defaults_name_to_current_directory() {
     let nested = tmp.child("my-project-name");
     nested.create_dir_all().unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["init"])
         .current_dir(nested.path())
         .assert()
@@ -328,8 +331,7 @@ fn init_defaults_name_to_current_directory() {
 fn add_appends_new_session_and_pa_list_sees_it() {
     let tmp = assert_fs::TempDir::new().unwrap();
     // Bootstrap with init.
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["init", "myws"])
         .current_dir(tmp.path())
         .assert()
@@ -338,8 +340,7 @@ fn add_appends_new_session_and_pa_list_sees_it() {
     let ws_path = tmp.child("myws.portagenty.toml");
 
     // Append a new session.
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args([
             "add",
             "claude",
@@ -355,8 +356,7 @@ fn add_appends_new_session_and_pa_list_sees_it() {
         .stdout(contains("added session"));
 
     // pa list sees both the original shell session and the new one.
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["list"])
         .arg("--workspace")
         .arg(ws_path.path())
@@ -370,8 +370,7 @@ fn add_appends_new_session_and_pa_list_sees_it() {
 #[test]
 fn add_errors_on_duplicate_session_name() {
     let tmp = assert_fs::TempDir::new().unwrap();
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["init", "ws"])
         .current_dir(tmp.path())
         .assert()
@@ -379,8 +378,7 @@ fn add_errors_on_duplicate_session_name() {
     let ws_path = tmp.child("ws.portagenty.toml");
 
     // First add succeeds.
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["add", "tests", "-c", "cargo test"])
         .arg("--workspace")
         .arg(ws_path.path())
@@ -388,8 +386,7 @@ fn add_errors_on_duplicate_session_name() {
         .success();
 
     // Second add with same name fails cleanly.
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["add", "tests", "-c", "cargo test"])
         .arg("--workspace")
         .arg(ws_path.path())
@@ -401,8 +398,7 @@ fn add_errors_on_duplicate_session_name() {
 #[test]
 fn add_errors_when_no_workspace_found() {
     let tmp = assert_fs::TempDir::new().unwrap();
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["add", "claude", "-c", "claude"])
         .current_dir(tmp.path())
         .assert()
@@ -412,8 +408,7 @@ fn add_errors_when_no_workspace_found() {
 
 #[test]
 fn completions_bash_produces_bash_completion_script() {
-    let out = Command::cargo_bin("pa")
-        .unwrap()
+    let out = pa_cmd()
         .args(["completions", "bash"])
         .assert()
         .success()
@@ -432,8 +427,7 @@ fn completions_bash_produces_bash_completion_script() {
 
 #[test]
 fn completions_zsh_produces_zsh_completion_script() {
-    let out = Command::cargo_bin("pa")
-        .unwrap()
+    let out = pa_cmd()
         .args(["completions", "zsh"])
         .assert()
         .success()
@@ -451,8 +445,7 @@ fn completions_zsh_produces_zsh_completion_script() {
 
 #[test]
 fn completions_fish_produces_fish_completion_script() {
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["completions", "fish"])
         .assert()
         .success()
@@ -482,8 +475,7 @@ command = "cargo test"
     )
     .unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["rm", "claude", "-w"])
         .arg(ws.path())
         .assert()
@@ -502,8 +494,7 @@ fn rm_errors_on_unknown_session_name_and_lists_available() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["rm", "nonexistent", "-w"])
         .arg(&ws_path)
         .assert()
@@ -518,8 +509,7 @@ fn edit_changes_command_in_place() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["edit", "claude", "--command", "claude --resume", "-w"])
         .arg(&ws_path)
         .assert()
@@ -537,8 +527,7 @@ fn edit_can_rename_a_session() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["edit", "claude", "--rename", "agent", "-w"])
         .arg(&ws_path)
         .assert()
@@ -550,8 +539,7 @@ fn edit_can_rename_a_session() {
     assert!(after.contains(r#"name = "tests""#));
 
     // `pa list` sees the new name.
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["list", "-w"])
         .arg(&ws_path)
         .assert()
@@ -566,8 +554,7 @@ fn edit_rename_collision_errors() {
 
     // demo workspace has "claude" and "tests" — renaming claude to
     // tests should fail.
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["edit", "claude", "--rename", "tests", "-w"])
         .arg(&ws_path)
         .assert()
@@ -580,8 +567,7 @@ fn edit_errors_without_any_change_flag() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["edit", "claude", "-w"])
         .arg(&ws_path)
         .assert()
@@ -594,8 +580,7 @@ fn edit_errors_with_multiple_change_flags() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["edit", "claude", "--command", "a", "--cwd", "/tmp", "-w"])
         .arg(&ws_path)
         .assert()
@@ -605,8 +590,7 @@ fn edit_errors_with_multiple_change_flags() {
 
 #[test]
 fn snippets_list_shows_known_snippets() {
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["snippets", "list"])
         .assert()
         .success()
@@ -616,8 +600,7 @@ fn snippets_list_shows_known_snippets() {
 
 #[test]
 fn snippets_show_prints_file_contents() {
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["snippets", "show", "pa-aliases"])
         .assert()
         .success()
@@ -627,8 +610,7 @@ fn snippets_show_prints_file_contents() {
 
 #[test]
 fn snippets_show_errors_on_unknown_name() {
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["snippets", "show", "nope"])
         .assert()
         .failure()
@@ -641,8 +623,7 @@ fn snippets_install_writes_to_target_file() {
     let rc = tmp.child(".bashrc");
     rc.write_str("# my shell config\nexport FOO=bar\n").unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["snippets", "install", "pa-aliases"])
         .arg("--to")
         .arg(rc.path())
@@ -669,8 +650,7 @@ fn snippets_install_is_idempotent() {
     rc.write_str("").unwrap();
 
     for _ in 0..3 {
-        Command::cargo_bin("pa")
-            .unwrap()
+        pa_cmd()
             .args(["snippets", "install", "pa-aliases", "--to"])
             .arg(rc.path())
             .assert()
@@ -692,15 +672,13 @@ fn snippets_uninstall_removes_block_and_keeps_user_content() {
     let rc = tmp.child(".bashrc");
     rc.write_str("export FOO=bar\n").unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["snippets", "install", "pa-aliases", "--to"])
         .arg(rc.path())
         .assert()
         .success();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["snippets", "uninstall", "pa-aliases", "--from"])
         .arg(rc.path())
         .assert()
@@ -721,8 +699,7 @@ fn snippets_install_dry_run_leaves_file_untouched() {
     let rc = tmp.child(".bashrc");
     rc.write_str("original\n").unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .args(["snippets", "install", "pa-aliases", "--dry-run", "--to"])
         .arg(rc.path())
         .assert()
@@ -741,8 +718,7 @@ fn list_walks_up_when_no_workspace_flag() {
     let deep = tmp.child("a/b/c");
     deep.create_dir_all().unwrap();
 
-    Command::cargo_bin("pa")
-        .unwrap()
+    pa_cmd()
         .arg("list")
         .current_dir(deep.path())
         .assert()

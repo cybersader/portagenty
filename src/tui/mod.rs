@@ -2,6 +2,7 @@
 //! responsive layout for Termux/small-screen use. See `DESIGN.md` §10.
 
 pub mod app;
+pub mod picker;
 pub mod view;
 
 pub use app::{Action, App, AppOutcome, LaunchKind};
@@ -20,12 +21,15 @@ pub fn run() -> Result<()> {
     //   1. Try normal walk-up discovery.
     //   2. On failure: if we're interactive + first-time, run the
     //      onboarding wizard.
-    //   3. Otherwise (interactive but already onboarded, or declined
-    //      wizard): fall through to a synthetic "live sessions only"
-    //      workspace so users can still browse + attach to whatever
-    //      tmux/zellij sessions they have, without authoring a TOML.
-    let workspace = match load(&LoadOptions::default()) {
-        Ok(w) => w,
+    //   3. Otherwise (interactive but already onboarded): show a
+    //      ratatui workspace picker if any are registered, else fall
+    //      through to a synthetic "live sessions only" workspace.
+    //
+    // The picker path loads its chosen workspace inside the same
+    // ratatui session so there's no flicker between screens — one
+    // `init()` / `restore()` bracket covers the whole interaction.
+    let (workspace, use_existing_terminal) = match load(&LoadOptions::default()) {
+        Ok(w) => (w, None),
         Err(load_err) => {
             if !crate::onboarding::is_interactive() {
                 return Err(load_err);
@@ -33,17 +37,39 @@ pub fn run() -> Result<()> {
             if !crate::onboarding::has_onboarded() {
                 use crate::onboarding::OnboardOutcome;
                 match crate::onboarding::run_wizard(false)? {
-                    OnboardOutcome::Scaffolded { .. } => load(&LoadOptions::default())?,
+                    OnboardOutcome::Scaffolded { .. } => (load(&LoadOptions::default())?, None),
                     OnboardOutcome::ShowedDocs | OnboardOutcome::Skipped => return Ok(()),
                 }
             } else {
-                // Interactive + already onboarded + no workspace here.
-                // Before falling into "browse live sessions" mode,
-                // surface any globally-registered workspaces so users
-                // can jump into one without cd'ing into its tree.
-                match offer_registered_workspaces()? {
-                    Some(ws) => ws,
-                    None => synthetic_browse_workspace()?,
+                // TUI picker for registered workspaces + live browse.
+                let registered = crate::config::list_registered_workspaces().unwrap_or_default();
+                let mut terminal = ratatui::init();
+                let outcome = picker::run(&mut terminal, &registered);
+                match outcome {
+                    Ok(picker::PickerOutcome::Workspace(path)) => {
+                        let opts = LoadOptions {
+                            workspace_path: Some(path),
+                            ..Default::default()
+                        };
+                        match load(&opts) {
+                            Ok(w) => (w, Some(terminal)),
+                            Err(e) => {
+                                ratatui::restore();
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Ok(picker::PickerOutcome::LiveBrowse) => {
+                        (synthetic_browse_workspace()?, Some(terminal))
+                    }
+                    Ok(picker::PickerOutcome::Quit) => {
+                        ratatui::restore();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        ratatui::restore();
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -82,7 +108,10 @@ pub fn run() -> Result<()> {
 
     let app = App::new(workspace, mux, live);
 
-    let mut terminal = ratatui::init();
+    // Re-use the picker's ratatui terminal if we already initialized
+    // one, else init fresh. Either way, restore once at the end so
+    // the user's shell is in a sane state.
+    let mut terminal = use_existing_terminal.unwrap_or_else(ratatui::init);
     let result = app.run(&mut terminal);
     ratatui::restore();
 
@@ -117,60 +146,6 @@ pub fn run() -> Result<()> {
         eprintln!("  {e:#}");
     }
     launch_result
-}
-
-/// If there are globally-registered workspaces, print a numbered
-/// picker so the user can pick one without cd'ing anywhere. Returns:
-///   - `Ok(Some(workspace))` — user picked one, we loaded it
-///   - `Ok(None)` — no registered workspaces, or user opted to skip
-///   - `Err(_)` — only on IO errors from reading stdin
-fn offer_registered_workspaces() -> Result<Option<crate::domain::Workspace>> {
-    use std::io::{BufRead, Write};
-
-    let registered = crate::config::list_registered_workspaces().unwrap_or_default();
-    if registered.is_empty() {
-        return Ok(None);
-    }
-
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out)?;
-    writeln!(
-        out,
-        "  No workspace here. Pick one of your registered workspaces:"
-    )?;
-    for (i, path) in registered.iter().enumerate() {
-        // Best-effort name extraction from file stem; we don't parse
-        // the TOML here to keep this cheap. Users recognize their own
-        // projects by the filename.
-        let label = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_suffix(".portagenty"))
-            .unwrap_or_else(|| path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
-        writeln!(out, "    [{}] {}  ({})", i + 1, label, path.display())?;
-    }
-    writeln!(out, "    [0] just show live sessions on this machine")?;
-    write!(out, "  Choice [0]: ")?;
-    out.flush()?;
-
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
-    let choice = line.trim();
-    if choice.is_empty() || choice == "0" {
-        return Ok(None);
-    }
-    let idx: usize = match choice.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= registered.len() => n - 1,
-        _ => return Ok(None),
-    };
-    let picked = &registered[idx];
-    let opts = LoadOptions {
-        workspace_path: Some(picked.clone()),
-        ..Default::default()
-    };
-    Ok(Some(load(&opts)?))
 }
 
 /// Build a synthetic empty workspace so the TUI can render
