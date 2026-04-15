@@ -197,34 +197,70 @@ fn escape_kdl(s: &str) -> String {
     out
 }
 
-/// Generate the KDL layout we hand to `zellij --layout` when starting
-/// a session with a specific cwd + command. Single pane running
-/// `bash -c "<command>"` so shell metacharacters in the command work
-/// the same as when the user runs them from their own shell.
+/// Generate the KDL layout we hand to `zellij --new-session-with-layout`
+/// when starting a session with a specific cwd + command. Wraps our
+/// command pane in the stock `default_tab_template` so zellij's
+/// familiar tab-bar (top) and status-bar (bottom, with hotkey hints)
+/// show up — otherwise a bare `layout { pane {} }` strips them, which
+/// looks very broken to anyone who's used zellij before.
+///
+/// For trivially-a-shell commands (`bash`, `sh`, `zsh`, `$SHELL`) we
+/// don't wrap in `-c` — running `bash -c "bash"` sometimes yields a
+/// short-lived non-interactive inner shell depending on flags. Running
+/// the shell binary directly gets the user's normal interactive shell.
 ///
 /// When the session has env vars set, we route through `env(1)` —
 /// each `KEY=VAL` is a separate KDL string arg, which avoids shell-
-/// escape gymnastics inside the bash -c payload. zellij invokes
-/// `env KEY1=val1 KEY2=val2 bash -c <cmd>`, env sets the vars and
-/// execs bash, and bash runs the user's command with the vars set.
+/// escape gymnastics inside the bash -c payload.
 fn render_layout(session: &Session) -> String {
-    let cwd = escape_kdl(&session.cwd.display().to_string());
+    // Normalize cwd: strip trailing `.` component the walk-up loader
+    // leaves behind for `cwd = "."` in TOML. Zellij accepts it but it
+    // looks ugly in the status bar and is harmless to trim.
+    let cwd_path = {
+        let s = session.cwd.display().to_string();
+        if let Some(stripped) = s.strip_suffix("/.") {
+            stripped.to_string()
+        } else if s == "." {
+            ".".to_string()
+        } else {
+            s
+        }
+    };
+    let cwd = escape_kdl(&cwd_path);
     let cmd = escape_kdl(&session.command);
 
-    if session.env.is_empty() {
-        format!(
-            "layout {{\n    pane cwd=\"{cwd}\" {{\n        command \"bash\"\n        args \"-c\" \"{cmd}\"\n    }}\n}}\n"
-        )
+    // Stock zellij default — needed so status-bar + tab-bar plugins
+    // render. Values match the out-of-the-box tab template.
+    let tab_template = "    default_tab_template {\n        pane size=1 borderless=true {\n            plugin location=\"zellij:tab-bar\"\n        }\n        children\n        pane size=2 borderless=true {\n            plugin location=\"zellij:status-bar\"\n        }\n    }\n";
+
+    let pane = if session.env.is_empty() {
+        if is_shell_command(&session.command) {
+            // Run the shell binary directly; no `-c` wrapper.
+            format!("    pane cwd=\"{cwd}\" {{\n        command \"{cmd}\"\n    }}\n")
+        } else {
+            format!("    pane cwd=\"{cwd}\" {{\n        command \"bash\"\n        args \"-c\" \"{cmd}\"\n    }}\n")
+        }
     } else {
         let mut env_args = String::new();
         for (k, v) in &session.env {
             let pair = format!("{k}={v}");
             env_args.push_str(&format!(" \"{}\"", escape_kdl(&pair)));
         }
-        format!(
-            "layout {{\n    pane cwd=\"{cwd}\" {{\n        command \"env\"\n        args{env_args} \"bash\" \"-c\" \"{cmd}\"\n    }}\n}}\n"
-        )
-    }
+        if is_shell_command(&session.command) {
+            format!("    pane cwd=\"{cwd}\" {{\n        command \"env\"\n        args{env_args} \"{cmd}\"\n    }}\n")
+        } else {
+            format!("    pane cwd=\"{cwd}\" {{\n        command \"env\"\n        args{env_args} \"bash\" \"-c\" \"{cmd}\"\n    }}\n")
+        }
+    };
+
+    format!("layout {{\n{tab_template}{pane}}}\n")
+}
+
+/// Is this command "just run a login shell"? Matches the bare shell
+/// binary names we expect users to type in a scaffolded workspace.
+fn is_shell_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    matches!(trimmed, "bash" | "sh" | "zsh" | "fish" | "ash" | "dash")
 }
 
 /// Write the layout to a deterministic path under `$TMPDIR`. One file
@@ -443,6 +479,66 @@ mod tests {
         assert!(
             layout.contains(r#""bash" "-c" "claude""#),
             "missing bash tail:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_includes_default_tab_template_for_status_bar() {
+        let s = Session {
+            name: "x".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "claude".into(),
+            kind: None,
+            env: std::collections::BTreeMap::new(),
+        };
+        let layout = render_layout(&s);
+        assert!(
+            layout.contains("default_tab_template"),
+            "missing default_tab_template (status bar will not show):\n{layout}"
+        );
+        assert!(
+            layout.contains("zellij:status-bar"),
+            "missing status-bar plugin:\n{layout}"
+        );
+        assert!(
+            layout.contains("zellij:tab-bar"),
+            "missing tab-bar plugin:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_runs_bare_shell_without_dash_c_wrapper() {
+        let s = Session {
+            name: "x".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "bash".into(),
+            kind: None,
+            env: std::collections::BTreeMap::new(),
+        };
+        let layout = render_layout(&s);
+        assert!(
+            layout.contains(r#"command "bash""#),
+            "should run bash directly:\n{layout}"
+        );
+        assert!(
+            !layout.contains(r#"args "-c""#),
+            "should not wrap bare shell in -c:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_strips_trailing_dot_from_cwd() {
+        let s = Session {
+            name: "x".into(),
+            cwd: PathBuf::from("/home/u/project/."),
+            command: "bash".into(),
+            kind: None,
+            env: std::collections::BTreeMap::new(),
+        };
+        let layout = render_layout(&s);
+        assert!(
+            layout.contains(r#"cwd="/home/u/project""#),
+            "trailing /. should be stripped:\n{layout}"
         );
     }
 

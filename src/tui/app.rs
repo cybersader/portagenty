@@ -268,10 +268,11 @@ impl App {
             .unwrap_or(0)
             .min(24);
 
+        let width = area.width;
         let items: Vec<ListItem> = self
             .rows
             .iter()
-            .map(|r| row_list_item(r, name_col))
+            .map(|r| row_list_item(r, name_col, width))
             .collect();
 
         let list = List::new(items)
@@ -299,7 +300,7 @@ fn footer_for_width(width: u16) -> &'static str {
     }
 }
 
-fn row_list_item(row: &SessionRow, name_col: usize) -> ListItem<'static> {
+fn row_list_item(row: &SessionRow, name_col: usize, width: u16) -> ListItem<'static> {
     let padded_name = if row.display_name.chars().count() >= name_col {
         row.display_name.clone()
     } else {
@@ -338,18 +339,45 @@ fn row_list_item(row: &SessionRow, name_col: usize) -> ListItem<'static> {
         padded_name,
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::raw(row.cwd_display.clone()));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        row.command_display.clone(),
-        Style::default().add_modifier(Modifier::DIM),
-    ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("[{}]", row.state.label()),
-        Style::default().add_modifier(Modifier::DIM),
-    ));
+
+    // Responsive columns — drop non-essentials as the terminal gets
+    // narrower so the session name stays visible. Tiers tuned for
+    // Termux-over-SSH in portrait (~30–40 cols) vs. desktop.
+    //   >=80  → name · cwd · command · [status]
+    //   >=50  → name · command · [status]
+    //   >=30  → name · [status]
+    //   <30   → name only (marker + name is all that fits)
+    if width >= 80 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::raw(row.cwd_display.clone()));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            row.command_display.clone(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("[{}]", row.state.label()),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    } else if width >= 50 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            row.command_display.clone(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("[{}]", row.state.label()),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    } else if width >= 30 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("[{}]", row.state.label()),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
     ListItem::new(Line::from(spans))
 }
 
