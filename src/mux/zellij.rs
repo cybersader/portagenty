@@ -233,12 +233,18 @@ fn render_layout(session: &Session) -> String {
     // render. Values match the out-of-the-box tab template.
     let tab_template = "    default_tab_template {\n        pane size=1 borderless=true {\n            plugin location=\"zellij:tab-bar\"\n        }\n        children\n        pane size=2 borderless=true {\n            plugin location=\"zellij:status-bar\"\n        }\n    }\n";
 
+    // `close_on_exit true`: without it, zellij holds the pane open
+    // after the command finishes, showing "EXIT CODE: 0 — press
+    // ENTER to close" which confuses users who expect their shell
+    // exit to close the session.
     let pane = if session.env.is_empty() {
         if is_shell_command(&session.command) {
             // Run the shell binary directly; no `-c` wrapper.
-            format!("    pane cwd=\"{cwd}\" {{\n        command \"{cmd}\"\n    }}\n")
+            format!(
+                "    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"{cmd}\"\n    }}\n"
+            )
         } else {
-            format!("    pane cwd=\"{cwd}\" {{\n        command \"bash\"\n        args \"-c\" \"{cmd}\"\n    }}\n")
+            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"bash\"\n        args \"-c\" \"{cmd}\"\n    }}\n")
         }
     } else {
         let mut env_args = String::new();
@@ -247,9 +253,9 @@ fn render_layout(session: &Session) -> String {
             env_args.push_str(&format!(" \"{}\"", escape_kdl(&pair)));
         }
         if is_shell_command(&session.command) {
-            format!("    pane cwd=\"{cwd}\" {{\n        command \"env\"\n        args{env_args} \"{cmd}\"\n    }}\n")
+            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"env\"\n        args{env_args} \"{cmd}\"\n    }}\n")
         } else {
-            format!("    pane cwd=\"{cwd}\" {{\n        command \"env\"\n        args{env_args} \"bash\" \"-c\" \"{cmd}\"\n    }}\n")
+            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"env\"\n        args{env_args} \"bash\" \"-c\" \"{cmd}\"\n    }}\n")
         }
     };
 
@@ -345,6 +351,32 @@ impl Multiplexer for ZellijAdapter {
             );
         }
         ensure_cwd_exists(&session.cwd)?;
+
+        // For shell-only sessions, skip the custom layout entirely and
+        // use `zellij attach --create` — this gives the user zellij's
+        // native default layout (tab-bar + status-bar guaranteed) with
+        // a default shell in the requested cwd. Our custom layouts can
+        // fight with user zellij configs and drop the status bar; for
+        // the common "just gimme a shell" case, get out of the way.
+        if is_shell_command(&session.command) && session.env.is_empty() {
+            let status = self
+                .cmd()
+                .current_dir(&session.cwd)
+                .arg("attach")
+                .arg(&name)
+                .arg("--create")
+                .status()
+                .map_err(|e| friendly_io_err("spawning zellij attach --create", e))?;
+            if !status.success() {
+                bail!("zellij failed to start session {name:?}");
+            }
+            return Ok(());
+        }
+
+        // Non-shell command (or env overrides): we need a layout to
+        // inject `command`. Layout includes default_tab_template so
+        // the status bar still renders; pane has close_on_exit so the
+        // session cleans up naturally when the command finishes.
         let layout = write_layout_file(session, &name)?;
 
         // `--layout` + `--session` is ambiguous in zellij (>=0.40): with
