@@ -88,23 +88,27 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
 
     match ctx {
         HelpContext::Picker => {
-            lines.push(heading(" Workspace picker"));
+            lines.push(heading(" Workspace picker — keys"));
             lines.push(Line::raw(""));
             lines.push(row("j / ↓", "next workspace"));
             lines.push(row("k / ↑", "previous workspace"));
             lines.push(row("g / Home", "first"));
             lines.push(row("G / End", "last"));
             lines.push(row("Enter", "open the highlighted workspace"));
-            lines.push(Line::raw(""));
-            lines.push(heading(" Exiting"));
-            lines.push(Line::raw(""));
             lines.push(row("Esc / q", "exit pa"));
             lines.push(row("Ctrl+C", "exit pa"));
-            lines.push(Line::raw(""));
-            lines.push(heading(" This screen"));
-            lines.push(Line::raw(""));
             lines.push(row("?", "toggle this help"));
-            lines.push(row("any key", "close this help"));
+            lines.push(Line::raw(""));
+            lines.push(heading(" Workspace actions"));
+            lines.push(Line::raw(""));
+            lines.push(row("d", "unregister from the global index (file stays)"));
+            lines.push(row("D", "delete the workspace file (destructive)"));
+            lines.push(row("r", "reveal: print the file path"));
+            lines.push(Line::raw(""));
+            lines.push(heading(" Workspace actions (coming soon)"));
+            lines.push(Line::raw(""));
+            lines.push(row("n", "scaffold a new workspace via wizard"));
+            lines.push(row("e", "rename / change default multiplexer"));
         }
         HelpContext::SessionList => {
             lines.push(heading(" Session list — keys"));

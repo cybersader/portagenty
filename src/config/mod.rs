@@ -110,6 +110,54 @@ pub fn register_global_workspace(ws_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove a workspace entry from the global registry by path.
+/// Matches on the stored `path` string, with tolerance for `~` /
+/// `${VAR}` expansion differences: both the stored value and the
+/// input are resolved before compare. Silent no-op if the entry
+/// isn't present. Preserves other fields / comments via toml_edit.
+pub fn unregister_global_workspace(ws_path: &Path) -> Result<()> {
+    let cfg_path = global_config_path()?;
+    if !cfg_path.is_file() {
+        return Ok(());
+    }
+    let existing = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("reading {}", cfg_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .with_context(|| format!("parsing existing global config {}", cfg_path.display()))?;
+
+    let canonical = ws_path
+        .canonicalize()
+        .unwrap_or_else(|_| ws_path.to_path_buf());
+    let target = canonical.display().to_string();
+
+    let Some(arr) = doc
+        .get_mut("workspace")
+        .and_then(|i| i.as_array_of_tables_mut())
+    else {
+        return Ok(());
+    };
+    let mut i = 0;
+    while i < arr.len() {
+        let matches_this = arr
+            .get(i)
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| resolve_path(s, Path::new(".")).ok())
+            .map(|p: PathBuf| p == canonical || p.display().to_string() == target)
+            .unwrap_or(false);
+        if matches_this {
+            arr.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+
+    std::fs::write(&cfg_path, doc.to_string())
+        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    Ok(())
+}
+
 /// List all workspace files registered globally, as absolute paths.
 /// Paths that start with `~` or `${HOME}` are expanded. Missing
 /// entries (files that no longer exist on disk) are filtered out so

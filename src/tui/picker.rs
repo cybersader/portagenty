@@ -29,19 +29,38 @@ pub enum PickerOutcome {
     Quit,
 }
 
+/// Destructive action awaiting user confirmation in the picker.
+#[derive(Debug, Clone)]
+enum PickerPending {
+    /// Drop the row from the global `[[workspace]]` registry. Leaves
+    /// the `.portagenty.toml` file on disk untouched — only the index
+    /// loses the entry.
+    Unregister(PathBuf),
+    /// Delete the workspace file from disk *and* drop the registry
+    /// entry. Files-on-disk are gone after this.
+    DeleteFile(PathBuf),
+}
+
 /// Run the picker inside an already-initialized ratatui terminal.
 /// Terminal init + restore stay with the caller so a single
 /// `ratatui::init()` handles both the picker and the session-list
 /// TUI that follows — no flicker from tearing down between them.
 pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<PickerOutcome> {
+    // Picker-local mutable copy: actions like unregister / delete
+    // change the list in place without having to re-enter the outer
+    // run loop.
+    let mut workspaces: Vec<PathBuf> = workspaces.to_vec();
     let mut state = ListState::default();
     state.select(Some(0));
 
-    let total = workspaces.len() + 1; // +1 for the "live sessions" row
     let mut help_open = false;
+    let mut pending: Option<PickerPending> = None;
+    let mut status: Option<String> = None;
 
     loop {
-        terminal.draw(|frame| render(frame, workspaces, &mut state, help_open))?;
+        let total = workspaces.len() + 1; // +1 for the "live sessions" row
+        terminal
+            .draw(|frame| render(frame, &workspaces, &mut state, help_open, &pending, &status))?;
 
         let Event::Key(key) = event::read()? else {
             continue;
@@ -49,13 +68,25 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        // Help overlay: any key closes it. No passthrough — we don't
-        // want `Enter` on a "dismiss help" press to also open a
-        // workspace the user hadn't seen yet.
+        // Help overlay: any key closes it. No passthrough.
         if help_open {
             help_open = false;
             continue;
         }
+        // Confirm modal: divert keys.
+        if let Some(action) = pending.take() {
+            match crate::tui::confirm::classify(key.code) {
+                crate::tui::confirm::ConfirmKey::Confirm => {
+                    status = Some(perform_picker_action(action, &mut workspaces, &mut state));
+                }
+                crate::tui::confirm::ConfirmKey::Cancel => {
+                    status = Some("cancelled".into());
+                }
+            }
+            continue;
+        }
+        // Any keystroke clears lingering status.
+        status = None;
         match (key.code, key.modifiers) {
             (KeyCode::Char('?'), _) => {
                 help_open = true;
@@ -78,10 +109,42 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
                 state.select(Some(total - 1));
             }
+            (KeyCode::Char('d'), _) => {
+                if let Some(path) = selected_workspace(&workspaces, &state) {
+                    pending = Some(PickerPending::Unregister(path));
+                } else {
+                    status = Some(
+                        "d: nothing to unregister — live-sessions row isn't a workspace".into(),
+                    );
+                }
+            }
+            (KeyCode::Char('D'), _) => {
+                if let Some(path) = selected_workspace(&workspaces, &state) {
+                    pending = Some(PickerPending::DeleteFile(path));
+                } else {
+                    status =
+                        Some("D: nothing to delete — live-sessions row isn't a workspace".into());
+                }
+            }
+            (KeyCode::Char('r'), _) => {
+                if let Some(path) = selected_workspace(&workspaces, &state) {
+                    status = Some(format!("path: {}", path.display()));
+                } else {
+                    status = Some("r: live-sessions row has no file path".into());
+                }
+            }
+            (KeyCode::Char('n'), _) => {
+                status = Some(
+                    "n: to scaffold a new workspace, exit pa and run 'pa onboard' or 'pa init <name>'"
+                        .into(),
+                );
+            }
+            (KeyCode::Char('e'), _) => {
+                status = Some("e: in-TUI workspace editing is coming soon".into());
+            }
             (KeyCode::Enter, _) => {
                 let sel = state.selected().unwrap_or(0);
                 if sel == workspaces.len() {
-                    // Last row is the "live sessions" sentinel.
                     return Ok(PickerOutcome::LiveBrowse);
                 }
                 return Ok(PickerOutcome::Workspace(workspaces[sel].clone()));
@@ -91,7 +154,72 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
     }
 }
 
-fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState, help_open: bool) {
+/// Resolve the currently-selected row to a workspace PathBuf, or
+/// `None` when the live-sessions sentinel is selected. All the
+/// row-action keys share this guard so the sentinel is handled
+/// consistently.
+fn selected_workspace(workspaces: &[PathBuf], state: &ListState) -> Option<PathBuf> {
+    let sel = state.selected()?;
+    if sel >= workspaces.len() {
+        return None;
+    }
+    workspaces.get(sel).cloned()
+}
+
+/// Execute a confirmed picker action and mutate the row list + state
+/// in place. Returns a human-readable status string the UI pins in
+/// the footer until the next keystroke.
+fn perform_picker_action(
+    action: PickerPending,
+    workspaces: &mut Vec<PathBuf>,
+    state: &mut ListState,
+) -> String {
+    match action {
+        PickerPending::Unregister(path) => {
+            match crate::config::unregister_global_workspace(&path) {
+                Ok(()) => {
+                    workspaces.retain(|p| p != &path);
+                    clamp_selection(workspaces, state);
+                    format!("unregistered from global index: {}", path.display())
+                }
+                Err(e) => format!("unregister failed: {e:#}"),
+            }
+        }
+        PickerPending::DeleteFile(path) => {
+            // Delete the file first; if successful, then drop the
+            // registry entry (best-effort — a stale entry is
+            // auto-filtered on next picker load anyway).
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    let _ = crate::config::unregister_global_workspace(&path);
+                    workspaces.retain(|p| p != &path);
+                    clamp_selection(workspaces, state);
+                    format!("deleted workspace file: {}", path.display())
+                }
+                Err(e) => format!("delete failed: {e}"),
+            }
+        }
+    }
+}
+
+fn clamp_selection(workspaces: &[PathBuf], state: &mut ListState) {
+    let total = workspaces.len() + 1; // + live-sessions sentinel
+    let sel = state.selected().unwrap_or(0);
+    if total == 0 {
+        state.select(None);
+    } else {
+        state.select(Some(sel.min(total - 1)));
+    }
+}
+
+fn render(
+    frame: &mut Frame<'_>,
+    workspaces: &[PathBuf],
+    state: &mut ListState,
+    help_open: bool,
+    pending: &Option<PickerPending>,
+    status: &Option<String>,
+) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -206,12 +334,51 @@ fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState, 
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, chunks[2], state);
 
-    let footer = Paragraph::new(" j/k · Enter: open · ?: help · q: quit ")
-        .style(Style::default().add_modifier(Modifier::DIM));
-    frame.render_widget(footer, chunks[3]);
+    if let Some(s) = status {
+        frame.render_widget(
+            Paragraph::new(format!(" {s} ")).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            chunks[3],
+        );
+    } else {
+        let footer = Paragraph::new(" j/k · Enter · d/D/r · ?: help · q: quit ")
+            .style(Style::default().add_modifier(Modifier::DIM));
+        frame.render_widget(footer, chunks[3]);
+    }
+
+    if let Some(p) = pending {
+        let (title, body) = picker_confirm_copy(p);
+        crate::tui::confirm::render(frame, area, &title, &body);
+    }
 
     if help_open {
         crate::tui::help::render_overlay(frame, area, crate::tui::help::HelpContext::Picker);
+    }
+}
+
+fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
+    match p {
+        PickerPending::Unregister(path) => (
+            "Unregister workspace".into(),
+            format!(
+                "Drop this workspace from the global picker index? \
+                 The file {} stays on disk; you can re-register with \
+                 `pa init` or by running `pa onboard` here.",
+                path.display(),
+            ),
+        ),
+        PickerPending::DeleteFile(path) => (
+            "Delete workspace file".into(),
+            format!(
+                "DELETE THE FILE {} from disk and remove it from the global \
+                 picker index? This is destructive — the workspace TOML \
+                 cannot be recovered unless you have a backup or git history.",
+                path.display(),
+            ),
+        ),
     }
 }
 
