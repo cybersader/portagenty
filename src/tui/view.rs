@@ -71,6 +71,10 @@ pub struct SessionRow {
     /// for rendering the "2h ago" column on Live rows. `None` when the
     /// session has never been launched via `pa` (shown as blank).
     pub last_attached_unix: Option<u64>,
+    /// Number of clients attached to this live mpx session, when the
+    /// multiplexer exposes it (tmux does). `None` for idle/untracked
+    /// rows and for mpxs that don't report per-session client counts.
+    pub attached_clients: Option<u32>,
 }
 
 /// Build the row list from a loaded workspace plus the mpx's current
@@ -80,16 +84,15 @@ pub struct SessionRow {
 pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow> {
     let mut rows: Vec<SessionRow> = Vec::with_capacity(workspace.sessions.len() + live.len());
 
-    // Tracked rows first.
-    let live_names: std::collections::HashSet<&str> =
-        live.iter().map(|s| s.name.as_str()).collect();
+    // Tracked rows first. Each row looks up its live counterpart to
+    // pick up the attached-client count; absence means NotStarted.
     for sess in &workspace.sessions {
         let mpx_name = sanitize_session_name(&sess.name);
-        let state = if live_names.contains(mpx_name.as_str()) {
-            SessionState::Live
-        } else {
-            SessionState::NotStarted
-        };
+        let (state, attached_clients) = live
+            .iter()
+            .find(|s| s.name == mpx_name)
+            .map(|info| (SessionState::Live, info.attached))
+            .unwrap_or((SessionState::NotStarted, None));
         let last_attached_unix = workspace
             .file_path
             .as_ref()
@@ -103,6 +106,7 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
             command_display: sess.command.clone(),
             kind: sess.kind,
             last_attached_unix,
+            attached_clients,
         });
     }
 
@@ -133,6 +137,7 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
             command_display: "(unknown)".into(),
             kind: None,
             last_attached_unix: None,
+            attached_clients: info.attached,
         });
     }
 
@@ -263,7 +268,7 @@ mod tests {
         let info = vec![SessionInfo {
             name: "tmx".into(),
             cwd: Some(PathBuf::from("/home/u/dev")),
-            attached: Some(false),
+            attached: Some(0),
         }];
         let rows = build_rows(&ws(vec![]), &info);
         assert_eq!(rows[0].cwd_display, "/home/u/dev");

@@ -114,7 +114,7 @@ mod tests {
             Ok(vec![SessionInfo {
                 name: "one".into(),
                 cwd: Some(PathBuf::from("/tmp")),
-                attached: Some(false),
+                attached: Some(0),
             }])
         });
 

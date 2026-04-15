@@ -242,24 +242,52 @@ impl App {
             .iter()
             .filter(|r| r.state == SessionState::Untracked)
             .count();
-        let title = if untracked > 0 {
-            format!(
-                " {}  ·  {} session{}  · {} untracked ",
-                self.workspace.name,
-                tracked,
-                if tracked == 1 { "" } else { "s" },
-                untracked,
-            )
-        } else {
-            format!(
-                " {}  ·  {} session{} ",
-                self.workspace.name,
-                tracked,
-                if tracked == 1 { "" } else { "s" },
-            )
+
+        // Mpx badge: distinct accent color per multiplexer so the
+        // user can tell at a glance which backend they're talking to.
+        // Useful when juggling a zellij workspace for some projects
+        // and a tmux one for others on the same machine.
+        let (mpx_label, mpx_color) = match self.workspace.multiplexer {
+            crate::domain::Multiplexer::Tmux => ("tmux", Color::Cyan),
+            crate::domain::Multiplexer::Zellij => ("zellij", Color::Magenta),
+            crate::domain::Multiplexer::Wezterm => ("wezterm", Color::LightYellow),
         };
-        let header = Paragraph::new(title).style(Style::default().add_modifier(Modifier::REVERSED));
-        frame.render_widget(header, chunks[0]);
+        let mut title_spans: Vec<Span<'static>> = vec![
+            Span::raw(" "),
+            Span::styled(
+                self.workspace.name.clone(),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("[{mpx_label}]"),
+                Style::default().fg(mpx_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{tracked} session{}", if tracked == 1 { "" } else { "s" }),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ),
+        ];
+        if untracked > 0 {
+            title_spans.push(Span::raw("  "));
+            title_spans.push(Span::styled(
+                format!("· {untracked} untracked "),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::REVERSED),
+            ));
+        } else {
+            title_spans.push(Span::styled(
+                " ".to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(title_spans))
+                .style(Style::default().add_modifier(Modifier::REVERSED)),
+            chunks[0],
+        );
 
         if show_col_header {
             let col_header = column_header_line(area.width);
@@ -352,6 +380,8 @@ fn row_list_item(
     reserve_kind_space: bool,
 ) -> ListItem<'static> {
     // State marker (● ○ ?) — color encodes Live/NotStarted/Untracked.
+    // The session name picks up the same hue (not full color) so the
+    // row reads at a glance without needing the marker.
     let marker_style = match row.state {
         SessionState::Live => Style::default()
             .fg(Color::Green)
@@ -361,10 +391,38 @@ fn row_list_item(
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     };
+    let name_style = match row.state {
+        SessionState::Live => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        SessionState::NotStarted => Style::default().add_modifier(Modifier::BOLD),
+        SessionState::Untracked => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    };
 
     // Kind marker — small per-kind glyph shown right after the state
     // marker when the session has a kind hint.
     let (kind_glyph, kind_style) = kind_display(row.kind);
+
+    // Status tag: includes attached-client count when the mpx reports
+    // it (tmux does; zellij doesn't expose per-session, so no count).
+    let status_label = match row.state {
+        SessionState::Live => {
+            if let Some(n) = row.attached_clients {
+                if n > 1 {
+                    format!("[live · {n} clients]")
+                } else if n == 1 {
+                    "[live · 1 client]".to_string()
+                } else {
+                    "[live · detached]".to_string()
+                }
+            } else {
+                format!("[{}]", row.state.label())
+            }
+        }
+        _ => format!("[{}]", row.state.label()),
+    };
 
     // Narrow: render each row as a two-line "card". Line 1 is the
     // essentials (marker + name + status tag). Line 2 is a dim,
@@ -383,13 +441,10 @@ fn row_list_item(
             } else if reserve_kind_space {
                 s.push(Span::raw("  "));
             }
-            s.push(Span::styled(
-                row.display_name.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
+            s.push(Span::styled(row.display_name.clone(), name_style));
             s.push(Span::raw("  "));
             s.push(Span::styled(
-                format!("[{}]", row.state.label()),
+                status_label.clone(),
                 Style::default().add_modifier(Modifier::DIM),
             ));
             Line::from(s)
@@ -426,10 +481,7 @@ fn row_list_item(
         spans.push(Span::raw("  "));
     }
     let name_cell = pad_or_truncate(&row.display_name, name_col);
-    spans.push(Span::styled(
-        name_cell,
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
+    spans.push(Span::styled(name_cell, name_style));
     if width >= 80 && cwd_col >= 8 {
         spans.push(Span::raw("  "));
         let cwd_cell = pad_or_truncate(&compact_path(&row.cwd_display), cwd_col);
@@ -451,7 +503,7 @@ fn row_list_item(
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
-        format!("[{}]", row.state.label()),
+        status_label.clone(),
         Style::default().add_modifier(Modifier::DIM),
     ));
     // Relative-time hint (e.g. "2h ago") on wide rows. Only populated

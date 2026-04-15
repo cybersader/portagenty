@@ -12,7 +12,9 @@ pub struct SessionInfo {
     /// `None` when the mpx doesn't expose per-session cwd — zellij
     /// falls into this category; tmux always sets it.
     pub cwd: Option<PathBuf>,
-    /// Whether a client is currently attached. `None` when the mpx
-    /// doesn't expose this cheaply; adapters that can tell set it.
-    pub attached: Option<bool>,
+    /// Number of clients currently attached to this session.
+    /// `Some(0)` = live but unattached; `Some(n >= 1)` = n clients.
+    /// `None` when the multiplexer doesn't expose a per-session
+    /// count (zellij). Tmux reports the real count.
+    pub attached: Option<u32>,
 }

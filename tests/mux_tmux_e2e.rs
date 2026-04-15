@@ -152,7 +152,8 @@ fn create_detached_reports_cwd() {
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
     assert_eq!(last, expected);
-    assert_eq!(found.attached, Some(false));
+    // Freshly-created detached session: zero attached clients.
+    assert_eq!(found.attached, Some(0));
 }
 
 #[test]

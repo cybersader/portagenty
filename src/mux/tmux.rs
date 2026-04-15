@@ -141,10 +141,14 @@ impl Multiplexer for TmuxAdapter {
             let attached = parts.next().ok_or_else(|| {
                 anyhow!("tmux list-sessions: missing attached flag in line {line:?}")
             })?;
+            // tmux's `#{session_attached}` is the literal client count.
+            // Fall back to 0 on parse error rather than bailing — one
+            // malformed line shouldn't hide the rest of the list.
+            let attached_count: u32 = attached.parse().unwrap_or(0);
             sessions.push(SessionInfo {
                 name,
                 cwd: Some(PathBuf::from(cwd)),
-                attached: Some(attached == "1"),
+                attached: Some(attached_count),
             });
         }
         Ok(sessions)
