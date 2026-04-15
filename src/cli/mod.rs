@@ -117,7 +117,10 @@ fn build_mux(kind: MpxEnum) -> Result<Box<dyn Multiplexer>> {
         MpxEnum::Tmux => Ok(Box::new(TmuxAdapter::new())),
         MpxEnum::Zellij => Ok(Box::new(ZellijAdapter::new())),
         MpxEnum::Wezterm => Err(anyhow!(
-            "the wezterm multiplexer adapter is not implemented yet (v1.x)"
+            "wezterm isn't supported by portagenty: its mux is built around the GUI \
+             terminal's own window model, not the headless detach/reattach-over-SSH \
+             pattern that powers `pa`'s cross-device workflow. Use tmux or zellij. \
+             See ROADMAP v1.x for the rationale."
         )),
     }
 }

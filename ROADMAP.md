@@ -60,8 +60,19 @@ Explicitly **not** in v1:
 
 ### Still to ship (rough priority order)
 
-2. **WezTerm adapter.** Unlocks Windows native. Document attach
-   limitations honestly.
+2. ~~**WezTerm adapter.**~~ **Deferred / not-the-right-fit.** WezTerm
+   has a mux subsystem, but it's built around the GUI terminal
+   emulator's own multi-window model — not the headless
+   "detach-from-desktop, reattach-from-phone-over-SSH" pattern that
+   tmux and zellij are explicitly designed for. portagenty's whole
+   value-add over `cd && claude` is the cross-device session-
+   persistence story (see DESIGN §10 + the `pa claim` cross-device
+   takeover work in v1.x). WezTerm doesn't move the needle there,
+   and a half-baked adapter would mislead users into setups that
+   silently lose their state on disconnect. The `Multiplexer::Wezterm`
+   enum variant stays so workspace files can pin it ahead of any
+   future change of mind, but `build_mux` returns a clear "use
+   tmux or zellij" message until/unless the upstream model evolves.
 4. **Tags view, polished.** Tag editing from the TUI. Tag-based
    filtering and grouping. Thread `tags` from the global registry
    into the resolved `Workspace`.
