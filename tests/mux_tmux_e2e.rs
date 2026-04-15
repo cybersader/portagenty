@@ -133,9 +133,9 @@ fn create_detached_reports_cwd() {
     let found = list.iter().find(|s| s.name == "gamma").unwrap();
     // tmux canonicalizes, so don't require exact match — just that
     // the path reported is a real path and matches our tempdir's last
-    // component.
-    let last = found
-        .cwd
+    // component. tmux adapter always populates cwd + attached.
+    let found_cwd = found.cwd.as_ref().expect("tmux adapter should set cwd");
+    let last = found_cwd
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -144,7 +144,7 @@ fn create_detached_reports_cwd() {
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
     assert_eq!(last, expected);
-    assert!(!found.attached);
+    assert_eq!(found.attached, Some(false));
 }
 
 #[test]

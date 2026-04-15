@@ -52,10 +52,18 @@ jobs:
       - name: Install tmux (macos)
         if: matrix.os == 'macos-latest'
         run: brew install tmux
+      - name: Install zellij (linux only)
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zellij
       - name: Run unit + integration tests
         run: cargo nextest run --no-fail-fast
       - name: Run tmux-e2e tests
         run: cargo nextest run --no-fail-fast --features tmux-e2e
+      - name: Run zellij-e2e tests (linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo nextest run --no-fail-fast --features zellij-e2e
 
   build:
     name: build (${{ matrix.os }})

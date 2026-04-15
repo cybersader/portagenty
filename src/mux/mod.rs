@@ -8,10 +8,12 @@
 pub mod sanitize;
 pub mod session_info;
 pub mod tmux;
+pub mod zellij;
 
 pub use sanitize::sanitize_session_name;
 pub use session_info::SessionInfo;
 pub use tmux::TmuxAdapter;
+pub use zellij::ZellijAdapter;
 
 use anyhow::Result;
 
@@ -86,8 +88,8 @@ mod tests {
         mock.expect_list_sessions().returning(|| {
             Ok(vec![SessionInfo {
                 name: "one".into(),
-                cwd: PathBuf::from("/tmp"),
-                attached: false,
+                cwd: Some(PathBuf::from("/tmp")),
+                attached: Some(false),
             }])
         });
 

@@ -48,6 +48,10 @@ default = []
 # Enables end-to-end tests against a real tmux server. CI runs these on
 # Linux + macOS; the default dev loop skips them for speed.
 tmux-e2e = []
+# Enables end-to-end tests against a real zellij install. CI runs these
+# on Linux only (zellij on macOS is available via brew but the CI runner
+# install adds minutes; skip for now).
+zellij-e2e = []
 
 [profile.release]
 lto = "thin"

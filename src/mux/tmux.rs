@@ -142,8 +142,8 @@ impl Multiplexer for TmuxAdapter {
             })?;
             sessions.push(SessionInfo {
                 name,
-                cwd: PathBuf::from(cwd),
-                attached: attached == "1",
+                cwd: Some(PathBuf::from(cwd)),
+                attached: Some(attached == "1"),
             });
         }
         Ok(sessions)

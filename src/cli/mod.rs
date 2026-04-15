@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{load, LoadOptions};
 use crate::domain::{Multiplexer as MpxEnum, Session, Workspace};
-use crate::mux::{Multiplexer, TmuxAdapter};
+use crate::mux::{Multiplexer, TmuxAdapter, ZellijAdapter};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -89,9 +89,7 @@ fn resolve(session_name: &str, workspace: Option<&PathBuf>) -> Result<(Session, 
 fn build_mux(kind: MpxEnum) -> Result<Box<dyn Multiplexer>> {
     match kind {
         MpxEnum::Tmux => Ok(Box::new(TmuxAdapter::new())),
-        MpxEnum::Zellij => Err(anyhow!(
-            "the zellij multiplexer adapter is not implemented yet (v1.x)"
-        )),
+        MpxEnum::Zellij => Ok(Box::new(ZellijAdapter::new())),
         MpxEnum::Wezterm => Err(anyhow!(
             "the wezterm multiplexer adapter is not implemented yet (v1.x)"
         )),
