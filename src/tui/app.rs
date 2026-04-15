@@ -8,11 +8,11 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{List, ListItem, Paragraph},
     DefaultTerminal,
 };
 
-use crate::domain::Workspace;
+use crate::domain::{Session, Workspace};
 use crate::mux::Multiplexer;
 
 /// Top-level TUI state. Holds everything the event loop needs; no
@@ -88,20 +88,65 @@ impl App {
         let header = Paragraph::new(title).style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_widget(header, chunks[0]);
 
-        let body = Block::default()
-            .borders(Borders::NONE)
-            .title(Line::from(vec![
-                Span::styled("portagenty", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  —  "),
-                Span::raw("session list renders in the next commit"),
-            ]));
-        frame.render_widget(body, chunks[1]);
+        self.render_session_list(frame, chunks[1]);
 
         let footer_text = " q / Esc: quit ";
         let footer =
             Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
         frame.render_widget(footer, chunks[2]);
     }
+
+    fn render_session_list(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.workspace.sessions.is_empty() {
+            let empty = Paragraph::new(" No sessions defined in this workspace. ")
+                .style(Style::default().add_modifier(Modifier::DIM));
+            frame.render_widget(empty, area);
+            return;
+        }
+
+        let name_col = self
+            .workspace
+            .sessions
+            .iter()
+            .map(|s| s.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(24);
+
+        let items: Vec<ListItem> = self
+            .workspace
+            .sessions
+            .iter()
+            .map(|s| session_row(s, name_col))
+            .collect();
+
+        let list = List::new(items);
+        frame.render_widget(list, area);
+    }
+}
+
+fn session_row<'a>(session: &'a Session, name_col: usize) -> ListItem<'a> {
+    let padded_name = if session.name.chars().count() >= name_col {
+        session.name.clone()
+    } else {
+        format!(
+            "{:<width$}",
+            session.name,
+            width = name_col.saturating_add(1)
+        )
+    };
+
+    ListItem::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(padded_name, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::raw(session.cwd.display().to_string()),
+        Span::raw("  "),
+        Span::styled(
+            &session.command,
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]))
 }
 
 #[cfg(test)]
@@ -197,5 +242,74 @@ mod tests {
         let ws = sample_workspace("tiny", 0);
         let app = App::new(ws, Box::new(MockMultiplexer::new()));
         let _ = render_to_backend(&app, 80, 3);
+    }
+
+    fn line_at(t: &Terminal<TestBackend>, y: u16) -> String {
+        let buf = t.backend().buffer();
+        let w = buf.area().width;
+        (0..w)
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn renders_each_session_name_in_body() {
+        let ws = sample_workspace("multi", 3);
+        let app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&app, 100, 10);
+
+        // Body lives on rows 1..h-1 (row 0 = header, row h-1 = footer).
+        let body: String = (1..9)
+            .map(|y| line_at(&terminal, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in 0..3 {
+            let expected = format!("s{i}");
+            assert!(body.contains(&expected), "missing {expected:?} in:\n{body}");
+        }
+    }
+
+    #[test]
+    fn renders_session_cwd_and_command_alongside_name() {
+        let ws = Workspace {
+            name: "x".into(),
+            file_path: None,
+            multiplexer: MpxEnum::Tmux,
+            projects: vec![],
+            sessions: vec![Session {
+                name: "claude".into(),
+                cwd: PathBuf::from("/tmp/demo"),
+                command: "claude --resume".into(),
+            }],
+        };
+        let app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&app, 100, 5);
+
+        let body = line_at(&terminal, 1);
+        assert!(body.contains("claude"), "name missing: {body:?}");
+        assert!(body.contains("/tmp/demo"), "cwd missing: {body:?}");
+        assert!(body.contains("--resume"), "command missing: {body:?}");
+    }
+
+    #[test]
+    fn empty_workspace_shows_placeholder() {
+        let ws = sample_workspace("empty", 0);
+        let app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&app, 60, 5);
+
+        let body = line_at(&terminal, 1);
+        assert!(
+            body.to_lowercase().contains("no sessions"),
+            "missing placeholder: {body:?}"
+        );
+    }
+
+    #[test]
+    fn large_session_list_does_not_panic() {
+        // 80 sessions into a 20-row terminal — ratatui's List handles
+        // overflow by truncating; we just confirm we don't panic.
+        let ws = sample_workspace("big", 80);
+        let app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let _ = render_to_backend(&app, 80, 20);
     }
 }
