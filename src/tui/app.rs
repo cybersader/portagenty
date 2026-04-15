@@ -79,6 +79,18 @@ pub struct App {
 enum PendingAction {
     /// Remove the named session from the workspace file on disk.
     DeleteSession { name: String },
+    /// Terminate the live mpx session (tmux kill-session / zellij
+    /// kill-session + delete). Does not touch the workspace file.
+    KillSession {
+        /// Display name for the status line (workspace name for
+        /// tracked rows, mpx name for untracked).
+        display_name: String,
+        /// Sanitized name the multiplexer knows.
+        mpx_name: String,
+        /// Client count if the mpx reported it. Used to warn users
+        /// about disconnecting other devices.
+        attached_clients: Option<u32>,
+    },
 }
 
 impl App {
@@ -206,6 +218,25 @@ impl App {
     /// session). Untracked rows (live mpx sessions outside the
     /// workspace) are ignored — delete means "remove from workspace
     /// TOML", and they're not in the TOML to begin with.
+    /// Queue a kill-session confirm modal. Valid on Live or Untracked
+    /// rows (both have a live mpx session to terminate). NotStarted
+    /// rows have no mpx session, so kill is a no-op — we short-circuit
+    /// with a status message.
+    fn open_kill_prompt(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.state == SessionState::NotStarted {
+            self.status = Some("x: no live session to kill on this row (it's idle)".into());
+            return;
+        }
+        self.pending = Some(PendingAction::KillSession {
+            display_name: row.display_name.clone(),
+            mpx_name: row.mpx_name.clone(),
+            attached_clients: row.attached_clients,
+        });
+    }
+
     fn open_delete_prompt(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -230,6 +261,29 @@ impl App {
     /// so the user sees it without the modal re-opening.
     fn perform_pending(&mut self, action: PendingAction) {
         match action {
+            PendingAction::KillSession {
+                display_name,
+                mpx_name,
+                ..
+            } => match self.mux.kill(&mpx_name) {
+                Ok(()) => {
+                    // Rebuild rows from the mpx's fresh view. The
+                    // tracked row (if any) falls back to NotStarted;
+                    // untracked rows vanish entirely.
+                    let live = self.mux.list_sessions().unwrap_or_default();
+                    self.rows = crate::tui::view::build_rows(&self.workspace, &live);
+                    if self.rows.is_empty() {
+                        self.list_state.select(None);
+                    } else {
+                        let sel = self.list_state.selected().unwrap_or(0);
+                        self.list_state.select(Some(sel.min(self.rows.len() - 1)));
+                    }
+                    self.status = Some(format!("killed session {display_name:?}"));
+                }
+                Err(e) => {
+                    self.status = Some(format!("kill failed: {e:#}"));
+                }
+            },
             PendingAction::DeleteSession { name } => {
                 let Some(path) = self.workspace.file_path.clone() else {
                     self.status = Some("delete failed: no workspace file on disk".into());
@@ -294,6 +348,10 @@ impl App {
             }
             (KeyCode::Char('d'), _) => {
                 self.open_delete_prompt();
+                Action::None
+            }
+            (KeyCode::Char('x'), _) => {
+                self.open_kill_prompt();
                 Action::None
             }
             (KeyCode::Char('q'), _) => {
@@ -677,6 +735,27 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
                  name stays alive (it'll reappear as an Untracked row)."
             ),
         ),
+        PendingAction::KillSession {
+            display_name,
+            attached_clients,
+            ..
+        } => {
+            let extra = match attached_clients {
+                Some(n) if *n >= 2 => {
+                    format!(" {n} clients are currently attached — they will all be disconnected.")
+                }
+                Some(1) => " 1 client is currently attached — it will be disconnected.".into(),
+                _ => String::new(),
+            };
+            (
+                "Kill session".into(),
+                format!(
+                    "Terminate the live mpx session {display_name:?}?{extra} \
+                     This does NOT edit the workspace file, so the declared \
+                     session will reappear as idle on the next refresh."
+                ),
+            )
+        }
     }
 }
 

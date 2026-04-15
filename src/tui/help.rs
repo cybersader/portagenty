@@ -144,11 +144,14 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
                 "yellow — live mpx sessions outside the workspace",
             ));
             lines.push(Line::raw(""));
+            lines.push(heading(" Row actions"));
+            lines.push(Line::raw(""));
+            lines.push(row("d", "delete the session (edits TOML)"));
+            lines.push(row("x", "kill the live mpx session"));
+            lines.push(Line::raw(""));
             lines.push(heading(" Row actions (coming soon)"));
             lines.push(Line::raw(""));
-            lines.push(row("e", "edit the selected session"));
-            lines.push(row("d", "delete the selected session"));
-            lines.push(row("x", "disconnect / kill live session"));
+            lines.push(row("e", "edit session fields in place"));
             lines.push(row("m", "change workspace multiplexer"));
             lines.push(row("Space", "context menu for the row"));
         }
