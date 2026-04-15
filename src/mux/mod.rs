@@ -7,9 +7,11 @@
 
 pub mod sanitize;
 pub mod session_info;
+pub mod tmux;
 
 pub use sanitize::sanitize_session_name;
 pub use session_info::SessionInfo;
+pub use tmux::TmuxAdapter;
 
 use anyhow::Result;
 
