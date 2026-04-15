@@ -17,23 +17,34 @@ use crate::mux::TmuxAdapter;
 /// workspace + live mpx sessions, runs the TUI, and — if the user
 /// picked a row — restores the terminal and hands off to the mpx.
 pub fn run() -> Result<()> {
-    // See DESIGN.md §12 for the full entry-point contract. In short:
-    //   walk-up → (wizard first-time) → (picker returning) → session TUI
-    // with Esc from the session TUI routing back to the picker when
-    // the picker was the entry point.
-    let walked_up = load(&LoadOptions::default()).ok();
+    // See DESIGN.md §12 for the full entry-point contract. Key
+    // invariant: the workspace picker is the *home screen*. Esc from
+    // the session TUI always returns here, regardless of whether the
+    // user entered via walk-up, wizard-scaffold, or the picker
+    // itself. There is exactly one back-stack; pa is never ambiguous
+    // about "what does Esc do."
 
-    // If walk-up succeeded, run the session TUI directly. Esc here
-    // means "quit" because there's no picker to go back to.
-    if let Some(ws) = walked_up {
-        let mut terminal = ratatui::init();
-        let result = run_session_tui(&mut terminal, ws);
-        ratatui::restore();
-        return finalize(result);
+    // First-run wizard short-circuits before the TUI loop, since
+    // showing the picker with zero workspaces on a brand-new machine
+    // would just bounce straight to onboarding anyway.
+    if load(&LoadOptions::default()).is_err()
+        && crate::onboarding::is_interactive()
+        && !crate::onboarding::has_onboarded()
+    {
+        use crate::onboarding::OnboardOutcome;
+        match crate::onboarding::run_wizard(false)? {
+            OnboardOutcome::ShowedDocs | OnboardOutcome::Skipped => return Ok(()),
+            OnboardOutcome::Scaffolded { .. } => {
+                // Fall through to the TUI loop with the new workspace
+                // pre-selected. Walk-up will pick it up now.
+            }
+        }
     }
 
-    // Walk-up failed.
-    if !crate::onboarding::is_interactive() {
+    // Non-interactive (piped, CI, cron) with no walkable workspace
+    // and no onboarding: nothing useful to show, exit cleanly with
+    // the original error.
+    if !crate::onboarding::is_interactive() && load(&LoadOptions::default()).is_err() {
         return Err(anyhow::anyhow!(
             "no *.portagenty.toml found walking up from {}",
             std::env::current_dir()
@@ -42,55 +53,36 @@ pub fn run() -> Result<()> {
         ));
     }
 
-    if !crate::onboarding::has_onboarded() {
-        use crate::onboarding::OnboardOutcome;
-        match crate::onboarding::run_wizard(false)? {
-            OnboardOutcome::Scaffolded { .. } => {
-                let ws = load(&LoadOptions::default())?;
-                let mut terminal = ratatui::init();
-                let result = run_session_tui(&mut terminal, ws);
-                ratatui::restore();
-                return finalize(result);
-            }
-            OnboardOutcome::ShowedDocs | OnboardOutcome::Skipped => return Ok(()),
-        }
-    }
-
-    // Returning interactive user with no walkable workspace. Loop
-    // picker ↔ session TUI so Esc from the session list returns here.
+    // Main loop: session TUI ↔ picker, sharing one ratatui session.
+    // On the first iteration, if walk-up finds a workspace, show its
+    // session TUI directly. On subsequent iterations (after Esc),
+    // always show the picker.
     let mut terminal = ratatui::init();
+    let mut first_iteration = true;
     loop {
-        let registered = crate::config::list_registered_workspaces().unwrap_or_default();
-        let picker_outcome = match picker::run(&mut terminal, &registered) {
-            Ok(o) => o,
-            Err(e) => {
-                ratatui::restore();
-                return Err(e);
-            }
+        let ws = if first_iteration {
+            first_iteration = false;
+            load(&LoadOptions::default()).ok()
+        } else {
+            None // Back was pressed — always show picker from here on
         };
-        let ws = match picker_outcome {
-            picker::PickerOutcome::Quit => {
-                ratatui::restore();
-                return Ok(());
-            }
-            picker::PickerOutcome::LiveBrowse => synthetic_browse_workspace()?,
-            picker::PickerOutcome::Workspace(path) => {
-                let opts = LoadOptions {
-                    workspace_path: Some(path),
-                    ..Default::default()
-                };
-                match load(&opts) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        ratatui::restore();
-                        return Err(e);
-                    }
+
+        let ws = match ws {
+            Some(w) => w,
+            None => match show_picker(&mut terminal) {
+                Ok(Some(w)) => w,
+                Ok(None) => {
+                    ratatui::restore();
+                    return Ok(());
                 }
-            }
+                Err(e) => {
+                    ratatui::restore();
+                    return Err(e);
+                }
+            },
         };
-        let result = run_session_tui(&mut terminal, ws);
-        match result {
-            // User pressed Esc in the session TUI — back to picker.
+
+        match run_session_tui(&mut terminal, ws) {
             Ok(SessionRunOutcome::Back) => continue,
             Ok(SessionRunOutcome::Quit) => {
                 ratatui::restore();
@@ -104,6 +96,25 @@ pub fn run() -> Result<()> {
                 ratatui::restore();
                 return Err(e);
             }
+        }
+    }
+}
+
+/// Run the workspace picker and return the selected workspace, or
+/// `None` if the user quit. `Err` only for unexpected IO errors.
+fn show_picker(
+    terminal: &mut ratatui::DefaultTerminal,
+) -> Result<Option<crate::domain::Workspace>> {
+    let registered = crate::config::list_registered_workspaces().unwrap_or_default();
+    match picker::run(terminal, &registered)? {
+        picker::PickerOutcome::Quit => Ok(None),
+        picker::PickerOutcome::LiveBrowse => Ok(Some(synthetic_browse_workspace()?)),
+        picker::PickerOutcome::Workspace(path) => {
+            let opts = LoadOptions {
+                workspace_path: Some(path),
+                ..Default::default()
+            };
+            Ok(Some(load(&opts)?))
         }
     }
 }
@@ -178,15 +189,6 @@ fn run_session_tui(
             SessionRunOutcome::Launched(mux.attach(&mpx_name, mode))
         }
     })
-}
-
-/// Collapse a walk-up session-TUI outcome (Back or Quit both exit
-/// cleanly; Launched is deferred to [`finalize_launch`]).
-fn finalize(r: Result<SessionRunOutcome>) -> Result<()> {
-    match r? {
-        SessionRunOutcome::Back | SessionRunOutcome::Quit => Ok(()),
-        SessionRunOutcome::Launched(launch) => finalize_launch(launch),
-    }
 }
 
 /// Emit the loud post-restore banner on launch failure so the error
