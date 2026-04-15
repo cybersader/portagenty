@@ -15,12 +15,30 @@ use ratatui::{
 use crate::domain::{Session, Workspace};
 use crate::mux::Multiplexer;
 
+/// The reason [`App::run`] returned. The outer entry point uses this
+/// to decide whether to exit silently or hand off to the multiplexer
+/// to actually launch a session.
+#[derive(Debug, Clone)]
+pub enum AppOutcome {
+    Quit,
+    Launch(Session),
+}
+
+/// Internal action dispatch. Returned from [`App::handle_key`] so the
+/// event loop can translate a key press into either continued
+/// in-TUI work or a reason to exit the loop.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Quit,
+    LaunchSelected,
+}
+
 /// Top-level TUI state. Holds everything the event loop needs; no
 /// globals, nothing static. Tests construct `App` directly and render
 /// into a `ratatui::backend::TestBackend`.
 pub struct App {
     workspace: Workspace,
-    #[allow(dead_code)] // wired to mux in a later commit
     mux: Box<dyn Multiplexer>,
     list_state: ListState,
     should_quit: bool,
@@ -78,40 +96,74 @@ impl App {
         }
     }
 
-    /// Run the event loop until the user quits. Owns the terminal for
-    /// its duration; restores it on drop (ratatui's `restore` is called
-    /// by the caller via `DefaultTerminal::drop`).
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        while !self.should_quit {
+    /// Consume the app: run the event loop until the user either quits
+    /// or picks a session to launch. Returns the outcome and hands
+    /// back the multiplexer so the outer entry point can call
+    /// [`Multiplexer::create_and_attach`] after restoring the terminal.
+    pub fn run(
+        mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<(AppOutcome, Box<dyn Multiplexer>)> {
+        loop {
             terminal.draw(|frame| self.render(frame))?;
-            self.handle_event()?;
-        }
-        Ok(())
-    }
-
-    fn handle_event(&mut self) -> Result<()> {
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                return Ok(());
+            if let Some(outcome) = self.handle_event()? {
+                return Ok((outcome, self.mux));
             }
-            self.handle_key(key.code, key.modifiers);
         }
-        Ok(())
     }
 
-    /// Apply a single key press. Split out of `handle_event` so tests
-    /// drive selection without faking a crossterm event stream.
-    pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+    fn handle_event(&mut self) -> Result<Option<AppOutcome>> {
+        let Event::Key(key) = event::read()? else {
+            return Ok(None);
+        };
+        if key.kind != KeyEventKind::Press {
+            return Ok(None);
+        }
+        let action = self.handle_key(key.code, key.modifiers);
+        Ok(self.reduce_action(action))
+    }
+
+    fn reduce_action(&mut self, action: Action) -> Option<AppOutcome> {
+        match action {
+            Action::None => None,
+            Action::Quit => Some(AppOutcome::Quit),
+            Action::LaunchSelected => self
+                .selected()
+                .map(|i| AppOutcome::Launch(self.workspace.sessions[i].clone())),
+        }
+    }
+
+    /// Apply a single key press, returning whatever [`Action`] it
+    /// produced. Split from `handle_event` so tests drive input
+    /// synchronously without faking a crossterm event stream.
+    pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Action {
         match (code, mods) {
-            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.should_quit = true,
+            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+                self.should_quit = true;
+                Action::Quit
+            }
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
+                Action::Quit
             }
-            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.select_next(),
-            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.select_prev(),
-            (KeyCode::Char('g'), _) | (KeyCode::Home, _) => self.select_first(),
-            (KeyCode::Char('G'), _) | (KeyCode::End, _) => self.select_last(),
-            _ => {}
+            (KeyCode::Enter, _) => Action::LaunchSelected,
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                self.select_next();
+                Action::None
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                self.select_prev();
+                Action::None
+            }
+            (KeyCode::Char('g'), _) | (KeyCode::Home, _) => {
+                self.select_first();
+                Action::None
+            }
+            (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
+                self.select_last();
+                Action::None
+            }
+            _ => Action::None,
         }
     }
 
@@ -144,7 +196,7 @@ impl App {
 
         self.render_session_list(frame, chunks[1]);
 
-        let footer_text = " j/k: nav · g/G: top/bottom · q: quit ";
+        let footer_text = " j/k: nav · g/G: top/bottom · Enter: launch · q: quit ";
         let footer =
             Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
         frame.render_widget(footer, chunks[2]);
@@ -438,6 +490,41 @@ mod tests {
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
         assert_eq!(app.selected(), None);
+    }
+
+    #[test]
+    fn enter_returns_launch_action_with_selected_index() {
+        let ws = sample_workspace("x", 3);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        let action = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, Action::LaunchSelected);
+        assert_eq!(app.selected(), Some(1));
+    }
+
+    #[test]
+    fn enter_on_empty_workspace_does_nothing_meaningful() {
+        // handle_key returns LaunchSelected, but reduce_action turns it
+        // into None because selected() is None.
+        let ws = sample_workspace("x", 0);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let action = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, Action::LaunchSelected);
+        assert_eq!(app.selected(), None);
+    }
+
+    #[test]
+    fn quit_keys_return_quit_action() {
+        for key in [
+            (KeyCode::Char('q'), KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let ws = sample_workspace("x", 2);
+            let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+            let action = app.handle_key(key.0, key.1);
+            assert_eq!(action, Action::Quit, "key {key:?} should return Quit");
+        }
     }
 
     #[test]
