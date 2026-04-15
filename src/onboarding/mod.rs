@@ -80,7 +80,7 @@ pub fn run_wizard_with<R: BufRead, W: Write>(
     _forced: bool,
 ) -> Result<OnboardOutcome> {
     writeln!(output)?;
-    writeln!(output, "  Welcome to pa.")?;
+    writeln!(output, "  Welcome to portagenty.")?;
     writeln!(
         output,
         "  I don't see a workspace file here (no *.portagenty.toml)."
@@ -258,6 +258,7 @@ mod tests {
     fn option_2_shows_docs_and_returns_showed_docs() {
         let (outcome, out) = drive("2\n");
         assert_eq!(outcome, OnboardOutcome::ShowedDocs);
+        assert!(out.contains("Welcome to portagenty"));
         assert!(out.contains("Quick reference"));
         assert!(out.contains("pa init"));
         assert!(out.contains("https://cybersader.github.io/portagenty"));

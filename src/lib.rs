@@ -48,5 +48,21 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             kind,
             workspace,
         }) => cli::add(&name, &command, cwd.as_deref(), kind, workspace.as_ref()),
+        Some(Command::Rm { name, workspace }) => cli::rm(&name, workspace.as_ref()),
+        Some(Command::Edit {
+            name,
+            command,
+            cwd,
+            kind,
+            rename,
+            workspace,
+        }) => cli::edit(
+            &name,
+            command.as_deref(),
+            cwd.as_deref(),
+            kind,
+            rename.as_deref(),
+            workspace.as_ref(),
+        ),
     }
 }

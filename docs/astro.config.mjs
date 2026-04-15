@@ -53,11 +53,6 @@ export default defineConfig({
           label: "Reference",
           autogenerate: { directory: "reference" },
         },
-        {
-          label: "Design",
-          autogenerate: { directory: "design" },
-          collapsed: true,
-        },
       ],
     }),
   ],

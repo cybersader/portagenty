@@ -411,6 +411,150 @@ fn add_errors_when_no_workspace_found() {
 }
 
 #[test]
+fn rm_removes_matching_session_and_preserves_rest() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws = tmp.child("ws.portagenty.toml");
+    ws.write_str(
+        r#"# comment at top
+name = "Demo"
+multiplexer = "tmux"
+
+# comment about claude
+[[session]]
+name = "claude"
+cwd = "."
+command = "claude"
+
+[[session]]
+name = "tests"
+cwd = "."
+command = "cargo test"
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["rm", "claude", "-w"])
+        .arg(ws.path())
+        .assert()
+        .success()
+        .stdout(contains("removed session"));
+
+    let after = std::fs::read_to_string(ws.path()).unwrap();
+    assert!(after.contains("# comment at top"), "top comment preserved");
+    assert!(!after.contains(r#"name = "claude""#), "claude block gone");
+    assert!(after.contains(r#"name = "tests""#), "tests block kept");
+    assert!(after.contains("cargo test"), "tests command kept");
+}
+
+#[test]
+fn rm_errors_on_unknown_session_name_and_lists_available() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["rm", "nonexistent", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .failure()
+        .stderr(contains("no session named"))
+        .stderr(contains("claude"))
+        .stderr(contains("tests"));
+}
+
+#[test]
+fn edit_changes_command_in_place() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["edit", "claude", "--command", "claude --resume", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("edited"));
+
+    let after = std::fs::read_to_string(&ws_path).unwrap();
+    assert!(after.contains(r#"command = "claude --resume""#));
+    // Other session's command left alone.
+    assert!(after.contains(r#"command = "cargo nextest run""#));
+}
+
+#[test]
+fn edit_can_rename_a_session() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["edit", "claude", "--rename", "agent", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(&ws_path).unwrap();
+    assert!(after.contains(r#"name = "agent""#));
+    // Tests session untouched.
+    assert!(after.contains(r#"name = "tests""#));
+
+    // `pa list` sees the new name.
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["list", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("agent"));
+}
+
+#[test]
+fn edit_rename_collision_errors() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    // demo workspace has "claude" and "tests" — renaming claude to
+    // tests should fail.
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["edit", "claude", "--rename", "tests", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .failure()
+        .stderr(contains("already named"));
+}
+
+#[test]
+fn edit_errors_without_any_change_flag() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["edit", "claude", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .failure()
+        .stderr(contains("needs one of"));
+}
+
+#[test]
+fn edit_errors_with_multiple_change_flags() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["edit", "claude", "--command", "a", "--cwd", "/tmp", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .failure()
+        .stderr(contains("exactly one change"));
+}
+
+#[test]
 fn snippets_list_shows_known_snippets() {
     Command::cargo_bin("pa")
         .unwrap()

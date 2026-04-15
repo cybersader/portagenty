@@ -115,6 +115,46 @@ pub enum Command {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<PathBuf>,
     },
+    /// Remove a session from the current workspace file. Preserves
+    /// comments and formatting on everything else — only the matching
+    /// `[[session]]` block is excised.
+    Rm {
+        /// Session name to remove.
+        name: String,
+
+        /// Explicit workspace file. Walks up from cwd otherwise.
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
+    /// Change one field on an existing session without opening an
+    /// editor. Pass exactly one of --command / --cwd / --kind /
+    /// --rename; comments and formatting elsewhere in the file stay
+    /// untouched.
+    Edit {
+        /// Name of the session to edit.
+        name: String,
+
+        /// New command (body of `command = "..."`).
+        #[arg(long = "command")]
+        command: Option<String>,
+
+        /// New cwd.
+        #[arg(long = "cwd")]
+        cwd: Option<String>,
+
+        /// New kind hint.
+        #[arg(long = "kind", value_enum)]
+        kind: Option<AddKindArg>,
+
+        /// Rename the session. Errors if another session in the
+        /// workspace already has this name.
+        #[arg(long = "rename")]
+        rename: Option<String>,
+
+        /// Explicit workspace file.
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
     /// Manage bundled bash snippets — opt-in ergonomics
     /// (aliases, Termux-friendly tweaks) that ship with pa.
     #[command(subcommand)]
@@ -510,6 +550,192 @@ pub fn add(
 
 pub fn onboard() -> Result<()> {
     crate::onboarding::run_wizard(true)?;
+    Ok(())
+}
+
+/// Find the current workspace file (walk-up or explicit path).
+fn resolve_workspace_path(workspace: Option<&PathBuf>) -> Result<PathBuf> {
+    match workspace {
+        Some(p) => Ok(p.clone()),
+        None => crate::config::walk_up_from(
+            &std::env::current_dir().context("reading current directory")?,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "no *.portagenty.toml found walking up from {}. Run `pa init` here first.",
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "$PWD".into())
+            )
+        }),
+    }
+}
+
+pub fn rm(name: &str, workspace: Option<&PathBuf>) -> Result<()> {
+    let path = resolve_workspace_path(workspace)?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+
+    let array = doc
+        .get_mut("session")
+        .and_then(|v| v.as_array_of_tables_mut())
+        .ok_or_else(|| anyhow!("workspace {} has no sessions to remove", path.display()))?;
+
+    let idx = array
+        .iter()
+        .position(|t| {
+            t.get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| n == name)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            let available: Vec<String> = array
+                .iter()
+                .filter_map(|t| {
+                    t.get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            anyhow!(
+                "no session named {name:?} in {}. available: {}",
+                path.display(),
+                if available.is_empty() {
+                    "(none)".into()
+                } else {
+                    available.join(", ")
+                }
+            )
+        })?;
+
+    array.remove(idx);
+
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    let out = io::stdout();
+    let mut out = out.lock();
+    writeln!(out, "removed session {name:?} from {}", path.display())?;
+    Ok(())
+}
+
+pub fn edit(
+    name: &str,
+    command: Option<&str>,
+    cwd: Option<&str>,
+    kind: Option<AddKindArg>,
+    rename: Option<&str>,
+    workspace: Option<&PathBuf>,
+) -> Result<()> {
+    // Require exactly one change — otherwise it's ambiguous what
+    // the user meant. Rather than apply all of a multi-flag set,
+    // error out with guidance.
+    let flag_count = [
+        command.is_some(),
+        cwd.is_some(),
+        kind.is_some(),
+        rename.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if flag_count == 0 {
+        return Err(anyhow!(
+            "pa edit needs one of --command, --cwd, --kind, --rename"
+        ));
+    }
+    if flag_count > 1 {
+        return Err(anyhow!(
+            "pa edit takes exactly one change at a time — pass only one of --command / --cwd / --kind / --rename"
+        ));
+    }
+
+    let path = resolve_workspace_path(workspace)?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+
+    // Collect sibling names BEFORE we take a mutable handle to the
+    // target table, to avoid overlapping borrows.
+    let sibling_names: Vec<String> = doc
+        .get("session")
+        .and_then(|v| v.as_array_of_tables())
+        .into_iter()
+        .flat_map(|a| a.iter())
+        .filter_map(|t| {
+            let tname = t
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Exclude the target session itself so a no-op rename
+            // doesn't collide with its own name.
+            match tname {
+                Some(n) if n != name => Some(n),
+                _ => None,
+            }
+        })
+        .collect();
+
+    // Check the rename target doesn't collide with any other session.
+    if let Some(new_name) = rename {
+        if sibling_names.iter().any(|n| n == new_name) {
+            return Err(anyhow!(
+                "another session is already named {new_name:?} in {}",
+                path.display()
+            ));
+        }
+    }
+
+    let array = doc
+        .get_mut("session")
+        .and_then(|v| v.as_array_of_tables_mut())
+        .ok_or_else(|| anyhow!("workspace {} has no sessions to edit", path.display()))?;
+
+    let table = array
+        .iter_mut()
+        .find(|t| {
+            t.get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| n == name)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| anyhow!("no session named {name:?} in {}", path.display()))?;
+
+    if let Some(new_cmd) = command {
+        table["command"] = toml_edit::value(new_cmd);
+    }
+    if let Some(new_cwd) = cwd {
+        table["cwd"] = toml_edit::value(new_cwd);
+    }
+    if let Some(k) = kind {
+        let kind_str = match crate::domain::SessionKind::from(k) {
+            crate::domain::SessionKind::ClaudeCode => "claude-code",
+            crate::domain::SessionKind::Opencode => "opencode",
+            crate::domain::SessionKind::Editor => "editor",
+            crate::domain::SessionKind::DevServer => "dev-server",
+            crate::domain::SessionKind::Shell => "shell",
+            crate::domain::SessionKind::Other => "other",
+        };
+        table["kind"] = toml_edit::value(kind_str);
+    }
+    if let Some(new_name) = rename {
+        table["name"] = toml_edit::value(new_name);
+    }
+
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    let out = io::stdout();
+    let mut out = out.lock();
+    writeln!(out, "edited session {name:?} in {}", path.display())?;
     Ok(())
 }
 

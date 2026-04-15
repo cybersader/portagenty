@@ -134,6 +134,48 @@ The append preserves any comments / formatting in the existing
 workspace file — we just tack on a new `[[session]]` block at the
 end. Duplicate names error cleanly.
 
+## `pa rm <session>`
+
+Delete a session from the current workspace file. Comments and
+formatting elsewhere in the file are preserved — only the matching
+`[[session]]` block is excised.
+
+| Flag | Default | What |
+|---|---|---|
+| `name` (positional) | — (required) | Session to remove |
+| `-w`, `--workspace <path>` | walk-up | Explicit workspace file |
+
+```sh
+pa rm claude
+pa rm tests -w ~/code/my.portagenty.toml
+```
+
+## `pa edit <session>`
+
+Change one field on an existing session without opening an editor.
+Pass exactly one change flag; passing zero or more than one errors
+with guidance.
+
+| Flag | What |
+|---|---|
+| `name` (positional) | Session to edit |
+| `--command <cmd>` | Replace the command |
+| `--cwd <path>` | Replace the cwd |
+| `--kind <...>` | Replace the kind hint |
+| `--rename <new-name>` | Rename (errors on collision with an existing session) |
+| `-w`, `--workspace <path>` | Explicit workspace file (walk-up otherwise) |
+
+```sh
+pa edit claude --command "claude --resume"
+pa edit dev --cwd ./new-app
+pa edit my-session --kind claude-code
+pa edit old-name --rename new-name
+```
+
+Same comment-preserving behavior as `pa rm`: only the target field
+on the target session changes; everything else in the file is left
+untouched.
+
 ## `pa export`
 
 Render the resolved workspace as a multiplexer-native starter

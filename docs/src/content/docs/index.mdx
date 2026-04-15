@@ -14,30 +14,69 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid } from "@astrojs/starlight/components";
+import { Card, CardGrid, Code } from "@astrojs/starlight/components";
+
+## Features
 
 <CardGrid>
-  <Card title="One command to install" icon="rocket">
+  <Card title="One-command install" icon="rocket">
     `cargo install --git https://github.com/cybersader/portagenty`.
-    Nothing else to clone, nothing to compile by hand. Single static
-    Rust binary at `~/.cargo/bin/pa`.
+    No clone, no `cd`, no hand compile. Single static Rust binary
+    at `~/.cargo/bin/pa`.
   </Card>
   <Card title="Cross-device takeover" icon="seti:config">
     SSH in from your phone, run `pa claim`, and the session instantly
     reshapes to the new device. No more "stuck at my laptop's
-    terminal width" when you hop between machines.
+    terminal width" after device hops.
   </Card>
-  <Card title="Works with what's already running" icon="approve-check">
-    Tmux / zellij sessions you started outside portagenty show up in
-    the TUI as Untracked, ready to attach. Nothing is deleted; you
-    just see what's live.
+  <Card title="Untracked session adoption" icon="approve-check">
+    Tmux / zellij sessions you started manually show up in the TUI
+    alongside workspace-defined ones. Attach with Enter — nothing
+    new to set up.
   </Card>
   <Card title="Multiplexer-aware" icon="setting">
-    tmux + zellij first-class. Renders native starter artifacts for
-    both via `pa export` so teammates can launch without installing
-    pa.
+    tmux + zellij first-class. Sessions with `cwd`, `command`, and
+    `env` work consistently across both. WezTerm explicitly skipped
+    — see the roadmap.
+  </Card>
+  <Card title="First-run wizard" icon="open-book">
+    Run `pa` on a new machine with no config and it walks you
+    through a 30-second setup. No TOML editing required to start.
+  </Card>
+  <Card title="No-editor session management" icon="pencil">
+    `pa init` / `pa add` / `pa rm` / `pa edit` handle the whole
+    workspace-file lifecycle from the command line. Phone-keyboard
+    friendly, comment-preserving.
+  </Card>
+  <Card title="Bundled bash ergonomics" icon="puzzle">
+    `pa snippets install pa-aliases` drops curated, idempotent
+    shell snippets into your rc file. Short aliases, Termux-friendly
+    tweaks, all opt-in.
+  </Card>
+  <Card title="Committable layouts" icon="document">
+    `pa export` renders your workspace as a tmux starter script or
+    zellij KDL layout. Commit it; teammates launch without needing
+    `pa` installed.
   </Card>
 </CardGrid>
+
+## See it in action
+
+```sh
+# Phone-over-SSH bootstrap, no editor required.
+ssh desktop
+cd ~/code/new-project
+pa init                                             # one starter session
+pa add claude -c "claude --resume" --kind claude-code
+pa add dev    -c "bun run dev"     --kind dev-server
+
+# Launch.
+pa            # TUI, pick one, Enter
+pa claim      # or: cross-device takeover on the first session
+
+# Later, from the desktop, take it back:
+pa claim
+```
 
 ## Status
 
@@ -45,11 +84,12 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
 end-to-end: walk up to find a workspace, render the session list,
 pick one, attach — in tmux or zellij.
 
-Several v1.x items are also shipped: zellij adapter, untracked
-session adoption, cross-device takeover, `kind:` hints, per-session
-env vars, declarative export (`pa export`). Session schema
-extensions (pre/post commands), tag + custom-group views, and a
-`pa up` eager-launch are still on the [roadmap](https://github.com/cybersader/portagenty/blob/main/ROADMAP.md).
+Most v1.x items have shipped: zellij adapter, untracked adoption,
+`pa claim` cross-device takeover, `kind:` hints, per-session env
+vars, declarative export, first-run wizard, bundled snippets,
+full no-editor session management (`pa init` / `add` / `rm` /
+`edit`). Tags + custom-groups views and a `pa up` eager-launch are
+still on the [roadmap](https://github.com/cybersader/portagenty/blob/main/ROADMAP.md).
 
 WezTerm is **intentionally not supported** — its mux is built around
 the GUI emulator's window model, not the headless detach/reattach
