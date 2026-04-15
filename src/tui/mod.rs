@@ -16,27 +16,30 @@ use crate::mux::TmuxAdapter;
 /// workspace + live mpx sessions, runs the TUI, and — if the user
 /// picked a row — restores the terminal and hands off to the mpx.
 pub fn run() -> Result<()> {
-    // Two-phase load: try to find a workspace. If walk-up fails AND
-    // we're in an interactive shell AND the user hasn't seen
-    // onboarding yet, offer the first-run wizard instead of just
-    // erroring. Scripted / piped / CI runs bypass the wizard and
-    // get the original error.
+    // Three-phase load:
+    //   1. Try normal walk-up discovery.
+    //   2. On failure: if we're interactive + first-time, run the
+    //      onboarding wizard.
+    //   3. Otherwise (interactive but already onboarded, or declined
+    //      wizard): fall through to a synthetic "live sessions only"
+    //      workspace so users can still browse + attach to whatever
+    //      tmux/zellij sessions they have, without authoring a TOML.
     let workspace = match load(&LoadOptions::default()) {
         Ok(w) => w,
-        Err(e) => {
-            if crate::onboarding::is_interactive() && !crate::onboarding::has_onboarded() {
+        Err(load_err) => {
+            if !crate::onboarding::is_interactive() {
+                return Err(load_err);
+            }
+            if !crate::onboarding::has_onboarded() {
                 use crate::onboarding::OnboardOutcome;
                 match crate::onboarding::run_wizard(false)? {
-                    OnboardOutcome::Scaffolded { .. } => {
-                        // File was just created in cwd — retry load.
-                        load(&LoadOptions::default())?
-                    }
-                    OnboardOutcome::ShowedDocs | OnboardOutcome::Skipped => {
-                        return Ok(());
-                    }
+                    OnboardOutcome::Scaffolded { .. } => load(&LoadOptions::default())?,
+                    OnboardOutcome::ShowedDocs | OnboardOutcome::Skipped => return Ok(()),
                 }
             } else {
-                return Err(e);
+                // Interactive + already onboarded + no workspace here.
+                // Fall into "browse live sessions" mode.
+                synthetic_browse_workspace()?
             }
         }
     };
@@ -109,6 +112,43 @@ pub fn run() -> Result<()> {
         eprintln!("  {e:#}");
     }
     launch_result
+}
+
+/// Build a synthetic empty workspace so the TUI can render
+/// live-multiplexer sessions even when no `*.portagenty.toml` is
+/// reachable from the current directory. Picks the machine-default
+/// multiplexer if set; otherwise prefers zellij if installed, else
+/// tmux. Returns an error if neither mpx is installed — at that
+/// point there's literally nothing to show.
+fn synthetic_browse_workspace() -> Result<crate::domain::Workspace> {
+    use crate::domain::Multiplexer;
+    let mpx = crate::config::current_default_multiplexer()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            // No pinned default — probe PATH. Fall through to tmux
+            // when neither is present; the mpx adapter will surface a
+            // friendlier "not installed" error at list_sessions time.
+            if bin_on_path("zellij") {
+                Multiplexer::Zellij
+            } else {
+                Multiplexer::Tmux
+            }
+        });
+    Ok(crate::domain::Workspace {
+        name: "(no workspace — live sessions)".into(),
+        file_path: None,
+        multiplexer: mpx,
+        projects: vec![],
+        sessions: vec![],
+    })
+}
+
+fn bin_on_path(bin: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|d| d.join(bin).is_file())
 }
 
 /// Print a one-line hand-off banner just before we replace the TUI
