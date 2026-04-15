@@ -196,7 +196,7 @@ impl App {
 
         self.render_session_list(frame, chunks[1]);
 
-        let footer_text = " j/k: nav · g/G: top/bottom · Enter: launch · q: quit ";
+        let footer_text = footer_for_width(area.width);
         let footer =
             Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
         frame.render_widget(footer, chunks[2]);
@@ -235,6 +235,19 @@ impl App {
             )
             .highlight_symbol("▶ ");
         frame.render_stateful_widget(list, area, &mut self.list_state);
+    }
+}
+
+/// Tiered footer text. Narrow terminals (phone-in-portrait over SSH
+/// from Termux) get a shorter hint so "quit" is always visible. See
+/// DESIGN.md §10 for the mobile constraints that drive this.
+fn footer_for_width(width: u16) -> &'static str {
+    if width >= 60 {
+        " j/k: nav · g/G: top/bottom · Enter: launch · q: quit "
+    } else if width >= 30 {
+        " j/k · Enter: launch · q: quit "
+    } else {
+        " q: quit "
     }
 }
 
@@ -546,5 +559,99 @@ mod tests {
             !row1.contains("▶"),
             "unexpected highlight on row 1: {row1:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Termux / mobile-SSH rendering contract. See DESIGN.md §10.
+    //
+    // Typical sizes: 35–45 cols × 15–25 rows in portrait; less with
+    // the software keyboard open. These tests anchor the TUI's
+    // behavior at those sizes so we don't regress on the mobile path
+    // while iterating on layout.
+    // ----------------------------------------------------------------
+
+    #[rstest::rstest]
+    #[case::phone_portrait(35, 20)]
+    #[case::phone_portrait_with_keyboard(40, 15)]
+    #[case::phone_portrait_tight(30, 12)]
+    #[case::phone_landscape(80, 18)]
+    fn renders_cleanly_at_termux_sizes(#[case] w: u16, #[case] h: u16) {
+        let ws = sample_workspace("mobile", 4);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let terminal = render_to_backend(&mut app, w, h);
+
+        // Header on row 0 always has the workspace name.
+        let header = line_at(&terminal, 0);
+        assert!(
+            header.contains("mobile"),
+            "header missing at {w}x{h}: {header:?}"
+        );
+        // Footer on the last row always has quit hint.
+        let footer = line_at(&terminal, h - 1);
+        assert!(
+            footer.to_lowercase().contains("quit"),
+            "footer missing at {w}x{h}: {footer:?}"
+        );
+        // Selected row (index 0 by default) has the highlight marker
+        // somewhere in the body region (rows 1..h-1).
+        let has_highlight = (1..h - 1).any(|y| line_at(&terminal, y).contains("▶"));
+        assert!(
+            has_highlight,
+            "no highlight marker visible at {w}x{h}; rendered:\n{}",
+            (0..h)
+                .map(|y| line_at(&terminal, y))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn termux_on_screen_keyboards_can_navigate_without_modifiers() {
+        // Some Android software keyboards send uppercase letters as
+        // `Char('G')` with modifiers = NONE rather than SHIFT. Our
+        // match arms use `_` for modifiers so either works; this test
+        // pins that behavior.
+        let ws = sample_workspace("x", 4);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+
+        app.handle_key(KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(3), "G without SHIFT should go to last");
+
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(0), "g should go to first");
+    }
+
+    #[test]
+    fn termux_volume_down_as_ctrl_quits() {
+        // Termux's default mapping of Volume-Down-as-Ctrl arrives as
+        // KeyModifiers::CONTROL on a letter key. Ctrl-C must still quit.
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let action = app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action, Action::Quit);
+    }
+
+    #[test]
+    fn arrow_keys_work_as_fallback_for_jk() {
+        // Termux's Extra Keys row provides arrow keys explicitly;
+        // some users prefer them to j/k.
+        let ws = sample_workspace("x", 4);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(1));
+    }
+
+    #[test]
+    fn home_end_work_as_fallback_for_top_bottom() {
+        // Same reason — Home/End are easier to reach than g/G on some
+        // on-screen keyboards.
+        let ws = sample_workspace("x", 4);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        app.handle_key(KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(3));
+        app.handle_key(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.selected(), Some(0));
     }
 }
