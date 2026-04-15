@@ -52,6 +52,7 @@ mod tests {
                 name: "tests".into(),
                 cwd: PathBuf::from("/home/user/code/portagenty"),
                 command: "cargo nextest run".into(),
+                kind: None,
             }],
         };
         let encoded = toml::to_string(&p).expect("serialize");

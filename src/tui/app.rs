@@ -310,10 +310,7 @@ fn row_list_item(row: &SessionRow, name_col: usize) -> ListItem<'static> {
         )
     };
 
-    // Style the marker per state so color/modifier distinguishes
-    // Live (green), NotStarted (dim), and Untracked (yellow) at a
-    // glance. Plain ANSI only — avoids wide-glyph surprises on
-    // Termux (DESIGN §10).
+    // State marker (● ○ ?) — color encodes Live/NotStarted/Untracked.
     let marker_style = match row.state {
         SessionState::Live => Style::default()
             .fg(Color::Green)
@@ -324,24 +321,57 @@ fn row_list_item(row: &SessionRow, name_col: usize) -> ListItem<'static> {
             .add_modifier(Modifier::BOLD),
     };
 
-    ListItem::new(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(row.state.marker().to_string(), marker_style),
-        Span::raw(" "),
-        Span::styled(padded_name, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::raw(row.cwd_display.clone()),
-        Span::raw("  "),
-        Span::styled(
-            row.command_display.clone(),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("[{}]", row.state.label()),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-    ]))
+    // Kind marker — small per-kind glyph shown right after the state
+    // marker when the session has a kind hint. Covered by v1.x
+    // item 9 in ROADMAP.md.
+    let (kind_glyph, kind_style) = kind_display(row.kind);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(12);
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(row.state.marker().to_string(), marker_style));
+    spans.push(Span::raw(" "));
+    if let Some(glyph) = kind_glyph {
+        spans.push(Span::styled(glyph.to_string(), kind_style));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        padded_name,
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::raw(row.cwd_display.clone()));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        row.command_display.clone(),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("[{}]", row.state.label()),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    ListItem::new(Line::from(spans))
+}
+
+/// Per-kind display — glyph + style. `None` for Shell/Other since the
+/// kind adds no visual clarity there. Colors kept to the standard 8
+/// so the output works on plain terminals over SSH.
+fn kind_display(kind: Option<crate::domain::SessionKind>) -> (Option<char>, Style) {
+    let Some(kind) = kind else {
+        return (None, Style::default());
+    };
+    use crate::domain::SessionKind;
+    let color = match kind {
+        SessionKind::ClaudeCode => Color::Blue,
+        SessionKind::Opencode => Color::Cyan,
+        SessionKind::Editor => Color::Magenta,
+        SessionKind::DevServer => Color::Green,
+        SessionKind::Shell | SessionKind::Other => return (None, Style::default()),
+    };
+    (
+        kind.marker(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
 }
 
 #[cfg(test)]
@@ -364,6 +394,7 @@ mod tests {
                     name: format!("s{i}"),
                     cwd: PathBuf::from("/tmp"),
                     command: "true".into(),
+                    kind: None,
                 })
                 .collect(),
         }
@@ -475,6 +506,7 @@ mod tests {
                 name: "claude".into(),
                 cwd: PathBuf::from("/tmp/demo"),
                 command: "claude --resume".into(),
+                kind: None,
             }],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
@@ -889,5 +921,81 @@ mod tests {
             !header.contains("untracked"),
             "header shouldn't mention untracked when none: {header:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // kind: hint rendering (ROADMAP v1.x #9).
+    // ----------------------------------------------------------------
+
+    fn ws_with_kinds(items: Vec<(&str, Option<crate::domain::SessionKind>)>) -> Workspace {
+        Workspace {
+            name: "x".into(),
+            file_path: None,
+            multiplexer: MpxEnum::Tmux,
+            projects: vec![],
+            sessions: items
+                .into_iter()
+                .map(|(name, kind)| Session {
+                    name: name.into(),
+                    cwd: PathBuf::from("/tmp"),
+                    command: "c".into(),
+                    kind,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn renders_kind_markers_for_known_kinds() {
+        use crate::domain::SessionKind;
+        let ws = ws_with_kinds(vec![
+            ("claude", Some(SessionKind::ClaudeCode)),
+            ("opencode", Some(SessionKind::Opencode)),
+            ("editor", Some(SessionKind::Editor)),
+            ("dev", Some(SessionKind::DevServer)),
+            ("shell", Some(SessionKind::Shell)),
+            ("other", Some(SessionKind::Other)),
+            ("notype", None),
+        ]);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let terminal = render_to_backend(&mut app, 120, 12);
+
+        // Rows 1..=7 correspond to the 7 sessions we defined.
+        let row_for = |idx: u16| line_at(&terminal, idx);
+        assert!(
+            row_for(1).contains(" C "),
+            "claude row missing C: {:?}",
+            row_for(1)
+        );
+        assert!(
+            row_for(2).contains(" O "),
+            "opencode row missing O: {:?}",
+            row_for(2)
+        );
+        assert!(
+            row_for(3).contains(" E "),
+            "editor row missing E: {:?}",
+            row_for(3)
+        );
+        assert!(
+            row_for(4).contains(" D "),
+            "dev-server row missing D: {:?}",
+            row_for(4)
+        );
+        // Shell/Other/None → no kind marker. Check that the row
+        // doesn't stray into another kind's letter.
+        for (idx, name) in [(5u16, "shell"), (6, "other"), (7, "notype")] {
+            let r = row_for(idx);
+            assert!(r.contains(name), "row {idx} missing name {name}: {r:?}");
+            // Make sure we're not accidentally emitting stray kind letters
+            // — the [idle] label contains no C/O/E/D/J etc in uppercase.
+            // Weak check: no " C " / " O " / " E " / " D " segment.
+            for m in [" C ", " O ", " E ", " D "] {
+                assert!(
+                    !r.contains(m),
+                    "row {idx} ({name}) unexpectedly has kind marker {m:?}: {r:?}"
+                );
+            }
+        }
     }
 }

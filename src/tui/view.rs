@@ -6,7 +6,7 @@
 //! Pure functions with no I/O; easy to unit-test without a mock
 //! multiplexer or a ratatui backend.
 
-use crate::domain::{Session, Workspace};
+use crate::domain::{Session, SessionKind, Workspace};
 use crate::mux::{sanitize_session_name, SessionInfo};
 
 /// Per-row state. Drives both the visual marker in the TUI and the
@@ -64,6 +64,9 @@ pub struct SessionRow {
     /// Optional command — from the workspace for tracked rows,
     /// `(unknown)` for untracked rows whose mpx doesn't report it.
     pub command_display: String,
+    /// Optional kind hint, carried through from the workspace session
+    /// when present. Drives the per-row kind marker in the TUI.
+    pub kind: Option<SessionKind>,
 }
 
 /// Build the row list from a loaded workspace plus the mpx's current
@@ -90,6 +93,7 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
             session: Some(sess.clone()),
             cwd_display: sess.cwd.display().to_string(),
             command_display: sess.command.clone(),
+            kind: sess.kind,
         });
     }
 
@@ -118,6 +122,7 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(unknown)".into()),
             command_display: "(unknown)".into(),
+            kind: None,
         });
     }
 
@@ -142,6 +147,25 @@ mod tests {
                     name: name.into(),
                     cwd: PathBuf::from("/tmp"),
                     command: cmd.into(),
+                    kind: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn ws_with_kinds(sessions: Vec<(&str, Option<SessionKind>)>) -> Workspace {
+        Workspace {
+            name: "x".into(),
+            file_path: None,
+            multiplexer: Multiplexer::Tmux,
+            projects: vec![],
+            sessions: sessions
+                .into_iter()
+                .map(|(name, kind)| Session {
+                    name: name.into(),
+                    cwd: PathBuf::from("/tmp"),
+                    command: "c".into(),
+                    kind,
                 })
                 .collect(),
         }
@@ -254,5 +278,26 @@ mod tests {
         assert_eq!(SessionState::Live.label(), "live");
         assert_eq!(SessionState::NotStarted.label(), "idle");
         assert_eq!(SessionState::Untracked.label(), "untracked");
+    }
+
+    #[test]
+    fn tracked_row_carries_kind_through_to_view() {
+        let rows = build_rows(
+            &ws_with_kinds(vec![
+                ("claude", Some(SessionKind::ClaudeCode)),
+                ("shell", None),
+                ("dev", Some(SessionKind::DevServer)),
+            ]),
+            &[],
+        );
+        assert_eq!(rows[0].kind, Some(SessionKind::ClaudeCode));
+        assert_eq!(rows[1].kind, None);
+        assert_eq!(rows[2].kind, Some(SessionKind::DevServer));
+    }
+
+    #[test]
+    fn untracked_row_always_has_no_kind() {
+        let rows = build_rows(&ws(vec![]), &live(&["mystery"]));
+        assert_eq!(rows[0].kind, None);
     }
 }

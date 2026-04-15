@@ -80,6 +80,7 @@ fn to_session(rs: &RawSession, cwd_base: &Path) -> Result<Session> {
         cwd: resolve_path(&rs.cwd, cwd_base)
             .with_context(|| format!("resolving cwd for session {:?}", rs.name))?,
         command: rs.command.clone(),
+        kind: rs.kind,
     })
 }
 
@@ -159,6 +160,7 @@ mod tests {
             name: name.into(),
             cwd: cwd.into(),
             command: cmd.into(),
+            kind: None,
         }
     }
 

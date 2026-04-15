@@ -104,6 +104,7 @@ mod tests {
                 name: "claude".into(),
                 cwd: PathBuf::from("/home/u/code/portagenty"),
                 command: "claude".into(),
+                kind: None,
             }],
         };
         let encoded = toml::to_string(&w).unwrap();

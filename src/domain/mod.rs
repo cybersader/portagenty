@@ -10,5 +10,5 @@ pub mod session;
 pub mod workspace;
 
 pub use project::Project;
-pub use session::Session;
+pub use session::{Session, SessionKind};
 pub use workspace::{Multiplexer, Workspace};

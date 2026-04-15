@@ -85,6 +85,10 @@ pub struct RawSession {
     pub name: String,
     pub cwd: String,
     pub command: String,
+    /// Optional `kind:` hint. Passes through to `domain::Session`
+    /// verbatim; see that module for the enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::domain::SessionKind>,
 }
 
 /// Read a TOML file and parse it into `T`. Preserves the path in the

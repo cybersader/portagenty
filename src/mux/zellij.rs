@@ -322,6 +322,7 @@ mod tests {
             name: "x".into(),
             cwd: PathBuf::from("/home/u/code"),
             command: "claude --resume".into(),
+            kind: None,
         };
         let layout = render_layout(&s);
         assert!(layout.contains(r#"cwd="/home/u/code""#));
@@ -335,6 +336,7 @@ mod tests {
             name: "x".into(),
             cwd: PathBuf::from("/tmp"),
             command: r#"echo "hi""#.into(),
+            kind: None,
         };
         let layout = render_layout(&s);
         assert!(

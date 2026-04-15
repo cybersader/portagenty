@@ -64,6 +64,7 @@ fn create_detached_then_list_and_has_session() {
         name: "alpha".into(),
         cwd: h.workdir(),
         command: "sleep 60".into(),
+        kind: None,
     };
     h.adapter.create_detached(&sess).expect("create_detached");
 
@@ -86,6 +87,7 @@ fn kill_is_idempotent() {
         name: "beta".into(),
         cwd: h.workdir(),
         command: "sleep 60".into(),
+        kind: None,
     };
     h.adapter.create_detached(&sess).unwrap();
     assert!(h.adapter.has_session("beta").unwrap());
@@ -107,6 +109,7 @@ fn sanitization_round_trip_through_create_detached() {
         name: "has spaces:and:colons".into(),
         cwd: h.workdir(),
         command: "sleep 60".into(),
+        kind: None,
     };
     h.adapter.create_detached(&sess).unwrap();
 
@@ -126,6 +129,7 @@ fn create_detached_reports_cwd() {
         name: "gamma".into(),
         cwd: cwd.clone(),
         command: "sleep 60".into(),
+        kind: None,
     };
     h.adapter.create_detached(&sess).unwrap();
 
@@ -155,6 +159,7 @@ fn create_detached_errors_when_cwd_missing() {
         name: "delta".into(),
         cwd: bad_cwd,
         command: "sleep 60".into(),
+        kind: None,
     };
     let err = h.adapter.create_detached(&sess).unwrap_err();
     let msg = format!("{err:#}");
