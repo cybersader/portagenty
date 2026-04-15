@@ -163,6 +163,14 @@ pub enum Command {
     /// workspace in the current directory, picks a multiplexer,
     /// optionally pre-populates a Claude Code session. Safe to re-run.
     Onboard,
+    /// Emit a shell completion script for the named shell. Pipe it
+    /// into the completion file your shell loads — see the commands
+    /// reference for per-shell install hints.
+    Completions {
+        /// Shell to emit completion for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Render the resolved workspace as a starter script (tmux) or
     /// layout (zellij). Useful for committing a per-machine launcher
     /// alongside the workspace TOML.
@@ -550,6 +558,20 @@ pub fn add(
 
 pub fn onboard() -> Result<()> {
     crate::onboarding::run_wizard(true)?;
+    Ok(())
+}
+
+/// Emit a shell completion script to stdout. Covers every
+/// subcommand and flag clap knows about. Dynamic completions
+/// (session names, snippet names) are not included in v1.x — those
+/// land in a follow-up.
+pub fn completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut out);
     Ok(())
 }
 

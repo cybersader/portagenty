@@ -176,6 +176,22 @@ Same comment-preserving behavior as `pa rm`: only the target field
 on the target session changes; everything else in the file is left
 untouched.
 
+## `pa completions <shell>`
+
+Emit a shell completion script to stdout. See
+[shell completion setup](../../getting-started/completions/)
+for per-shell install recipes.
+
+```sh
+pa completions bash > ~/.local/share/bash-completion/completions/pa
+pa completions zsh  > ~/.zsh/completions/_pa
+pa completions fish > ~/.config/fish/completions/pa.fish
+```
+
+Covers subcommand names + flag names + flag values that come from a
+closed set. Dynamic completion of session names / snippet names /
+workspace files is roadmapped, not v1.x.
+
 ## `pa export`
 
 Render the resolved workspace as a multiplexer-native starter

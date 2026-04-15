@@ -41,6 +41,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Init { name, mpx, force }) => cli::init(name, mpx, force),
         Some(Command::Snippets(cmd)) => cli::snippets(cmd),
         Some(Command::Onboard) => cli::onboard(),
+        Some(Command::Completions { shell }) => cli::completions(shell),
         Some(Command::Add {
             name,
             command,

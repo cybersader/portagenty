@@ -411,6 +411,55 @@ fn add_errors_when_no_workspace_found() {
 }
 
 #[test]
+fn completions_bash_produces_bash_completion_script() {
+    let out = Command::cargo_bin("pa")
+        .unwrap()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    // Bash completion scripts always define _pa (or whatever bin
+    // name) and use `complete -F` at the bottom.
+    assert!(s.contains("_pa"), "expected _pa function:\n{s}");
+    assert!(
+        s.contains("complete -F"),
+        "expected `complete -F` registration:\n{s}"
+    );
+}
+
+#[test]
+fn completions_zsh_produces_zsh_completion_script() {
+    let out = Command::cargo_bin("pa")
+        .unwrap()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    // Zsh completion scripts start with `#compdef`.
+    assert!(s.starts_with("#compdef"), "expected #compdef header:\n{s}");
+    // Our subcommand names should appear somewhere.
+    assert!(s.contains("launch"));
+    assert!(s.contains("claim"));
+    assert!(s.contains("init"));
+}
+
+#[test]
+fn completions_fish_produces_fish_completion_script() {
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(contains("complete -c pa"));
+}
+
+#[test]
 fn rm_removes_matching_session_and_preserves_rest() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws = tmp.child("ws.portagenty.toml");
