@@ -63,6 +63,13 @@ pa launch claude -w ./my.portagenty.toml   # explicit workspace file
 # first one in the workspace — the common one-agent-per-project case.
 pa claim
 pa claim tests              # specific session by name
+
+# Render the workspace as a starter script (or zellij layout). Useful
+# for committing alongside the TOML so teammates can launch the whole
+# stack without installing pa themselves.
+pa export                       # to stdout; format follows the workspace's mpx
+pa export --format zellij -o layout.kdl
+pa export --format tmux -o starter.sh
 ```
 
 ## 5. Cross-device: take over from a different machine

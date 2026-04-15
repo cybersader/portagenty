@@ -38,11 +38,10 @@ Explicitly **not** in v1:
 
 ### Shipped
 
-1. **zellij adapter** (`af963c3…`). List/has/kill via imperative CLI;
-   create + attach via generated KDL layout files. Inside-zellij
-   detection returns a clear "detach first" error instead of the
-   opaque nesting failure. 7 e2e tests against real zellij on Linux
-   CI.
+1. **zellij adapter.** List/has/kill via imperative CLI; create +
+   attach via generated KDL layout files. Inside-zellij detection
+   returns a clear "detach first" error instead of the opaque
+   nesting failure. 7 e2e tests against real zellij on Linux CI.
 3. **Untracked session adoption.** The TUI merges `mux.list_sessions`
    with workspace definitions and surfaces three row states — Live,
    NotStarted, Untracked — each with a distinct color marker.
@@ -51,12 +50,28 @@ Explicitly **not** in v1:
 6. **State/activity decorations.** Delivered alongside untracked
    adoption: ● (green) live, ○ (dim) idle, ? (yellow) untracked,
    plus a `[label]` tag on each row.
+7. **Declarative export (`pa export`).** Renders the resolved
+   workspace as a POSIX shell script (`tmux new-session -d` per
+   session + `tmux attach -d`) or as a zellij KDL layout (one tab
+   per session, env routed through `command "env"` for clean string
+   args). Commit a starter script alongside the workspace TOML and
+   teammates can launch the whole stack without installing `pa`.
 9. **`kind:` session hints.** Optional `kind` field on sessions
    (claude-code / opencode / editor / dev-server / shell / other).
    Currently display-only — the TUI shows a one-letter color-coded
-   glyph (C / O / E / D) next to the state marker. Smart-resume
-   behaviors deferred to a later commit if we find they're worth
-   the added branching.
+   glyph (C / O / E / D) next to the state marker.
+10a. **Per-session env vars.** `env` field on sessions threaded
+   through the merge into the launch path. tmux uses `-e KEY=VAL`
+   per entry; zellij wraps `bash -c "<cmd>"` in `env KEY=VAL ...`
+   so values with spaces / symbols don't need shell escaping.
+   Pre/post commands + profile refs (item 10's other halves) still
+   to ship.
+
+Plus an **unplanned win**: cross-device takeover (`pa claim` + the
+default `AttachMode::Takeover`). Solves the "screen size stuck after
+attaching from a smaller device" issue inherent to multi-client
+tmux sessions. tmux uses `-d` natively; zellij warns when other
+clients appear attached (no equivalent CLI). See README quickstart.
 
 ### Still to ship (rough priority order)
 
@@ -78,13 +93,13 @@ Explicitly **not** in v1:
    into the resolved `Workspace`.
 5. **Custom ordered groups.** Hand-curated named groups
    ("playlists"). Drag-in-TUI or edit via keybinding.
-7. **Declarative export.** `pa export` emits zellij KDL layouts
-   and tmux scripts from a workspace definition.
-8. **Eager / "jump-in" launch.** `--eager` flag and/or
-   workspace-level config key.
-10. **Session schema extensions.** Env vars, pre/post commands,
-    profile references. Lifted selectively from the VS Code
-    extension's schema.
+8. **Eager / "jump-in" launch.** `pa up` / `--eager` flag to
+   pre-spawn all workspace sessions in detached mode (fully
+   supported on tmux; partial on zellij due to the
+   no-background-with-command limitation).
+10b. **Session schema extensions, part 2.** Pre/post commands +
+    profile references. Schema scaffolding from part 1 (env)
+    extends naturally.
 11. **`fd` / Everything CLI search integration.** Opportunistic
     fast discovery where available.
 12. **Termux polish pass.** Over-SSH verification + any rough
