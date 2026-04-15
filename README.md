@@ -4,16 +4,36 @@ A portable, terminal-native launcher for agent workspaces. Written in Rust. Bina
 
 > Status: **v1 feature-complete, pre-release**. `pa` loads a workspace, shows its sessions in a TUI, and launches the selected session in tmux. `pa launch <name>` and `pa list` work headlessly. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive and [ROADMAP.md](./ROADMAP.md) for what's shipped and what's next (v1.x: zellij + WezTerm adapters, untracked-session adoption, Recent/Tags/Groups views, declarative export). Docs site: <https://cybersader.github.io/portagenty/>. Local + Tailscale preview also supported (see below).
 
-## Quickstart (using `pa`)
+## Install
+
+One command if you have Rust:
 
 ```sh
-# 1. Install tmux if you don't have it.
-sudo apt install tmux    # or: brew install tmux
+cargo install --git https://github.com/cybersader/portagenty
+```
 
-# 2. Build pa.
-cargo install --path .   # or: cargo build --release
+…or, if you don't have Rust yet:
 
-# 3. Drop a workspace file anywhere.
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+cargo install --git https://github.com/cybersader/portagenty
+```
+
+Also install your multiplexer of choice:
+
+```sh
+sudo apt install tmux          # Debian / Ubuntu / WSL
+brew install tmux              # macOS
+# or zellij: https://zellij.dev/documentation/installation
+```
+
+Verify: `pa --version`. The binary lives at `~/.cargo/bin/pa`; make sure that's on `PATH` (rustup's installer adds it by default).
+
+## Quickstart
+
+```sh
+# 1. Drop a workspace file anywhere under the projects it covers.
 cat > ~/code/my.portagenty.toml <<'EOF'
 name = "My stuff"
 multiplexer = "tmux"
@@ -23,17 +43,21 @@ projects = ["~/code/one", "~/code/two"]
 name = "claude"
 cwd = "~/code/one"
 command = "claude"
+kind = "claude-code"
 
 [[session]]
 name = "dev"
 cwd = "~/code/two"
 command = "bun run dev"
+kind = "dev-server"
 EOF
 
-# 4. From any directory under the workspace file:
+# 2. From any directory under the workspace file:
 pa                       # opens TUI; pick a session, Enter to launch
 pa list                  # prints the resolved workspace
-pa launch claude         # one-shot: skip TUI, go straight to tmux
+pa launch claude         # one-shot: skip TUI, go straight to the mpx
+pa claim                 # "make this device the main" — cross-device takeover
+pa export -o starter.sh  # render a starter script to commit alongside
 ```
 
 ## Building (development)
