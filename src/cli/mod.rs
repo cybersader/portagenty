@@ -75,6 +75,46 @@ pub enum Command {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<PathBuf>,
     },
+    /// Scaffold a new `<name>.portagenty.toml` in the current
+    /// directory. One starter session pre-populated so `pa` works
+    /// immediately — edit or `pa add` more later. Designed for the
+    /// phone-over-SSH case where you don't want to drop into nano.
+    Init {
+        /// Workspace name. Defaults to the current directory's name.
+        name: Option<String>,
+
+        /// Multiplexer to pin. Defaults to "tmux".
+        #[arg(long = "mpx", value_enum)]
+        mpx: Option<InitMpxArg>,
+
+        /// Overwrite an existing workspace file if one's already here.
+        #[arg(long = "force")]
+        force: bool,
+    },
+    /// Append a new session to the current workspace file. Faster
+    /// than editing TOML by hand — especially from Termux.
+    Add {
+        /// Session name.
+        name: String,
+
+        /// The command to run.
+        #[arg(short = 'c', long = "command")]
+        command: String,
+
+        /// Session cwd. Defaults to "." (relative to the workspace
+        /// file's directory).
+        #[arg(long = "cwd")]
+        cwd: Option<String>,
+
+        /// Optional kind hint (claude-code / opencode / editor /
+        /// dev-server / shell / other).
+        #[arg(long = "kind", value_enum)]
+        kind: Option<AddKindArg>,
+
+        /// Explicit workspace file. Walks up from cwd otherwise.
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
     /// Render the resolved workspace as a starter script (tmux) or
     /// layout (zellij). Useful for committing a per-machine launcher
     /// alongside the workspace TOML.
@@ -105,6 +145,36 @@ impl From<ExportFormatArg> for crate::export::ExportFormat {
         match a {
             ExportFormatArg::Tmux => crate::export::ExportFormat::Tmux,
             ExportFormatArg::Zellij => crate::export::ExportFormat::Zellij,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum InitMpxArg {
+    Tmux,
+    Zellij,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum AddKindArg {
+    ClaudeCode,
+    Opencode,
+    Editor,
+    DevServer,
+    Shell,
+    Other,
+}
+
+impl From<AddKindArg> for crate::domain::SessionKind {
+    fn from(a: AddKindArg) -> Self {
+        use crate::domain::SessionKind;
+        match a {
+            AddKindArg::ClaudeCode => SessionKind::ClaudeCode,
+            AddKindArg::Opencode => SessionKind::Opencode,
+            AddKindArg::Editor => SessionKind::Editor,
+            AddKindArg::DevServer => SessionKind::DevServer,
+            AddKindArg::Shell => SessionKind::Shell,
+            AddKindArg::Other => SessionKind::Other,
         }
     }
 }
@@ -229,6 +299,168 @@ fn attach_mode_label(mode: AttachMode) -> &'static str {
         AttachMode::Takeover => "takeover: other clients will be detached",
         AttachMode::Shared => "shared: other clients stay attached",
     }
+}
+
+/// Quote a string as a TOML basic string (backslash-escape `\` and
+/// `"`; nothing else needs escaping for the values we let users pass
+/// on the command line). Used by both `init` and `add` when writing
+/// TOML fragments.
+fn toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Scaffold a new workspace file in the current directory. Writes
+/// `<name>.portagenty.toml` with one starter session (`shell`, just
+/// bash) so `pa` works end-to-end on the first run. Returns the path
+/// that got written.
+pub fn init(name: Option<String>, mpx: Option<InitMpxArg>, force: bool) -> Result<()> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let workspace_name = match name {
+        Some(n) => n,
+        None => cwd
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("workspace")
+            .to_string(),
+    };
+
+    // Sanitize for filename use: replace anything non-safe with `_`.
+    // Filenames are strict about what's tolerable; the on-disk name
+    // is separate from the display name.
+    let filename_stem: String = workspace_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let filename = format!("{filename_stem}.portagenty.toml");
+    let path = cwd.join(&filename);
+
+    if path.exists() && !force {
+        return Err(anyhow!(
+            "{} already exists; pass --force to overwrite",
+            path.display()
+        ));
+    }
+
+    let mpx = match mpx {
+        Some(InitMpxArg::Zellij) => "zellij",
+        Some(InitMpxArg::Tmux) | None => "tmux",
+    };
+
+    let contents = format!(
+        r#"# Workspace file for portagenty. See:
+# https://cybersader.github.io/portagenty/reference/schema/
+name = {name}
+multiplexer = "{mpx}"
+
+[[session]]
+name = "shell"
+cwd = "."
+command = "bash"
+kind = "shell"
+"#,
+        name = toml_basic_string(&workspace_name),
+    );
+
+    std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
+
+    let out = io::stdout();
+    let mut out = out.lock();
+    writeln!(out, "created {}", path.display())?;
+    writeln!(
+        out,
+        "run `pa` here to open the TUI, or `pa add` to append more sessions"
+    )?;
+    Ok(())
+}
+
+/// Append a new session to the current workspace file. Keeps the
+/// existing content verbatim (comments + formatting preserved) —
+/// just appends a `[[session]]` block at the end.
+pub fn add(
+    name: &str,
+    command: &str,
+    cwd: Option<&str>,
+    kind: Option<AddKindArg>,
+    workspace: Option<&PathBuf>,
+) -> Result<()> {
+    // Find the workspace file.
+    let ws_path = match workspace {
+        Some(p) => p.clone(),
+        None => crate::config::walk_up_from(
+            &std::env::current_dir().context("reading current directory")?,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "no *.portagenty.toml found walking up from {}. Run `pa init` here first.",
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "$PWD".into())
+            )
+        })?,
+    };
+
+    // Duplicate-check: load + parse to see if name already exists.
+    // If so, bail clearly instead of producing a file with two
+    // sessions of the same name (which load() would then error on).
+    let existing: crate::config::WorkspaceFile = crate::config::load_toml(&ws_path)
+        .with_context(|| format!("reading existing workspace file {}", ws_path.display()))?;
+    if existing.sessions.iter().any(|s| s.name == name) {
+        return Err(anyhow!(
+            "session {name:?} already exists in {}. Delete it by hand or pick a different name.",
+            ws_path.display(),
+        ));
+    }
+
+    let cwd_val = cwd.unwrap_or(".");
+
+    let mut block = String::new();
+    block.push_str("\n[[session]]\n");
+    block.push_str(&format!("name = {}\n", toml_basic_string(name)));
+    block.push_str(&format!("cwd = {}\n", toml_basic_string(cwd_val)));
+    block.push_str(&format!("command = {}\n", toml_basic_string(command)));
+    if let Some(k) = kind {
+        let kind_str = match crate::domain::SessionKind::from(k) {
+            crate::domain::SessionKind::ClaudeCode => "claude-code",
+            crate::domain::SessionKind::Opencode => "opencode",
+            crate::domain::SessionKind::Editor => "editor",
+            crate::domain::SessionKind::DevServer => "dev-server",
+            crate::domain::SessionKind::Shell => "shell",
+            crate::domain::SessionKind::Other => "other",
+        };
+        block.push_str(&format!("kind = \"{kind_str}\"\n"));
+    }
+
+    // Read existing contents so we preserve everything (comments,
+    // whitespace, trailing-newline decisions). Append the new block.
+    let mut contents = std::fs::read_to_string(&ws_path)
+        .with_context(|| format!("reading {}", ws_path.display()))?;
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&block);
+
+    std::fs::write(&ws_path, contents).with_context(|| format!("writing {}", ws_path.display()))?;
+
+    let out = io::stdout();
+    let mut out = out.lock();
+    writeln!(out, "added session {name:?} to {}", ws_path.display())?;
+    Ok(())
 }
 
 pub fn export(

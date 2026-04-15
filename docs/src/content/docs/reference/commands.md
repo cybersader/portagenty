@@ -92,6 +92,48 @@ sessions:  2
   - dev     (cwd: /home/u/code/two)  bun run dev
 ```
 
+## `pa init [name]`
+
+Scaffold a new `<name>.portagenty.toml` in the current directory
+with one starter session (`shell` → `bash`). Designed for phone-over-
+SSH: you don't have to hand-edit TOML before `pa` works.
+
+| Flag | Default | What |
+|---|---|---|
+| `name` (positional) | current-directory name | Workspace display name; filename stem is a sanitized version |
+| `--mpx tmux\|zellij` | tmux | Which multiplexer to pin |
+| `--force` | off | Overwrite an existing `<name>.portagenty.toml` |
+
+```sh
+pa init                        # name taken from current dir
+pa init my-space               # explicit name
+pa init my-space --mpx zellij
+pa init my-space --force       # overwrite existing
+```
+
+## `pa add <session> -c <command>`
+
+Append a new session to the current workspace file. Faster than
+editing TOML manually, especially from a phone keyboard.
+
+| Flag | Default | What |
+|---|---|---|
+| `name` (positional) | — (required) | New session's name |
+| `-c`, `--command <cmd>` | — (required) | Command to run |
+| `--cwd <path>` | `.` | Working directory |
+| `--kind <...>` | none | `claude-code`, `opencode`, `editor`, `dev-server`, `shell`, or `other` |
+| `-w`, `--workspace <path>` | walk-up | Explicit workspace file |
+
+```sh
+pa add claude -c "claude --resume" --kind claude-code
+pa add dev -c "bun run dev" --cwd ./app --kind dev-server
+pa add tests -c "cargo nextest run"
+```
+
+The append preserves any comments / formatting in the existing
+workspace file — we just tack on a new `[[session]]` block at the
+end. Duplicate names error cleanly.
+
 ## `pa export`
 
 Render the resolved workspace as a multiplexer-native starter

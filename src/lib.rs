@@ -36,5 +36,13 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             format,
             output,
         }) => cli::export(workspace.as_ref(), format, output.as_ref()),
+        Some(Command::Init { name, mpx, force }) => cli::init(name, mpx, force),
+        Some(Command::Add {
+            name,
+            command,
+            cwd,
+            kind,
+            workspace,
+        }) => cli::add(&name, &command, cwd.as_deref(), kind, workspace.as_ref()),
     }
 }

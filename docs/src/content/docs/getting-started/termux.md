@@ -52,6 +52,27 @@ visible:
    [`cybersader/agentic-workflow-and-tech-stack`'s terminal-setup
    docs](https://github.com/cybersader/agentic-workflow-and-tech-stack/blob/main/docs/terminal-setup.md).
 
+## Bootstrapping a new project from the phone
+
+You don't need to SSH to desktop, open nano, and hand-edit a TOML
+file just to get started on a new project. From Termux:
+
+```sh
+ssh desktop
+cd ~/code/new-project
+pa init                                            # scaffolds <dirname>.portagenty.toml
+pa add claude -c "claude --resume" --kind claude-code
+pa add dev   -c "bun run dev"      --kind dev-server
+pa                                                  # TUI, pick one, Enter
+```
+
+Four commands and you're in. No editor required. Each `pa add`
+appends to the workspace file non-destructively; existing
+comments and ordering are preserved.
+
+When you come back to the project from the desktop, everything's
+already in git-friendly TOML ready to commit.
+
 ## Known hiccups
 
 - **Flow control (`Ctrl+S` / `Ctrl+Q`)** can freeze the terminal if

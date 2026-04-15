@@ -244,6 +244,173 @@ fn list_prints_workspace_summary() {
 }
 
 #[test]
+fn init_creates_starter_workspace_with_sane_defaults() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["init", "my-space"])
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .stdout(contains("created"))
+        .stdout(contains("pa add"));
+
+    let path = tmp.child("my-space.portagenty.toml");
+    assert!(path.path().is_file(), "workspace file should exist");
+
+    let contents = std::fs::read_to_string(path.path()).unwrap();
+    assert!(contents.contains(r#"name = "my-space""#));
+    assert!(contents.contains(r#"multiplexer = "tmux""#));
+    assert!(contents.contains(r#"name = "shell""#));
+    assert!(contents.contains(r#"command = "bash""#));
+    assert!(contents.contains(r#"kind = "shell""#));
+}
+
+#[test]
+fn init_with_zellij_mpx_flag_pins_zellij() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["init", "zj-space", "--mpx", "zellij"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+
+    let path = tmp.child("zj-space.portagenty.toml");
+    let contents = std::fs::read_to_string(path.path()).unwrap();
+    assert!(contents.contains(r#"multiplexer = "zellij""#));
+}
+
+#[test]
+fn init_errors_when_file_already_exists_unless_force() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("dup.portagenty.toml").write_str("").unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["init", "dup"])
+        .current_dir(tmp.path())
+        .assert()
+        .failure()
+        .stderr(contains("--force"));
+
+    // With --force it overwrites.
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["init", "dup", "--force"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn init_defaults_name_to_current_directory() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let nested = tmp.child("my-project-name");
+    nested.create_dir_all().unwrap();
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["init"])
+        .current_dir(nested.path())
+        .assert()
+        .success();
+
+    let path = nested.child("my-project-name.portagenty.toml");
+    assert!(path.path().is_file());
+    let contents = std::fs::read_to_string(path.path()).unwrap();
+    assert!(contents.contains(r#"name = "my-project-name""#));
+}
+
+#[test]
+fn add_appends_new_session_and_pa_list_sees_it() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    // Bootstrap with init.
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["init", "myws"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+
+    let ws_path = tmp.child("myws.portagenty.toml");
+
+    // Append a new session.
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args([
+            "add",
+            "claude",
+            "-c",
+            "claude --resume",
+            "--kind",
+            "claude-code",
+        ])
+        .arg("--workspace")
+        .arg(ws_path.path())
+        .assert()
+        .success()
+        .stdout(contains("added session"));
+
+    // pa list sees both the original shell session and the new one.
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["list"])
+        .arg("--workspace")
+        .arg(ws_path.path())
+        .assert()
+        .success()
+        .stdout(contains("shell"))
+        .stdout(contains("claude"))
+        .stdout(contains("claude --resume"));
+}
+
+#[test]
+fn add_errors_on_duplicate_session_name() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["init", "ws"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+    let ws_path = tmp.child("ws.portagenty.toml");
+
+    // First add succeeds.
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["add", "tests", "-c", "cargo test"])
+        .arg("--workspace")
+        .arg(ws_path.path())
+        .assert()
+        .success();
+
+    // Second add with same name fails cleanly.
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["add", "tests", "-c", "cargo test"])
+        .arg("--workspace")
+        .arg(ws_path.path())
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+}
+
+#[test]
+fn add_errors_when_no_workspace_found() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["add", "claude", "-c", "claude"])
+        .current_dir(tmp.path())
+        .assert()
+        .failure()
+        .stderr(contains("pa init"));
+}
+
+#[test]
 fn list_walks_up_when_no_workspace_flag() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let _ = write_demo_workspace(&tmp);
