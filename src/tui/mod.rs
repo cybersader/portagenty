@@ -24,6 +24,27 @@ pub fn run() -> Result<()> {
 
     match result? {
         (AppOutcome::Quit, _) => Ok(()),
-        (AppOutcome::Launch(session), mux) => mux.create_and_attach(&session),
+        (AppOutcome::Launch(session), mux) => {
+            // Record the launch before attaching; attach blocks until
+            // the user detaches from the mpx, and if they kill the
+            // whole process tree we'd lose the entry otherwise. The
+            // record_launch is best-effort — a state-store failure
+            // shouldn't block the user's launch.
+            if let Some(path) = &workspace_file_from(&session) {
+                let _ = crate::state::record_launch(path, &session.name);
+            }
+            mux.create_and_attach(&session)
+        }
     }
+}
+
+/// We moved the Workspace into the App, which moved into `run`. The
+/// workspace file path is no longer reachable through the Session
+/// alone, so we'd need to either plumb it through AppOutcome or
+/// re-derive it. Easiest: re-derive by walking up from the session's
+/// cwd. Not perfect — if the workspace file is elsewhere — but for
+/// v1 it's the simplest defensible choice. See DESIGN §4 for the
+/// broader state-store contract.
+fn workspace_file_from(session: &crate::domain::Session) -> Option<std::path::PathBuf> {
+    crate::config::walk_up_from(&session.cwd)
 }

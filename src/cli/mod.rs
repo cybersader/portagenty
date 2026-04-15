@@ -110,6 +110,13 @@ pub fn launch(session: &str, workspace: Option<&PathBuf>, dry_run: bool) -> Resu
         return Ok(());
     }
 
+    // Record the launch BEFORE attaching — attach blocks until the
+    // user detaches from the mpx, so recording after could lose the
+    // entry if the process is killed mid-session.
+    if let Some(path) = &ws.file_path {
+        let _ = crate::state::record_launch(path, &sess.name);
+    }
+
     let mux = build_mux(ws.multiplexer)?;
     mux.create_and_attach(&sess)
         .with_context(|| format!("launching session {:?}", sess.name))
