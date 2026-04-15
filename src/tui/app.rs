@@ -69,10 +69,18 @@ pub struct App {
     /// perform the action, on anything else we clear and continue.
     pending: Option<PendingAction>,
     /// Human-readable status blurb shown in the footer region. Set
-    /// after row actions (e.g. "deleted 'claude'"). Cleared on next
-    /// key press so it doesn't linger indefinitely.
+    /// after row actions (e.g. "deleted 'claude'"). Auto-clears
+    /// after STATUS_TTL via the event-poll loop, so it doesn't
+    /// linger when the user just walks away.
     status: Option<String>,
+    /// Wall-clock instant the current status was set. `None` when
+    /// status is `None`. Used by the run loop to age status messages
+    /// out without requiring a keystroke.
+    status_set_at: Option<std::time::Instant>,
 }
+
+/// How long status messages stick around before auto-clearing.
+const STATUS_TTL: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// Queued destructive action awaiting user confirmation.
 #[derive(Debug, Clone)]
@@ -113,6 +121,7 @@ impl App {
             help_open: false,
             pending: None,
             status: None,
+            status_set_at: None,
         }
     }
 
@@ -168,9 +177,23 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) -> Result<(AppOutcome, Box<dyn Multiplexer>)> {
         loop {
+            // Auto-age the status line so a "cancelled" or "deleted X"
+            // message doesn't sit forever when the user walks away.
+            if let Some(set_at) = self.status_set_at {
+                if set_at.elapsed() >= STATUS_TTL {
+                    self.clear_status();
+                }
+            }
             terminal.draw(|frame| self.render(frame))?;
-            if let Some(outcome) = self.handle_event()? {
-                return Ok((outcome, self.mux));
+
+            // Poll instead of read so we can re-check the status TTL
+            // periodically. 250ms is short enough to feel responsive
+            // when the message clears, long enough that we're not
+            // burning CPU.
+            if event::poll(std::time::Duration::from_millis(250))? {
+                if let Some(outcome) = self.handle_event()? {
+                    return Ok((outcome, self.mux));
+                }
             }
         }
     }
@@ -213,6 +236,19 @@ impl App {
         self.selected().and_then(|i| self.rows.get(i))
     }
 
+    /// Set the footer status line + reset its TTL clock. Use this
+    /// instead of writing to `self.status` directly so auto-clear
+    /// timing stays consistent.
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status = Some(msg.into());
+        self.status_set_at = Some(std::time::Instant::now());
+    }
+
+    fn clear_status(&mut self) {
+        self.status = None;
+        self.status_set_at = None;
+    }
+
     /// Queue a delete-session confirm modal for the currently-selected
     /// row. Only valid on tracked rows (ones with a workspace
     /// session). Untracked rows (live mpx sessions outside the
@@ -227,7 +263,7 @@ impl App {
             return;
         };
         if row.state == SessionState::NotStarted {
-            self.status = Some("x: no live session to kill on this row (it's idle)".into());
+            self.set_status("x: no live session to kill on this row (it's idle)");
             return;
         }
         self.pending = Some(PendingAction::KillSession {
@@ -242,13 +278,11 @@ impl App {
             return;
         };
         if row.session.is_none() {
-            self.status =
-                Some("d: nothing to delete — untracked rows aren't in the workspace".into());
+            self.set_status("d: nothing to delete — untracked rows aren't in the workspace");
             return;
         }
         if self.workspace.file_path.is_none() {
-            self.status =
-                Some("d: can't delete — this is the synthetic live-browse workspace".into());
+            self.set_status("d: can't delete — this is the synthetic live-browse workspace");
             return;
         }
         self.pending = Some(PendingAction::DeleteSession {
@@ -278,15 +312,15 @@ impl App {
                         let sel = self.list_state.selected().unwrap_or(0);
                         self.list_state.select(Some(sel.min(self.rows.len() - 1)));
                     }
-                    self.status = Some(format!("killed session {display_name:?}"));
+                    self.set_status(format!("killed session {display_name:?}"));
                 }
                 Err(e) => {
-                    self.status = Some(format!("kill failed: {e:#}"));
+                    self.set_status(format!("kill failed: {e:#}"));
                 }
             },
             PendingAction::DeleteSession { name } => {
                 let Some(path) = self.workspace.file_path.clone() else {
-                    self.status = Some("delete failed: no workspace file on disk".into());
+                    self.set_status("delete failed: no workspace file on disk");
                     return;
                 };
                 match crate::cli::remove_session_from_file(&path, &name) {
@@ -305,10 +339,10 @@ impl App {
                             let sel = self.list_state.selected().unwrap_or(0);
                             self.list_state.select(Some(sel.min(self.rows.len() - 1)));
                         }
-                        self.status = Some(format!("deleted session {name:?}"));
+                        self.set_status(format!("deleted session {name:?}"));
                     }
                     Err(e) => {
-                        self.status = Some(format!("delete failed: {e:#}"));
+                        self.set_status(format!("delete failed: {e:#}"));
                     }
                 }
             }
@@ -334,13 +368,13 @@ impl App {
                     self.perform_pending(action);
                 }
                 crate::tui::confirm::ConfirmKey::Cancel => {
-                    self.status = Some("cancelled".into());
+                    self.set_status("cancelled");
                 }
             }
             return Action::None;
         }
         // Any keystroke clears a lingering status line.
-        self.status = None;
+        self.clear_status();
         match (code, mods) {
             (KeyCode::Char('?'), _) => {
                 self.help_open = true;
@@ -362,9 +396,18 @@ impl App {
                 self.should_quit = true;
                 Action::Quit
             }
-            // Esc backs out one level — to the picker when we came in
-            // through it, else quit. Driver in `tui::run` decides.
-            (KeyCode::Esc, _) => Action::Back,
+            // Esc dismisses the status line first if one is showing,
+            // otherwise backs out to the picker. Two-stage Esc means
+            // a stray dismiss never throws the user back to the
+            // home screen by accident.
+            (KeyCode::Esc, _) => {
+                if self.status.is_some() {
+                    self.clear_status();
+                    Action::None
+                } else {
+                    Action::Back
+                }
+            }
             (KeyCode::Enter, _) => Action::LaunchSelected,
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
                 self.select_next();
@@ -469,17 +512,24 @@ impl App {
 
         self.render_session_list(frame, chunks[2]);
 
-        // Status line preempts the keybind footer when set (most
-        // recent action result). Clears on next keystroke.
+        // Status line preempts the keybind footer when set. Auto-
+        // clears via STATUS_TTL or on Esc.
         if let Some(status) = &self.status {
-            frame.render_widget(
-                Paragraph::new(format!(" {status} ")).style(
+            let line = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    status.clone(),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                chunks[3],
-            );
+                Span::raw("  "),
+                Span::styled(
+                    "(Esc dismisses)",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), chunks[3]);
         } else {
             let footer_text = footer_for_width(area.width);
             let footer =

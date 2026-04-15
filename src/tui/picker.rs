@@ -29,6 +29,34 @@ pub enum PickerOutcome {
     Quit,
 }
 
+/// How long status messages stick around before auto-clearing.
+const STATUS_TTL: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Footer status line with auto-clear support.
+#[derive(Debug, Default)]
+struct StatusLine {
+    text: Option<String>,
+    set_at: Option<std::time::Instant>,
+}
+
+impl StatusLine {
+    fn set(&mut self, msg: String) {
+        self.text = Some(msg);
+        self.set_at = Some(std::time::Instant::now());
+    }
+    fn clear(&mut self) {
+        self.text = None;
+        self.set_at = None;
+    }
+    fn age_out(&mut self) {
+        if let Some(set_at) = self.set_at {
+            if set_at.elapsed() >= STATUS_TTL {
+                self.clear();
+            }
+        }
+    }
+}
+
 /// Destructive action awaiting user confirmation in the picker.
 #[derive(Debug, Clone)]
 enum PickerPending {
@@ -55,13 +83,26 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
 
     let mut help_open = false;
     let mut pending: Option<PickerPending> = None;
-    let mut status: Option<String> = None;
+    let mut status = StatusLine::default();
 
     loop {
+        // Auto-age the status line so messages don't sit forever.
+        status.age_out();
         let total = workspaces.len() + 1; // +1 for the "live sessions" row
-        terminal
-            .draw(|frame| render(frame, &workspaces, &mut state, help_open, &pending, &status))?;
+        terminal.draw(|frame| {
+            render(
+                frame,
+                &workspaces,
+                &mut state,
+                help_open,
+                &pending,
+                &status.text,
+            )
+        })?;
 
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -77,21 +118,30 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
         if let Some(action) = pending.take() {
             match crate::tui::confirm::classify(key.code) {
                 crate::tui::confirm::ConfirmKey::Confirm => {
-                    status = Some(perform_picker_action(action, &mut workspaces, &mut state));
+                    let msg = perform_picker_action(action, &mut workspaces, &mut state);
+                    status.set(msg);
                 }
                 crate::tui::confirm::ConfirmKey::Cancel => {
-                    status = Some("cancelled".into());
+                    status.set("cancelled".into());
                 }
             }
             continue;
         }
-        // Any keystroke clears lingering status.
-        status = None;
         match (key.code, key.modifiers) {
             (KeyCode::Char('?'), _) => {
                 help_open = true;
             }
-            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return Ok(PickerOutcome::Quit),
+            (KeyCode::Char('q'), _) => return Ok(PickerOutcome::Quit),
+            (KeyCode::Esc, _) => {
+                // Two-stage Esc: dismiss a status line first, then
+                // exit pa on the second press. Prevents an
+                // accidental Esc from quitting after a stray action.
+                if status.text.is_some() {
+                    status.clear();
+                } else {
+                    return Ok(PickerOutcome::Quit);
+                }
+            }
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 return Ok(PickerOutcome::Quit);
             }
@@ -113,7 +163,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                 if let Some(path) = selected_workspace(&workspaces, &state) {
                     pending = Some(PickerPending::Unregister(path));
                 } else {
-                    status = Some(
+                    status.set(
                         "d: nothing to unregister — live-sessions row isn't a workspace".into(),
                     );
                 }
@@ -122,25 +172,24 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                 if let Some(path) = selected_workspace(&workspaces, &state) {
                     pending = Some(PickerPending::DeleteFile(path));
                 } else {
-                    status =
-                        Some("D: nothing to delete — live-sessions row isn't a workspace".into());
+                    status.set("D: nothing to delete — live-sessions row isn't a workspace".into());
                 }
             }
             (KeyCode::Char('r'), _) => {
                 if let Some(path) = selected_workspace(&workspaces, &state) {
-                    status = Some(format!("path: {}", path.display()));
+                    status.set(format!("path: {}", path.display()));
                 } else {
-                    status = Some("r: live-sessions row has no file path".into());
+                    status.set("r: live-sessions row has no file path".into());
                 }
             }
             (KeyCode::Char('n'), _) => {
-                status = Some(
+                status.set(
                     "n: to scaffold a new workspace, exit pa and run 'pa onboard' or 'pa init <name>'"
                         .into(),
                 );
             }
             (KeyCode::Char('e'), _) => {
-                status = Some("e: in-TUI workspace editing is coming soon".into());
+                status.set("e: in-TUI workspace editing is coming soon".into());
             }
             (KeyCode::Enter, _) => {
                 let sel = state.selected().unwrap_or(0);
@@ -335,14 +384,21 @@ fn render(
     frame.render_stateful_widget(list, chunks[2], state);
 
     if let Some(s) = status {
-        frame.render_widget(
-            Paragraph::new(format!(" {s} ")).style(
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                s.clone(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            chunks[3],
-        );
+            Span::raw("  "),
+            Span::styled(
+                "(Esc dismisses)",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), chunks[3]);
     } else {
         let footer = Paragraph::new(" j/k · Enter · d/D/r · ?: help · q: quit ")
             .style(Style::default().add_modifier(Modifier::DIM));
