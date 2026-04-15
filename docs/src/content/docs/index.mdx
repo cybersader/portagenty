@@ -1,9 +1,9 @@
 ---
 title: portagenty
-description: Portable, terminal-native launcher for agent workspaces.
+description: Agentic coding tools in the terminal, anywhere you go.
 template: splash
 hero:
-  tagline: A workspace despite the limitations of a hierarchical filesystem. Single static Rust binary, terminal-native, no GUI ever.
+  tagline: Agentic coding tools in the terminal, anywhere you go. Spin up Claude Code, opencode, and dev servers in one persistent workspace — SSH in from any device, from your laptop to your phone on Termux, and pick up exactly where you left off.
   actions:
     - text: Get started
       link: /portagenty/getting-started/installation/
@@ -15,6 +15,20 @@ hero:
 ---
 
 import { Card, CardGrid, Code } from "@astrojs/starlight/components";
+
+## Why
+
+Agentic coding — Claude Code, opencode, Aider, and the dev servers
+and test runners they drive — lives in the terminal. But the terminal
+is stuck where you started it: one laptop, one window size, one SSH
+hop. Walk away, switch devices, or lose the connection and you're
+rebuilding context from scratch.
+
+portagenty treats your agent sessions as a **portable workspace**.
+Define them once in a committable TOML file, launch them on any
+device over tmux or zellij, and hop between laptop, desktop, and
+phone-over-SSH (Termux) with a single `pa claim`. The sessions keep
+running; only the terminal attached to them changes.
 
 ## Features
 
