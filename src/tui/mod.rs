@@ -262,11 +262,6 @@ fn bin_on_path(bin: &str) -> bool {
 /// or tmux version's defaults — users with custom configs just ignore
 /// the hint and use their own chord.
 fn print_launch_banner(mpx: crate::domain::Multiplexer, session: &str) {
-    let detach = match mpx {
-        crate::domain::Multiplexer::Tmux => "Ctrl+B then d",
-        crate::domain::Multiplexer::Zellij => "Ctrl+O then d",
-        crate::domain::Multiplexer::Wezterm => "see wezterm docs",
-    };
     let mpx_name = match mpx {
         crate::domain::Multiplexer::Tmux => "tmux",
         crate::domain::Multiplexer::Zellij => "zellij",
@@ -274,6 +269,23 @@ fn print_launch_banner(mpx: crate::domain::Multiplexer, session: &str) {
     };
     eprintln!();
     eprintln!("  pa → {mpx_name} session \"{session}\"");
-    eprintln!("        detach: {detach}  ·  re-attach: pa claim {session}");
+    match mpx {
+        crate::domain::Multiplexer::Tmux => {
+            eprintln!("        detach: Ctrl+B then d   ·   re-attach: pa claim {session}");
+        }
+        crate::domain::Multiplexer::Zellij => {
+            // Zellij's Ctrl+Q is *quit with confirmation overlay*, NOT
+            // detach. Users keep hitting it and landing on the
+            // "Do you really want to quit zellij?" modal. Spell out
+            // the right chord (Ctrl+O then d) and explicitly warn
+            // against Ctrl+Q so the muscle-memory mistake is avoided.
+            eprintln!("        detach: Ctrl+O then d   ·   re-attach: pa claim {session}");
+            eprintln!("        NOTE: Ctrl+Q opens zellij's quit-confirmation overlay,");
+            eprintln!("              NOT a detach. Use Ctrl+O then d to leave without killing.");
+        }
+        crate::domain::Multiplexer::Wezterm => {
+            eprintln!("        detach: see wezterm docs");
+        }
+    }
     eprintln!();
 }

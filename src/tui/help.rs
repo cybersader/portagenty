@@ -33,7 +33,10 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, ctx: HelpContext) {
     let w = area.width;
     let h = area.height;
     let overlay_w = w.saturating_sub(4).clamp(20, 70);
-    let overlay_h = h.saturating_sub(4).clamp(10, 22);
+    // Enough height on a desktop to show all sections (keys + markers
+    // + kind glyphs + title-bar + coming-soon) without clipping.
+    // Narrow terminals (Termux portrait) clamp to available height.
+    let overlay_h = h.saturating_sub(2).clamp(10, 40);
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;
     let region = Rect {
@@ -104,30 +107,50 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("any key", "close this help"));
         }
         HelpContext::SessionList => {
-            lines.push(heading(" Session list"));
+            lines.push(heading(" Session list — keys"));
             lines.push(Line::raw(""));
             lines.push(row("j / ↓", "next session"));
             lines.push(row("k / ↑", "previous session"));
             lines.push(row("g / Home", "first"));
             lines.push(row("G / End", "last"));
             lines.push(row("Enter", "attach (or create-and-attach)"));
-            lines.push(Line::raw(""));
-            lines.push(heading(" Navigation"));
-            lines.push(Line::raw(""));
             lines.push(row("Esc", "back to picker (home screen)"));
             lines.push(row("q / Ctrl+C", "exit pa"));
+            lines.push(row("?", "toggle this help"));
+            lines.push(Line::raw(""));
+            lines.push(heading(" Row markers"));
+            lines.push(Line::raw(""));
+            lines.push(row("●  live", "session is running in the multiplexer"));
+            lines.push(row("○  idle", "declared in the workspace, not started yet"));
+            lines.push(row(
+                "?  untracked",
+                "live mpx session without a workspace entry",
+            ));
+            lines.push(Line::raw(""));
+            lines.push(heading(" Kind glyphs"));
+            lines.push(Line::raw(""));
+            lines.push(row("C (blue)", "claude-code"));
+            lines.push(row("O (cyan)", "opencode"));
+            lines.push(row("E (magenta)", "editor"));
+            lines.push(row("D (green)", "dev-server"));
+            lines.push(row("(none)", "shell / other / no hint"));
+            lines.push(Line::raw(""));
+            lines.push(heading(" Title bar"));
+            lines.push(Line::raw(""));
+            lines.push(row("[tmux]", "cyan badge — tmux multiplexer"));
+            lines.push(row("[zellij]", "magenta badge — zellij multiplexer"));
+            lines.push(row(
+                "N untracked",
+                "yellow — live mpx sessions outside the workspace",
+            ));
             lines.push(Line::raw(""));
             lines.push(heading(" Row actions (coming soon)"));
             lines.push(Line::raw(""));
             lines.push(row("e", "edit the selected session"));
             lines.push(row("d", "delete the selected session"));
             lines.push(row("x", "disconnect / kill live session"));
+            lines.push(row("m", "change workspace multiplexer"));
             lines.push(row("Space", "context menu for the row"));
-            lines.push(Line::raw(""));
-            lines.push(heading(" This screen"));
-            lines.push(Line::raw(""));
-            lines.push(row("?", "toggle this help"));
-            lines.push(row("any key", "close this help"));
         }
     }
 

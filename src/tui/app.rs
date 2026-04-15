@@ -388,11 +388,11 @@ impl App {
 /// DESIGN.md §10 for the mobile constraints that drive this.
 fn footer_for_width(width: u16) -> &'static str {
     if width >= 60 {
-        " j/k · Enter · Esc: back · ?: help · q: quit "
+        " j/k · Enter: launch · Esc: back · ?: help · q: quit "
     } else if width >= 30 {
-        " j/k · Esc · ? help · q: quit "
+        " j/k · ? help · q: quit "
     } else {
-        " ? help · q: quit "
+        " ? · q: quit "
     }
 }
 
