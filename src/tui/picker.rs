@@ -111,6 +111,11 @@ fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState, 
         .style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(hint, chunks[1]);
 
+    // Width budget for each row so long paths don't run past the
+    // viewport. On narrow terminals we drop the path and show only
+    // the name + relative-time hint — the full path belongs in help
+    // or details, not in a row that'd truncate awkwardly.
+    let row_width = chunks[2].width as usize;
     let mut items: Vec<ListItem> = Vec::with_capacity(workspaces.len() + 1);
     for path in workspaces {
         let label = path
@@ -122,22 +127,56 @@ fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState, 
             .parent()
             .map(|p| compact_path(&p.display().to_string()))
             .unwrap_or_default();
-        // Relative-time hint so the user can tell at a glance which
-        // workspace they were in last. Empty for never-launched.
         let relative = crate::state::relative_time(crate::state::last_launch_for_workspace(path));
-        items.push(ListItem::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("●", Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            Span::styled(
-                label.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("   "),
-            Span::styled(dir, Style::default().add_modifier(Modifier::DIM)),
-            Span::raw("   "),
-            Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
-        ])));
+
+        if row_width >= 70 {
+            // Wide: name · path · time. Path middle-truncates to fit.
+            let name_budget = label.chars().count().min(22);
+            // Remaining after: gutter(6) + name + sep(3) + time(12) + pad(2)
+            let used = 6 + name_budget + 3 + 12 + 2;
+            let path_budget = row_width.saturating_sub(used).clamp(10, 50);
+            items.push(ListItem::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("●", Style::default().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::styled(
+                    label.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled(
+                    truncate_middle(&dir, path_budget),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::raw("   "),
+                Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
+            ])));
+        } else {
+            // Narrow / Termux portrait: two-line card. Line 1 name +
+            // relative time; line 2 indented dim path with middle
+            // truncation so it can't overflow.
+            let path_budget = row_width.saturating_sub(6).max(10);
+            items.push(ListItem::new(vec![
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled("●", Style::default().fg(Color::Cyan)),
+                    Span::raw("  "),
+                    Span::styled(
+                        label.to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
+                ]),
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        truncate_middle(&dir, path_budget),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ]),
+            ]));
+        }
     }
     // Sentinel row: live browse.
     items.push(ListItem::new(Line::from(vec![
@@ -174,6 +213,27 @@ fn render(frame: &mut Frame<'_>, workspaces: &[PathBuf], state: &mut ListState, 
     if help_open {
         crate::tui::help::render_overlay(frame, area, crate::tui::help::HelpContext::Picker);
     }
+}
+
+/// Middle-ellipsis truncation for paths. Keeps the start + end and
+/// drops the middle; biased toward preserving the tail because the
+/// project leaf is more recognizable than the ancestor directories.
+fn truncate_middle(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return s.chars().take(max).collect();
+    }
+    let ell = "…";
+    let keep = max - 1;
+    let tail = (keep * 2).div_ceil(3);
+    let head = keep - tail;
+    let head_str: String = s.chars().take(head).collect();
+    let tail_start = count - tail;
+    let tail_str: String = s.chars().skip(tail_start).collect();
+    format!("{head_str}{ell}{tail_str}")
 }
 
 fn compact_path(p: &str) -> String {
