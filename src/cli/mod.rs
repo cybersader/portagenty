@@ -654,8 +654,22 @@ fn resolve_workspace_path(workspace: Option<&PathBuf>) -> Result<PathBuf> {
 
 pub fn rm(name: &str, workspace: Option<&PathBuf>) -> Result<()> {
     let path = resolve_workspace_path(workspace)?;
+    remove_session_from_file(&path, name)?;
+    let out = io::stdout();
+    let mut out = out.lock();
+    writeln!(out, "removed session {name:?} from {}", path.display())?;
+    Ok(())
+}
+
+/// Pure file-mutation core of `pa rm`. No stdio — callable from the
+/// TUI's row-delete action. Preserves comments and formatting via
+/// toml_edit; errors if the session name isn't present, with a helpful
+/// list of available names. Exposed to the TUI via
+/// `pub(crate)` so cross-module callers don't reach into CLI-private
+/// internals.
+pub(crate) fn remove_session_from_file(path: &std::path::Path, name: &str) -> Result<()> {
     let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let mut doc: toml_edit::DocumentMut = raw
         .parse()
@@ -696,12 +710,7 @@ pub fn rm(name: &str, workspace: Option<&PathBuf>) -> Result<()> {
 
     array.remove(idx);
 
-    std::fs::write(&path, doc.to_string())
-        .with_context(|| format!("writing {}", path.display()))?;
-
-    let out = io::stdout();
-    let mut out = out.lock();
-    writeln!(out, "removed session {name:?} from {}", path.display())?;
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

@@ -2,6 +2,7 @@
 //! responsive layout for Termux/small-screen use. See `DESIGN.md` §10.
 
 pub mod app;
+pub mod confirm;
 pub mod help;
 pub mod picker;
 pub mod view;

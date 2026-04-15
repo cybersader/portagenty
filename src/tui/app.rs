@@ -64,6 +64,21 @@ pub struct App {
     /// handling is short-circuited: any key press closes the overlay
     /// and returns `Action::None` (no accidental nav / launch).
     help_open: bool,
+    /// When Some, a confirm modal is showing for the given action.
+    /// Key handling diverts to the confirm classifier; on y/Y we
+    /// perform the action, on anything else we clear and continue.
+    pending: Option<PendingAction>,
+    /// Human-readable status blurb shown in the footer region. Set
+    /// after row actions (e.g. "deleted 'claude'"). Cleared on next
+    /// key press so it doesn't linger indefinitely.
+    status: Option<String>,
+}
+
+/// Queued destructive action awaiting user confirmation.
+#[derive(Debug, Clone)]
+enum PendingAction {
+    /// Remove the named session from the workspace file on disk.
+    DeleteSession { name: String },
 }
 
 impl App {
@@ -84,6 +99,8 @@ impl App {
             list_state,
             should_quit: false,
             help_open: false,
+            pending: None,
+            status: None,
         }
     }
 
@@ -184,6 +201,66 @@ impl App {
         self.selected().and_then(|i| self.rows.get(i))
     }
 
+    /// Queue a delete-session confirm modal for the currently-selected
+    /// row. Only valid on tracked rows (ones with a workspace
+    /// session). Untracked rows (live mpx sessions outside the
+    /// workspace) are ignored — delete means "remove from workspace
+    /// TOML", and they're not in the TOML to begin with.
+    fn open_delete_prompt(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.session.is_none() {
+            self.status =
+                Some("d: nothing to delete — untracked rows aren't in the workspace".into());
+            return;
+        }
+        if self.workspace.file_path.is_none() {
+            self.status =
+                Some("d: can't delete — this is the synthetic live-browse workspace".into());
+            return;
+        }
+        self.pending = Some(PendingAction::DeleteSession {
+            name: row.display_name.clone(),
+        });
+    }
+
+    /// Execute a previously-queued action. Called only after the user
+    /// confirmed via y/Y in the modal. Any error ends up in `status`
+    /// so the user sees it without the modal re-opening.
+    fn perform_pending(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::DeleteSession { name } => {
+                let Some(path) = self.workspace.file_path.clone() else {
+                    self.status = Some("delete failed: no workspace file on disk".into());
+                    return;
+                };
+                match crate::cli::remove_session_from_file(&path, &name) {
+                    Ok(()) => {
+                        // Drop from in-memory workspace + rebuild the
+                        // row list so the TUI reflects the change
+                        // immediately. The mpx session (if any)
+                        // reappears as an Untracked row after rebuild.
+                        self.workspace.sessions.retain(|s| s.name != name);
+                        let live = self.mux.list_sessions().unwrap_or_default();
+                        self.rows = crate::tui::view::build_rows(&self.workspace, &live);
+                        // Keep selection in-bounds.
+                        if self.rows.is_empty() {
+                            self.list_state.select(None);
+                        } else {
+                            let sel = self.list_state.selected().unwrap_or(0);
+                            self.list_state.select(Some(sel.min(self.rows.len() - 1)));
+                        }
+                        self.status = Some(format!("deleted session {name:?}"));
+                    }
+                    Err(e) => {
+                        self.status = Some(format!("delete failed: {e:#}"));
+                    }
+                }
+            }
+        }
+    }
+
     /// Apply a single key press, returning whatever [`Action`] it
     /// produced. Split from `handle_event` so tests drive input
     /// synchronously without faking a crossterm event stream.
@@ -195,9 +272,28 @@ impl App {
             self.help_open = false;
             return Action::None;
         }
+        // Confirm modal: divert key handling until dismissed. y/Y
+        // performs the pending action, anything else cancels.
+        if let Some(action) = self.pending.take() {
+            match crate::tui::confirm::classify(code) {
+                crate::tui::confirm::ConfirmKey::Confirm => {
+                    self.perform_pending(action);
+                }
+                crate::tui::confirm::ConfirmKey::Cancel => {
+                    self.status = Some("cancelled".into());
+                }
+            }
+            return Action::None;
+        }
+        // Any keystroke clears a lingering status line.
+        self.status = None;
         match (code, mods) {
             (KeyCode::Char('?'), _) => {
                 self.help_open = true;
+                Action::None
+            }
+            (KeyCode::Char('d'), _) => {
+                self.open_delete_prompt();
                 Action::None
             }
             (KeyCode::Char('q'), _) => {
@@ -315,10 +411,30 @@ impl App {
 
         self.render_session_list(frame, chunks[2]);
 
-        let footer_text = footer_for_width(area.width);
-        let footer =
-            Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
-        frame.render_widget(footer, chunks[3]);
+        // Status line preempts the keybind footer when set (most
+        // recent action result). Clears on next keystroke.
+        if let Some(status) = &self.status {
+            frame.render_widget(
+                Paragraph::new(format!(" {status} ")).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                chunks[3],
+            );
+        } else {
+            let footer_text = footer_for_width(area.width);
+            let footer =
+                Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
+            frame.render_widget(footer, chunks[3]);
+        }
+
+        // Confirm modal above content, below help (help wins if both
+        // somehow open; in practice they're mutually exclusive).
+        if let Some(pending) = &self.pending {
+            let (title, body) = confirm_copy(pending, &self.workspace.name);
+            crate::tui::confirm::render(frame, area, &title, &body);
+        }
 
         // Help overlay renders last so it sits on top of everything.
         if self.help_open {
@@ -546,6 +662,22 @@ fn row_list_item(
         ));
     }
     ListItem::new(Line::from(spans))
+}
+
+/// Title + body strings for a pending confirm modal. Kept next to
+/// the PendingAction enum so both evolve together when new actions
+/// are added.
+fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, String) {
+    match pending {
+        PendingAction::DeleteSession { name } => (
+            "Delete session".into(),
+            format!(
+                "Remove session {name:?} from workspace {workspace_name:?}? \
+                 This edits the workspace TOML; any running mpx session with this \
+                 name stays alive (it'll reappear as an Untracked row)."
+            ),
+        ),
+    }
 }
 
 /// Human-readable column header above the session list. Matches the
