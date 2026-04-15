@@ -46,4 +46,4 @@ Filesystems force every project into one parent directory. portagenty layers *al
 - When discussing design, propose 2–3 options with tradeoffs rather than a single answer. The user wants to make decisions, not rubber-stamp them.
 - Prefer updating `README.md`, `DESIGN.md`, or `ROADMAP.md` over creating parallel design docs. Those three files are the whole design surface.
 - If a user decision conflicts with anything in those docs, update the docs in the same turn. Stale docs here are a worse failure mode than verbose docs.
-- Memory notes at `~/.claude/projects/-mnt-c-Users-Cybersader-Documents-1-Projects--Workspaces-portagenty/memory/` hold cross-session context (sibling repos, locked decisions). Don't put design decisions there — those go in `DESIGN.md`.
+- Memory notes under the Claude Code per-project memory directory (`~/.claude/projects/<slug>/memory/`) hold cross-session context (sibling repos, locked decisions). Don't put design decisions there — those go in `DESIGN.md`.
