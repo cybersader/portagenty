@@ -125,20 +125,86 @@ fn scaffold_flow<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<
         name.to_string()
     };
 
+    // What's the current machine default mpx, if any? Drives prompt
+    // wording + default.
+    let current_default = crate::config::current_default_multiplexer().ok().flatten();
+    let (default_label, default_idx) = match current_default {
+        Some(crate::domain::Multiplexer::Zellij) => ("zellij", "2"),
+        _ => ("tmux", "1"),
+    };
+
     writeln!(output)?;
-    writeln!(output, "  Multiplexer:")?;
+    writeln!(output, "  Multiplexer for this workspace:")?;
     writeln!(
         output,
         "    [1] tmux (recommended — best cross-device story)"
     )?;
     writeln!(output, "    [2] zellij")?;
-    write!(output, "  Choice [1]: ")?;
+    write!(output, "  Choice [{default_idx} = {default_label}]: ")?;
     output.flush()?;
     let mpx_choice = read_line(input)?;
-    let mpx = match mpx_choice.trim() {
-        "2" => "zellij",
-        _ => "tmux",
+    let (mpx_wire, mpx_enum) = match mpx_choice.trim() {
+        "1" => ("tmux", crate::domain::Multiplexer::Tmux),
+        "2" => ("zellij", crate::domain::Multiplexer::Zellij),
+        "" => match default_idx {
+            "2" => ("zellij", crate::domain::Multiplexer::Zellij),
+            _ => ("tmux", crate::domain::Multiplexer::Tmux),
+        },
+        _ => ("tmux", crate::domain::Multiplexer::Tmux),
     };
+
+    // Offer to set (or update) the machine default. Prompt wording
+    // adapts so the first-time user sees "Set X as default" and the
+    // returning user sees "Change default from Y to X".
+    writeln!(output)?;
+    match current_default {
+        None => {
+            write!(
+                output,
+                "  Set {mpx_wire} as this machine's default multiplexer? [Y/n]: "
+            )?;
+        }
+        Some(cur) if cur == mpx_enum => {
+            // Already the default — no-op, but show a note so the
+            // user knows the question was considered.
+            writeln!(
+                output,
+                "  (machine default is already {mpx_wire} — keeping it)"
+            )?;
+        }
+        Some(cur) => {
+            let cur_wire = match cur {
+                crate::domain::Multiplexer::Tmux => "tmux",
+                crate::domain::Multiplexer::Zellij => "zellij",
+                crate::domain::Multiplexer::Wezterm => "wezterm",
+            };
+            write!(
+                output,
+                "  Change machine default from {cur_wire} to {mpx_wire}? [y/N]: "
+            )?;
+        }
+    }
+    let make_default = match current_default {
+        Some(cur) if cur == mpx_enum => false,
+        None => {
+            output.flush()?;
+            let ans = read_line(input)?;
+            !matches!(ans.trim().to_ascii_lowercase().as_str(), "n" | "no")
+        }
+        Some(_) => {
+            output.flush()?;
+            let ans = read_line(input)?;
+            matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        }
+    };
+    if make_default {
+        if let Err(e) = crate::config::set_global_default_multiplexer(mpx_enum) {
+            writeln!(output)?;
+            writeln!(output, "  warning: couldn't write global default: {e}")?;
+        } else {
+            writeln!(output, "  ✓ Machine default set to {mpx_wire}.")?;
+        }
+    }
 
     writeln!(output)?;
     write!(output, "  Pre-populate a Claude Code session? [Y/n]: ")?;
@@ -168,13 +234,14 @@ fn scaffold_flow<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<
             path.display()
         )?;
         writeln!(output, "  Run `pa init --force` if you want to overwrite.")?;
+        writeln!(output, "  Run `pa onboard` anytime to re-run this wizard.")?;
         mark_onboarded()?;
         return Ok(OnboardOutcome::Skipped);
     }
 
     let mut body = String::new();
     body.push_str(&format!(
-        "# Workspace file for portagenty. See:\n# https://cybersader.github.io/portagenty/reference/schema/\nname = \"{name}\"\nmultiplexer = \"{mpx}\"\n\n"
+        "# Workspace file for portagenty. See:\n# https://cybersader.github.io/portagenty/reference/schema/\nname = \"{name}\"\nmultiplexer = \"{mpx_wire}\"\n\n"
     ));
     body.push_str(
         "[[session]]\nname = \"shell\"\ncwd = \".\"\ncommand = \"bash\"\nkind = \"shell\"\n",
@@ -190,6 +257,7 @@ fn scaffold_flow<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<
     writeln!(output)?;
     writeln!(output, "  ✓ Created {}", path.display())?;
     writeln!(output, "  Run `pa` here to open the TUI.")?;
+    writeln!(output, "  Run `pa onboard` anytime to re-run this wizard.")?;
 
     mark_onboarded()?;
     Ok(OnboardOutcome::Scaffolded { path })

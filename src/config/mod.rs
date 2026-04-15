@@ -17,6 +17,47 @@ pub use files::{
 };
 pub use merge::{expand, resolve_path};
 
+/// Read the current global default multiplexer, if any. Returns
+/// `None` when the global config file doesn't exist yet OR when it
+/// exists but doesn't pin a default.
+pub fn current_default_multiplexer() -> Result<Option<crate::domain::Multiplexer>> {
+    let path = match global_config_path() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let global: GlobalFile = load_toml(&path)?;
+    Ok(global.default_multiplexer)
+}
+
+/// Write (or update) the global default multiplexer in
+/// `$XDG_CONFIG_HOME/portagenty/config.toml`. Uses toml_edit so any
+/// other fields the user has set (project registrations, known
+/// workspaces) are preserved verbatim. Creates the file + parent
+/// dirs if they don't exist yet.
+pub fn set_global_default_multiplexer(mpx: crate::domain::Multiplexer) -> Result<()> {
+    let path = global_config_path()?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .with_context(|| format!("parsing existing global config {}", path.display()))?;
+    let wire = match mpx {
+        crate::domain::Multiplexer::Tmux => "tmux",
+        crate::domain::Multiplexer::Zellij => "zellij",
+        crate::domain::Multiplexer::Wezterm => "wezterm",
+    };
+    doc["default-multiplexer"] = toml_edit::value(wire);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
