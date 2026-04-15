@@ -13,15 +13,25 @@ use ratatui::{
 };
 
 use crate::domain::{Session, Workspace};
-use crate::mux::Multiplexer;
+use crate::mux::{Multiplexer, SessionInfo};
+use crate::tui::view::{build_rows, SessionRow, SessionState};
+
+/// How the user wants a selected row to be realized on the mpx side.
+/// Determined by the row's [`SessionState`].
+#[derive(Debug, Clone)]
+pub enum LaunchKind {
+    /// Workspace-defined, not currently live: `create_and_attach`.
+    Create { session: Session },
+    /// Already live (workspace or untracked): `attach` by sanitized name.
+    Attach { mpx_name: String },
+}
 
 /// The reason [`App::run`] returned. The outer entry point uses this
-/// to decide whether to exit silently or hand off to the multiplexer
-/// to actually launch a session.
+/// to decide whether to exit silently or hand off to the multiplexer.
 #[derive(Debug, Clone)]
 pub enum AppOutcome {
     Quit,
-    Launch(Session),
+    Launch(LaunchKind),
 }
 
 /// Internal action dispatch. Returned from [`App::handle_key`] so the
@@ -40,32 +50,44 @@ pub enum Action {
 pub struct App {
     workspace: Workspace,
     mux: Box<dyn Multiplexer>,
+    rows: Vec<SessionRow>,
     list_state: ListState,
     should_quit: bool,
 }
 
 impl App {
-    pub fn new(workspace: Workspace, mux: Box<dyn Multiplexer>) -> Self {
+    /// Construct with the workspace + mpx, plus the pre-fetched live
+    /// session list. Passing `live` in explicitly keeps `new` pure
+    /// (no I/O at construction time) and lets tests drive any
+    /// rendering state they want without mockall expectations.
+    pub fn new(workspace: Workspace, mux: Box<dyn Multiplexer>, live: Vec<SessionInfo>) -> Self {
+        let rows = build_rows(&workspace, &live);
         let mut list_state = ListState::default();
-        if !workspace.sessions.is_empty() {
+        if !rows.is_empty() {
             list_state.select(Some(0));
         }
         Self {
             workspace,
             mux,
+            rows,
             list_state,
             should_quit: false,
         }
     }
 
-    /// Currently-selected session index, if any. `None` when the
-    /// workspace has no sessions.
+    /// Currently-selected row index, if any.
     pub fn selected(&self) -> Option<usize> {
         self.list_state.selected()
     }
 
+    /// Read-only view of the rows. Useful for tests + future TUI
+    /// features that need to reason about the full view-model.
+    pub fn rows(&self) -> &[SessionRow] {
+        &self.rows
+    }
+
     fn select_next(&mut self) {
-        let n = self.workspace.sessions.len();
+        let n = self.rows.len();
         if n == 0 {
             return;
         }
@@ -74,7 +96,7 @@ impl App {
     }
 
     fn select_prev(&mut self) {
-        let n = self.workspace.sessions.len();
+        let n = self.rows.len();
         if n == 0 {
             return;
         }
@@ -84,13 +106,13 @@ impl App {
     }
 
     fn select_first(&mut self) {
-        if !self.workspace.sessions.is_empty() {
+        if !self.rows.is_empty() {
             self.list_state.select(Some(0));
         }
     }
 
     fn select_last(&mut self) {
-        let n = self.workspace.sessions.len();
+        let n = self.rows.len();
         if n > 0 {
             self.list_state.select(Some(n - 1));
         }
@@ -127,10 +149,26 @@ impl App {
         match action {
             Action::None => None,
             Action::Quit => Some(AppOutcome::Quit),
-            Action::LaunchSelected => self
-                .selected()
-                .map(|i| AppOutcome::Launch(self.workspace.sessions[i].clone())),
+            Action::LaunchSelected => self.selected().and_then(|i| {
+                let row = self.rows.get(i)?;
+                let kind = match row.state {
+                    SessionState::NotStarted => row
+                        .session
+                        .as_ref()
+                        .map(|s| LaunchKind::Create { session: s.clone() })?,
+                    SessionState::Live | SessionState::Untracked => LaunchKind::Attach {
+                        mpx_name: row.mpx_name.clone(),
+                    },
+                };
+                Some(AppOutcome::Launch(kind))
+            }),
         }
+    }
+
+    /// The currently-selected row, if any. Exposed so the outer entry
+    /// point can ask "what did the user pick?" after `run` returns.
+    pub fn selected_row(&self) -> Option<&SessionRow> {
+        self.selected().and_then(|i| self.rows.get(i))
     }
 
     /// Apply a single key press, returning whatever [`Action`] it
@@ -181,16 +219,28 @@ impl App {
             ])
             .split(area);
 
-        let title = format!(
-            " {}  ·  {} session{} ",
-            self.workspace.name,
-            self.workspace.sessions.len(),
-            if self.workspace.sessions.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
-        );
+        let tracked = self.workspace.sessions.len();
+        let untracked = self
+            .rows
+            .iter()
+            .filter(|r| r.state == SessionState::Untracked)
+            .count();
+        let title = if untracked > 0 {
+            format!(
+                " {}  ·  {} session{}  · {} untracked ",
+                self.workspace.name,
+                tracked,
+                if tracked == 1 { "" } else { "s" },
+                untracked,
+            )
+        } else {
+            format!(
+                " {}  ·  {} session{} ",
+                self.workspace.name,
+                tracked,
+                if tracked == 1 { "" } else { "s" },
+            )
+        };
         let header = Paragraph::new(title).style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_widget(header, chunks[0]);
 
@@ -203,27 +253,25 @@ impl App {
     }
 
     fn render_session_list(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        if self.workspace.sessions.is_empty() {
-            let empty = Paragraph::new(" No sessions defined in this workspace. ")
+        if self.rows.is_empty() {
+            let empty = Paragraph::new(" No sessions defined or running. ")
                 .style(Style::default().add_modifier(Modifier::DIM));
             frame.render_widget(empty, area);
             return;
         }
 
         let name_col = self
-            .workspace
-            .sessions
+            .rows
             .iter()
-            .map(|s| s.name.chars().count())
+            .map(|r| r.display_name.chars().count())
             .max()
             .unwrap_or(0)
             .min(24);
 
         let items: Vec<ListItem> = self
-            .workspace
-            .sessions
+            .rows
             .iter()
-            .map(|s| session_row(s, name_col))
+            .map(|r| row_list_item(r, name_col))
             .collect();
 
         let list = List::new(items)
@@ -251,25 +299,46 @@ fn footer_for_width(width: u16) -> &'static str {
     }
 }
 
-fn session_row<'a>(session: &'a Session, name_col: usize) -> ListItem<'a> {
-    let padded_name = if session.name.chars().count() >= name_col {
-        session.name.clone()
+fn row_list_item(row: &SessionRow, name_col: usize) -> ListItem<'static> {
+    let padded_name = if row.display_name.chars().count() >= name_col {
+        row.display_name.clone()
     } else {
         format!(
             "{:<width$}",
-            session.name,
+            row.display_name,
             width = name_col.saturating_add(1)
         )
     };
 
+    // Style the marker per state so color/modifier distinguishes
+    // Live (green), NotStarted (dim), and Untracked (yellow) at a
+    // glance. Plain ANSI only — avoids wide-glyph surprises on
+    // Termux (DESIGN §10).
+    let marker_style = match row.state {
+        SessionState::Live => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        SessionState::NotStarted => Style::default().add_modifier(Modifier::DIM),
+        SessionState::Untracked => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    };
+
     ListItem::new(Line::from(vec![
-        Span::raw("  "),
+        Span::raw(" "),
+        Span::styled(row.state.marker().to_string(), marker_style),
+        Span::raw(" "),
         Span::styled(padded_name, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::raw(session.cwd.display().to_string()),
+        Span::raw(row.cwd_display.clone()),
         Span::raw("  "),
         Span::styled(
-            &session.command,
+            row.command_display.clone(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("[{}]", row.state.label()),
             Style::default().add_modifier(Modifier::DIM),
         ),
     ]))
@@ -310,7 +379,7 @@ mod tests {
     #[test]
     fn renders_header_with_workspace_name_and_session_count() {
         let ws = sample_workspace("Agentic", 3);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 60, 10);
 
         let buffer = terminal.backend().buffer();
@@ -330,7 +399,7 @@ mod tests {
     #[test]
     fn renders_singular_when_one_session() {
         let ws = sample_workspace("Solo", 1);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 60, 10);
 
         let buffer = terminal.backend().buffer();
@@ -344,7 +413,7 @@ mod tests {
     #[test]
     fn renders_footer_with_quit_hint() {
         let ws = sample_workspace("X", 0);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 60, 5);
 
         let buffer = terminal.backend().buffer();
@@ -358,7 +427,7 @@ mod tests {
     fn handles_narrow_terminal_without_panic() {
         // Termux / small-screen constraint: single-column, tight rows.
         let ws = sample_workspace("narrow", 5);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let _ = render_to_backend(&mut app, 20, 10);
     }
 
@@ -366,7 +435,7 @@ mod tests {
     fn handles_very_short_terminal() {
         // Minimum: header + one row for body + footer = 3 rows.
         let ws = sample_workspace("tiny", 0);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let _ = render_to_backend(&mut app, 80, 3);
     }
 
@@ -381,7 +450,7 @@ mod tests {
     #[test]
     fn renders_each_session_name_in_body() {
         let ws = sample_workspace("multi", 3);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 100, 10);
 
         // Body lives on rows 1..h-1 (row 0 = header, row h-1 = footer).
@@ -408,7 +477,7 @@ mod tests {
                 command: "claude --resume".into(),
             }],
         };
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 100, 5);
 
         let body = line_at(&terminal, 1);
@@ -420,7 +489,7 @@ mod tests {
     #[test]
     fn empty_workspace_shows_placeholder() {
         let ws = sample_workspace("empty", 0);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, 60, 5);
 
         let body = line_at(&terminal, 1);
@@ -435,28 +504,28 @@ mod tests {
         // 80 sessions into a 20-row terminal — ratatui's List handles
         // overflow by truncating; we just confirm we don't panic.
         let ws = sample_workspace("big", 80);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let _ = render_to_backend(&mut app, 80, 20);
     }
 
     #[test]
     fn selection_starts_at_zero_for_non_empty() {
         let ws = sample_workspace("x", 3);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         assert_eq!(app.selected(), Some(0));
     }
 
     #[test]
     fn selection_is_none_for_empty_workspace() {
         let ws = sample_workspace("x", 0);
-        let app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         assert_eq!(app.selected(), None);
     }
 
     #[test]
     fn j_key_advances_selection_wrapping() {
         let ws = sample_workspace("x", 3);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(app.selected(), Some(1));
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
@@ -468,7 +537,7 @@ mod tests {
     #[test]
     fn k_key_retreats_selection_wrapping() {
         let ws = sample_workspace("x", 3);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
         assert_eq!(app.selected(), Some(2), "should wrap to last");
         app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
@@ -478,7 +547,7 @@ mod tests {
     #[test]
     fn arrow_keys_are_equivalent_to_jk() {
         let ws = sample_workspace("x", 4);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(app.selected(), Some(2));
@@ -489,7 +558,7 @@ mod tests {
     #[test]
     fn g_goes_to_top_capital_g_to_bottom() {
         let ws = sample_workspace("x", 5);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
         assert_eq!(app.selected(), Some(4));
         app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
@@ -499,7 +568,7 @@ mod tests {
     #[test]
     fn navigation_is_noop_on_empty_workspace() {
         let ws = sample_workspace("x", 0);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
         assert_eq!(app.selected(), None);
@@ -508,7 +577,7 @@ mod tests {
     #[test]
     fn enter_returns_launch_action_with_selected_index() {
         let ws = sample_workspace("x", 3);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         let action = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(action, Action::LaunchSelected);
@@ -520,7 +589,7 @@ mod tests {
         // handle_key returns LaunchSelected, but reduce_action turns it
         // into None because selected() is None.
         let ws = sample_workspace("x", 0);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let action = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(action, Action::LaunchSelected);
         assert_eq!(app.selected(), None);
@@ -534,7 +603,7 @@ mod tests {
             (KeyCode::Char('c'), KeyModifiers::CONTROL),
         ] {
             let ws = sample_workspace("x", 2);
-            let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+            let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
             let action = app.handle_key(key.0, key.1);
             assert_eq!(action, Action::Quit, "key {key:?} should return Quit");
         }
@@ -543,7 +612,7 @@ mod tests {
     #[test]
     fn highlight_symbol_appears_next_to_selected_row() {
         let ws = sample_workspace("x", 3);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE); // select index 1
         let terminal = render_to_backend(&mut app, 80, 10);
         // Row 0 is the header; row 1 is the first session (index 0);
@@ -577,7 +646,7 @@ mod tests {
     #[case::phone_landscape(80, 18)]
     fn renders_cleanly_at_termux_sizes(#[case] w: u16, #[case] h: u16) {
         let ws = sample_workspace("mobile", 4);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let terminal = render_to_backend(&mut app, w, h);
 
         // Header on row 0 always has the workspace name.
@@ -612,7 +681,7 @@ mod tests {
         // match arms use `_` for modifiers so either works; this test
         // pins that behavior.
         let ws = sample_workspace("x", 4);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
 
         app.handle_key(KeyCode::Char('G'), KeyModifiers::NONE);
         assert_eq!(app.selected(), Some(3), "G without SHIFT should go to last");
@@ -626,7 +695,7 @@ mod tests {
         // Termux's default mapping of Volume-Down-as-Ctrl arrives as
         // KeyModifiers::CONTROL on a letter key. Ctrl-C must still quit.
         let ws = sample_workspace("x", 2);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let action = app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(action, Action::Quit);
     }
@@ -636,7 +705,7 @@ mod tests {
         // Termux's Extra Keys row provides arrow keys explicitly;
         // some users prefer them to j/k.
         let ws = sample_workspace("x", 4);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Up, KeyModifiers::NONE);
@@ -648,10 +717,177 @@ mod tests {
         // Same reason — Home/End are easier to reach than g/G on some
         // on-screen keyboards.
         let ws = sample_workspace("x", 4);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()));
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::End, KeyModifiers::NONE);
         assert_eq!(app.selected(), Some(3));
         app.handle_key(KeyCode::Home, KeyModifiers::NONE);
         assert_eq!(app.selected(), Some(0));
+    }
+
+    // ----------------------------------------------------------------
+    // Untracked-session adoption (DESIGN §9). Tests that the TUI
+    // surfaces live mpx sessions that weren't part of the loaded
+    // workspace, and that Enter maps to the right Multiplexer call
+    // based on row state.
+    // ----------------------------------------------------------------
+
+    fn live_session(name: &str) -> SessionInfo {
+        SessionInfo {
+            name: name.into(),
+            cwd: None,
+            attached: None,
+        }
+    }
+
+    fn drive_enter(app: &mut App) -> Option<AppOutcome> {
+        let a = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.reduce_action(a)
+    }
+
+    #[test]
+    fn untracked_session_appears_in_rows() {
+        let ws = sample_workspace("x", 2);
+        let app = App::new(
+            ws,
+            Box::new(MockMultiplexer::new()),
+            vec![live_session("stranger")],
+        );
+        let rows = app.rows();
+        assert_eq!(rows.len(), 3, "2 tracked + 1 untracked expected");
+        assert_eq!(rows[2].display_name, "stranger");
+        assert_eq!(rows[2].state, SessionState::Untracked);
+    }
+
+    #[test]
+    fn tracked_row_flips_to_live_when_mpx_reports_same_name() {
+        // sample_workspace names sessions "s0", "s1", etc. — no
+        // sanitization change.
+        let ws = sample_workspace("x", 3);
+        let app = App::new(
+            ws,
+            Box::new(MockMultiplexer::new()),
+            vec![live_session("s1")],
+        );
+        let rows = app.rows();
+        assert_eq!(rows[0].state, SessionState::NotStarted);
+        assert_eq!(rows[1].state, SessionState::Live);
+        assert_eq!(rows[2].state, SessionState::NotStarted);
+    }
+
+    #[test]
+    fn enter_on_not_started_creates_and_attaches() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let outcome = drive_enter(&mut app).expect("enter should produce outcome");
+        match outcome {
+            AppOutcome::Launch(LaunchKind::Create { session }) => {
+                assert_eq!(session.name, "s0");
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_live_attaches_by_mpx_name() {
+        let ws = sample_workspace("x", 1);
+        let mut app = App::new(
+            ws,
+            Box::new(MockMultiplexer::new()),
+            vec![live_session("s0")],
+        );
+        // Row 0 is now Live.
+        let outcome = drive_enter(&mut app).expect("enter should produce outcome");
+        match outcome {
+            AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
+                assert_eq!(mpx_name, "s0");
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_untracked_attaches_by_mpx_name() {
+        // Empty workspace, only untracked sessions in mpx.
+        let ws = sample_workspace("x", 0);
+        let mut app = App::new(
+            ws,
+            Box::new(MockMultiplexer::new()),
+            vec![live_session("orphan-session")],
+        );
+        let outcome = drive_enter(&mut app).expect("enter should produce outcome");
+        match outcome {
+            AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
+                assert_eq!(mpx_name, "orphan-session");
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_empty_everything_produces_no_outcome() {
+        let ws = sample_workspace("x", 0);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let outcome = drive_enter(&mut app);
+        assert!(
+            outcome.is_none(),
+            "no rows at all -> no outcome; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn rendered_row_shows_state_marker_for_each_state() {
+        let ws = sample_workspace("x", 2);
+        // s0 live, s1 not-started, plus "extra" untracked.
+        let mut app = App::new(
+            ws,
+            Box::new(MockMultiplexer::new()),
+            vec![live_session("s0"), live_session("extra")],
+        );
+        let terminal = render_to_backend(&mut app, 100, 10);
+        // Body spans rows 1..h-1. Three rows expected in order:
+        // row 1 = s0 (live ●), row 2 = s1 (not-started ○),
+        // row 3 = extra (untracked ?).
+        let row1 = line_at(&terminal, 1);
+        let row2 = line_at(&terminal, 2);
+        let row3 = line_at(&terminal, 3);
+        assert!(row1.contains("●"), "row1 should have live marker: {row1:?}");
+        assert!(
+            row2.contains("○"),
+            "row2 should have not-started marker: {row2:?}"
+        );
+        assert!(
+            row3.contains("?"),
+            "row3 should have untracked marker: {row3:?}"
+        );
+        // Labels also appear.
+        let body = format!("{row1}\n{row2}\n{row3}");
+        assert!(body.contains("[live]"));
+        assert!(body.contains("[idle]"));
+        assert!(body.contains("[untracked]"));
+    }
+
+    #[test]
+    fn header_shows_untracked_count_when_present() {
+        let ws = sample_workspace("x", 1);
+        let mut app = App::new(
+            ws,
+            Box::new(MockMultiplexer::new()),
+            vec![live_session("other"), live_session("another")],
+        );
+        let terminal = render_to_backend(&mut app, 80, 5);
+        let header = line_at(&terminal, 0);
+        assert!(header.contains("2 untracked"), "header missing: {header:?}");
+    }
+
+    #[test]
+    fn header_omits_untracked_segment_when_zero() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let terminal = render_to_backend(&mut app, 80, 5);
+        let header = line_at(&terminal, 0);
+        assert!(
+            !header.contains("untracked"),
+            "header shouldn't mention untracked when none: {header:?}"
+        );
     }
 }
