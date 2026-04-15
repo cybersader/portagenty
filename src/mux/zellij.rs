@@ -67,6 +67,13 @@ impl ZellijAdapter {
     /// Blank session — no layout, no command. Useful for exercising
     /// `list_sessions`, `has_session`, and `kill` without spinning
     /// up the full launch path.
+    ///
+    /// zellij's session registration is briefly async after the CLI
+    /// returns — the child process can exit successfully before
+    /// `list-sessions` reports the new name. This method polls
+    /// `has_session` up to one second so the return is
+    /// synchronous-to-visibility, which keeps tests deterministic on
+    /// slow CI runners without every test having to retry.
     pub fn create_background(&self, name: &str) -> Result<()> {
         let status = self
             .cmd()
@@ -80,7 +87,16 @@ impl ZellijAdapter {
         if !status.success() {
             bail!("zellij attach --create-background failed for session {name:?}");
         }
-        Ok(())
+
+        // Wait for the session to appear in list-sessions. 20 × 50ms
+        // = 1s max; most runs return on the first check.
+        for _ in 0..20 {
+            if self.has_session(name)? {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        bail!("zellij session {name:?} was created but did not appear in list within 1s")
     }
 
     /// Kill + delete the named session. Each step is best-effort so a
