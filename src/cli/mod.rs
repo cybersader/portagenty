@@ -75,6 +75,38 @@ pub enum Command {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<PathBuf>,
     },
+    /// Render the resolved workspace as a starter script (tmux) or
+    /// layout (zellij). Useful for committing a per-machine launcher
+    /// alongside the workspace TOML.
+    Export {
+        /// Explicit path to a `*.portagenty.toml` file.
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+
+        /// Output format. Defaults to whichever the workspace's
+        /// `multiplexer` field resolves to.
+        #[arg(long = "format", value_enum)]
+        format: Option<ExportFormatArg>,
+
+        /// Where to write the output. Default is stdout.
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ExportFormatArg {
+    Tmux,
+    Zellij,
+}
+
+impl From<ExportFormatArg> for crate::export::ExportFormat {
+    fn from(a: ExportFormatArg) -> Self {
+        match a {
+            ExportFormatArg::Tmux => crate::export::ExportFormat::Tmux,
+            ExportFormatArg::Zellij => crate::export::ExportFormat::Zellij,
+        }
+    }
 }
 
 /// Resolve the session the user named in the current (or explicit)
@@ -197,6 +229,33 @@ fn attach_mode_label(mode: AttachMode) -> &'static str {
         AttachMode::Takeover => "takeover: other clients will be detached",
         AttachMode::Shared => "shared: other clients stay attached",
     }
+}
+
+pub fn export(
+    workspace: Option<&PathBuf>,
+    format: Option<ExportFormatArg>,
+    output: Option<&PathBuf>,
+) -> Result<()> {
+    let ws = load(&LoadOptions {
+        workspace_path: workspace.cloned(),
+        ..Default::default()
+    })?;
+
+    let format: crate::export::ExportFormat = format
+        .map(Into::into)
+        .unwrap_or_else(|| crate::export::ExportFormat::default_for(&ws));
+
+    let rendered = crate::export::render(&ws, format);
+
+    if let Some(path) = output {
+        std::fs::write(path, &rendered)
+            .with_context(|| format!("writing export to {}", path.display()))?;
+    } else {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        stdout.write_all(rendered.as_bytes())?;
+    }
+    Ok(())
 }
 
 pub fn list(workspace: Option<&PathBuf>) -> Result<()> {

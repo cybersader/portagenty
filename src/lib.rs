@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod config;
 pub mod domain;
+pub mod export;
 pub mod mux;
 pub mod state;
 pub mod tui;
@@ -30,5 +31,10 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             dry_run,
         }) => cli::claim(session.as_deref(), workspace.as_ref(), dry_run),
         Some(Command::List { workspace }) => cli::list(workspace.as_ref()),
+        Some(Command::Export {
+            workspace,
+            format,
+            output,
+        }) => cli::export(workspace.as_ref(), format, output.as_ref()),
     }
 }

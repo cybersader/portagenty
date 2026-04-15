@@ -130,6 +130,63 @@ fn claim_without_name_defaults_to_first_session() {
 }
 
 #[test]
+fn export_to_stdout_uses_workspace_default_format() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["export"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("#!/usr/bin/env bash"))
+        .stdout(contains("tmux new-session"))
+        .stdout(contains("'claude'"))
+        .stdout(contains("'tests'"));
+}
+
+#[test]
+fn export_with_zellij_format_emits_kdl() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["export", "--format", "zellij"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("layout {"))
+        .stdout(contains(r#"tab name="claude""#))
+        .stdout(contains(r#"tab name="tests""#));
+}
+
+#[test]
+fn export_writes_to_output_path_when_dash_o_given() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+    let out = tmp.child("starter.sh");
+
+    Command::cargo_bin("pa")
+        .unwrap()
+        .args(["export", "--format", "tmux"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .arg("-o")
+        .arg(out.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+
+    assert!(out.path().is_file(), "output file should exist");
+    let contents = std::fs::read_to_string(out.path()).unwrap();
+    assert!(contents.contains("tmux new-session"));
+}
+
+#[test]
 fn claim_errors_when_workspace_has_no_sessions() {
     let tmp = assert_fs::TempDir::new().unwrap();
     tmp.child("empty.portagenty.toml")
