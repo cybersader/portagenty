@@ -42,12 +42,30 @@ pub fn classify(code: crossterm::event::KeyCode) -> ConfirmKey {
 /// Caller decides what dismisses it (typically Esc / q / any key).
 /// Used for "reveal path" so users can long-press to select on
 /// mobile without the modal vanishing under them.
+///
+/// Width hugs the longest line of `body` so a mobile long-press
+/// doesn't pull in trailing blank cells. No Wrap widget — the
+/// caller is expected to pre-wrap content to fit (we cap the
+/// computed width at terminal-width-minus-4 anyway, so anything
+/// too wide gets truncated rather than wrapped-with-padding).
 pub fn render_info(frame: &mut Frame<'_>, area: Rect, title: &str, body: Vec<Line<'static>>) {
     let w = area.width;
     let h = area.height;
-    let overlay_w = w.saturating_sub(4).clamp(24, 70);
-    // 2 borders + body + a couple of spacer lines.
-    let want_h: u16 = (body.len() as u16) + 4;
+    // Longest body line drives the overlay width so trailing cells
+    // don't get added to the user's clipboard selection.
+    let max_line = body
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    // +2 for the L/R border + 2 for breathing room.
+    let want_w = (max_line as u16).saturating_add(4);
+    let overlay_w = want_w
+        .max(title.len() as u16 + 6) // accommodate the title
+        .min(w.saturating_sub(2))
+        .max(24);
+    // 2 borders + body height.
+    let want_h: u16 = (body.len() as u16) + 2;
     let overlay_h = want_h.min(h.saturating_sub(2)).max(5);
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;
@@ -70,10 +88,9 @@ pub fn render_info(frame: &mut Frame<'_>, area: Rect, title: &str, body: Vec<Lin
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    frame.render_widget(
-        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
-        region,
-    );
+    // No `wrap` — caller pre-wraps; this avoids ratatui's wrap widget
+    // padding inserted blank cells past the line content.
+    frame.render_widget(Paragraph::new(body).block(block), region);
 }
 
 /// Render a confirm modal centered in `area`. `title` is short (fits

@@ -222,10 +222,16 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
 }
 
 /// Build the "reveal path" info modal. Auto-attempts to copy the
-/// path to the system clipboard so users can paste it elsewhere
-/// (especially mobile, where long-press selection inside the TUI
-/// is fiddly).
+/// path to the system clipboard, then hard-wraps the path into
+/// clean lines that fit the modal width — so a mobile long-press
+/// selects exactly the visible text without trailing-padding
+/// artifacts from ratatui's `Wrap` widget.
+///
+/// The wrap width (52) matches the modal's inner width budget:
+/// overlay clamps to 60 cols, minus 2 borders and 2 chars of padding
+/// per side. If we ever bump the modal width, bump this constant.
 fn build_reveal_modal(path: &std::path::Path) -> InfoModal {
+    const PATH_WRAP: usize = 52;
     let path_str = path.display().to_string();
     let copy_result = crate::clipboard::copy(&path_str);
     let copy_line = match copy_result {
@@ -237,12 +243,12 @@ fn build_reveal_modal(path: &std::path::Path) -> InfoModal {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(" to clipboard via `{tool}`")),
+            Span::raw(format!(" to clipboard via `{tool}` — paste anywhere.")),
         ]),
         Err(e) => Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                "couldn't copy:",
+                "couldn't auto-copy:",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -254,26 +260,45 @@ fn build_reveal_modal(path: &std::path::Path) -> InfoModal {
             ),
         ]),
     };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(8);
+    lines.push(Line::raw(""));
+    // Each path chunk on its own line, no trailing space, no Wrap{}
+    // — long-press selection on mobile picks up exactly the visible
+    // characters of the chunk.
+    for chunk in chunked_path(&path_str, PATH_WRAP) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(chunk, Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(copy_line);
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "Any key closes (Esc / q / Enter).",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]));
     InfoModal {
         title: "Workspace path".into(),
-        lines: vec![
-            Line::raw(""),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(path_str, Style::default().add_modifier(Modifier::BOLD)),
-            ]),
-            Line::raw(""),
-            copy_line,
-            Line::raw(""),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    "Press any key (Esc / q / Enter) to close.",
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-            ]),
-        ],
+        lines,
     }
+}
+
+/// Chop a string into max-`width`-char chunks, returning each as an
+/// owned String. Chars (not bytes) so multi-byte UTF-8 is safe.
+fn chunked_path(s: &str, width: usize) -> Vec<String> {
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .chunks(width.max(1))
+        .map(|c| c.iter().collect::<String>())
+        .collect()
 }
 
 /// Resolve the currently-selected row to a workspace PathBuf, or
