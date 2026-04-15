@@ -125,21 +125,39 @@ fn scaffold_flow<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<
         name.to_string()
     };
 
-    // What's the current machine default mpx, if any? Drives prompt
-    // wording + default.
+    // What's on PATH? Drives the default choice when the user has no
+    // prior machine default set.
+    let tmux_here = bin_on_path("tmux");
+    let zellij_here = bin_on_path("zellij");
+
+    // What's the current machine default mpx, if any? Takes precedence
+    // over install-detection for the default when set.
     let current_default = crate::config::current_default_multiplexer().ok().flatten();
     let (default_label, default_idx) = match current_default {
         Some(crate::domain::Multiplexer::Zellij) => ("zellij", "2"),
-        _ => ("tmux", "1"),
+        Some(_) => ("tmux", "1"),
+        None => match (tmux_here, zellij_here) {
+            // Only zellij installed — prefer it.
+            (false, true) => ("zellij", "2"),
+            // tmux installed, or neither (fall back to tmux recommendation).
+            _ => ("tmux", "1"),
+        },
+    };
+
+    let tmux_tag = if tmux_here { "installed" } else { "not found" };
+    let zellij_tag = if zellij_here {
+        "installed"
+    } else {
+        "not found"
     };
 
     writeln!(output)?;
     writeln!(output, "  Multiplexer for this workspace:")?;
     writeln!(
         output,
-        "    [1] tmux (recommended — best cross-device story)"
+        "    [1] tmux   ({tmux_tag}) — recommended, best cross-device story"
     )?;
-    writeln!(output, "    [2] zellij")?;
+    writeln!(output, "    [2] zellij ({zellij_tag})")?;
     write!(output, "  Choice [{default_idx} = {default_label}]: ")?;
     output.flush()?;
     let mpx_choice = read_line(input)?;
@@ -299,6 +317,30 @@ fn skip<W: Write>(output: &mut W) -> Result<OnboardOutcome> {
     )?;
     mark_onboarded()?;
     Ok(OnboardOutcome::Skipped)
+}
+
+/// Is `bin` resolvable on `$PATH`? Tiny reimplementation of `which`
+/// so we don't pull in a dep for one wizard annotation. Honors PATHEXT
+/// on Windows (which we don't target, but it's free).
+fn bin_on_path(bin: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            for ext in ["exe", "cmd", "bat"] {
+                if candidate.with_extension(ext).is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn read_line<R: BufRead>(input: &mut R) -> Result<String> {
