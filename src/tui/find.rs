@@ -421,8 +421,9 @@ fn classify_pick(path: &Path) -> SearchOutcome {
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     let w = area.width;
     let h = area.height;
-    let overlay_w = ((w as u32 * 8 / 10).clamp(28, 90) as u16).min(w);
-    let overlay_h = ((h as u32 * 8 / 10).clamp(8, 30) as u16).min(h);
+    // Use nearly full terminal width so long paths have room.
+    let overlay_w = w.saturating_sub(2).max(20);
+    let overlay_h = ((h as u32 * 9 / 10).clamp(8, 35) as u16).min(h);
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;
     let region = Rect {
@@ -455,30 +456,24 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     let inner = outer.inner(region);
     frame.render_widget(outer, region);
 
-    // Inner layout: root breadcrumb + input + candidate list + hint.
+    // Inner layout: 2-line breadcrumb + input + candidate list + hint.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // root breadcrumb
+            Constraint::Length(2), // root breadcrumb (2 lines for wrapping)
             Constraint::Length(1), // input
             Constraint::Min(1),    // candidate list
             Constraint::Length(1),
         ])
         .split(inner);
 
-    // Animated root breadcrumb. Path segments are displayed
-    // leaf-first; when they overflow the line, a rotating window
-    // cycles upward toward the root (barber-pole style), slow near
-    // the leaf, fast near `/`. If the full path fits, no animation.
+    // Static 2-line breadcrumb. Line 1: folder icon + path (wraps to
+    // line 2 if too long). Backends on line 2 as dim suffix.
+    // No animation — just clear, always-readable text.
     let inner_w = inner.width as usize;
-    let segments = path_segments(&state.opts.roots);
-    let breadcrumb_line = render_animated_breadcrumb(
-        &segments,
-        state.anim_offset,
-        inner_w,
-        &state.backends.one_liner(),
-    );
-    frame.render_widget(Paragraph::new(breadcrumb_line), chunks[0]);
+    let breadcrumb =
+        render_static_breadcrumb(&state.opts.roots, inner_w, &state.backends.one_liner());
+    frame.render_widget(Paragraph::new(breadcrumb), chunks[0]);
 
     // Input line: prompt char + user text + caret (block style).
     let input_line = Line::from(vec![
@@ -599,6 +594,45 @@ fn candidate_item(c: &Candidate, width: u16) -> ListItem<'static> {
 ///   `/mnt/c/Users/Cybersader/Documents/1 Projects, Workspaces`
 ///   → `["1 Projects, Workspaces", "Documents", "C", "U", "c", "m"]`
 ///
+/// Render a static 2-line breadcrumb. Line 1: the full path with
+/// ~ for home and a folder icon. Line 2: backends, or overflow
+/// from line 1 + backends. No animation — just clear, readable.
+fn render_static_breadcrumb(roots: &[PathBuf], width: usize, backends: &str) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+    let bold = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let path_str = roots
+        .first()
+        .map(|p| compact_home(&p.display().to_string()))
+        .unwrap_or_else(|| "(no root)".into());
+
+    let padded = format!("  📂 {path_str}");
+    let budget = width.saturating_sub(2);
+
+    if padded.chars().count() <= budget {
+        // Fits on one line; backends on line 2.
+        vec![
+            Line::from(Span::styled(padded, bold)),
+            Line::from(Span::styled(format!("     [{backends}]"), dim)),
+        ]
+    } else {
+        // Wrap: split at budget, overflow to line 2.
+        let split = budget.saturating_sub(5);
+        let head: String = path_str.chars().take(split).collect();
+        let rest: String = path_str.chars().skip(split).collect();
+        vec![
+            Line::from(Span::styled(format!("  📂 {head}"), bold)),
+            Line::from(vec![
+                Span::styled(format!("     {rest}"), bold),
+                Span::raw("  "),
+                Span::styled(format!("[{backends}]"), dim),
+            ]),
+        ]
+    }
+}
+
 /// Leaf + parent stay full (they're the useful context); the rest
 /// compress. This is the "much smaller" path the user asked for —
 /// the terminal can't change font size, so we abbreviate instead.
@@ -631,6 +665,7 @@ fn path_segments(roots: &[PathBuf]) -> Vec<String> {
 /// When all segments fit, the full path is shown leaf-first with no
 /// animation indicator. When they overflow, a `⇡` prefix hints
 /// that more segments are above the visible window.
+#[allow(dead_code)]
 fn render_animated_breadcrumb(
     segments: &[String],
     offset: usize,
