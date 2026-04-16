@@ -622,7 +622,8 @@ impl App {
                 Constraint::Length(1),        // title
                 Constraint::Length(header_h), // column header
                 Constraint::Min(0),           // list
-                Constraint::Length(1),        // footer
+                Constraint::Length(1),        // footer line 1
+                Constraint::Length(1),        // footer line 2
             ])
             .split(area);
 
@@ -707,10 +708,10 @@ impl App {
                 ),
             ]);
             frame.render_widget(Paragraph::new(line), chunks[3]);
+            // Empty second footer line when status is showing.
+            frame.render_widget(Paragraph::new(""), chunks[4]);
         } else {
-            // New responsive (key, label) footer. Quit-first so it
-            // survives at the narrowest widths; help next; then
-            // navigation; then row actions.
+            // 2-line footer. Line 1: primary keys. Line 2: actions.
             use crate::tui::footer::Entry;
             crate::tui::footer::render(
                 frame,
@@ -720,12 +721,43 @@ impl App {
                     Entry::new("?", "help"),
                     Entry::new("Esc", "back"),
                     Entry::new("Enter", "launch"),
-                    Entry::new("j/k", "nav"),
-                    Entry::new("e", "edit"),
-                    Entry::new("d", "delete"),
-                    Entry::new("x", "kill"),
-                    Entry::new("m", "switch mpx"),
+                    Entry::new("↑/↓", "nav"),
                 ],
+            );
+            let sep = Style::default().fg(Color::DarkGray);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ─── ", sep),
+                    Span::styled(
+                        "e ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("edit  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "d ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("delete  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "x ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("kill  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "m ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("mpx", Style::default().add_modifier(Modifier::DIM)),
+                ])),
+                chunks[4],
             );
         }
 
@@ -1197,13 +1229,19 @@ mod tests {
     fn renders_footer_with_quit_hint() {
         let ws = sample_workspace("X", 0);
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
-        let terminal = render_to_backend(&mut app, 60, 5);
+        // Height needs to be big enough for title + col_header + list + 2 footer lines.
+        let terminal = render_to_backend(&mut app, 60, 6);
 
         let buffer = terminal.backend().buffer();
-        let last_line: String = (0..60)
+        // "quit" should be in one of the last 2 rows (2-line footer).
+        let row4: String = (0..60)
             .map(|x| buffer[(x, 4)].symbol().chars().next().unwrap_or(' '))
             .collect();
-        assert!(last_line.contains("quit"), "got: {last_line:?}");
+        let row5: String = (0..60)
+            .map(|x| buffer[(x, 5)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        let both = format!("{row4} {row5}");
+        assert!(both.contains("quit"), "got: {both:?}");
     }
 
     #[test]
@@ -1460,11 +1498,13 @@ mod tests {
             header.contains("mobile"),
             "header missing at {w}x{h}: {header:?}"
         );
-        // Footer on the last row always has quit hint.
-        let footer = line_at(&terminal, h - 1);
+        // Footer spans the last 2 rows. "quit" is on one of them.
+        let footer1 = line_at(&terminal, h - 2);
+        let footer2 = line_at(&terminal, h - 1);
+        let both = format!("{footer1} {footer2}");
         assert!(
-            footer.to_lowercase().contains("quit"),
-            "footer missing at {w}x{h}: {footer:?}"
+            both.to_lowercase().contains("quit"),
+            "footer missing quit at {w}x{h}: {both:?}"
         );
         // Selected row (index 0 by default) has the highlight marker
         // somewhere in the body region (rows 1..h-1).

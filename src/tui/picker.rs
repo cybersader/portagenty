@@ -453,7 +453,8 @@ fn render(
             Constraint::Length(1), // title
             Constraint::Length(1), // spacer/hint
             Constraint::Min(0),    // list
-            Constraint::Length(1), // footer
+            Constraint::Length(1), // footer line 1
+            Constraint::Length(1), // footer line 2
         ])
         .split(area);
 
@@ -576,9 +577,9 @@ fn render(
             ),
         ]);
         frame.render_widget(Paragraph::new(line), chunks[3]);
+        frame.render_widget(Paragraph::new(""), chunks[4]);
     } else {
-        // Quit-first ordering keeps `q` visible at the narrowest
-        // widths; help next; then nav and row actions.
+        // 2-line footer. Line 1: primary. Line 2: workspace actions.
         use crate::tui::footer::Entry;
         crate::tui::footer::render(
             frame,
@@ -587,12 +588,43 @@ fn render(
                 Entry::new("q", "quit"),
                 Entry::new("?", "help"),
                 Entry::new("Enter", "open"),
-                Entry::new("j/k", "nav"),
-                Entry::new("n", "new"),
-                Entry::new("d", "unreg"),
-                Entry::new("D", "delete"),
-                Entry::new("r", "reveal"),
+                Entry::new("↑/↓", "nav"),
             ],
+        );
+        let sep = Style::default().fg(Color::DarkGray);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" ─── ", sep),
+                Span::styled(
+                    "n ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("new  ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    "d ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("unreg  ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    "D ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("delete  ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    "r ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("reveal", Style::default().add_modifier(Modifier::DIM)),
+            ])),
+            chunks[4],
         );
     }
 
