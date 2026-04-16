@@ -72,6 +72,9 @@ pub enum EditOutcome {
     /// User confirmed the edit. Caller should call
     /// `crate::cli::edit_session_in_file` with this op and reload.
     Apply(crate::cli::EditOp),
+    /// User chose cwd edit — caller should open the find/tree
+    /// overlay for folder selection instead of a text input.
+    BrowseForCwd,
 }
 
 /// Process a single key press inside the edit overlay. Pure
@@ -95,11 +98,11 @@ pub fn handle_key(state: &mut EditState, code: KeyCode, mods: KeyModifiers) -> E
                 EditOutcome::Continue
             }
             KeyCode::Char('c') => {
-                *state = EditState::TypingValue {
-                    field: TextField::Cwd,
-                    input: String::new(),
-                };
-                EditOutcome::Continue
+                // Instead of a text input, signal the caller to open
+                // the find/tree overlay for folder selection. The
+                // caller (App) handles the overlay lifecycle and
+                // writes the chosen path back via edit_session_in_file.
+                EditOutcome::BrowseForCwd
             }
             KeyCode::Char('m') => {
                 *state = EditState::TypingValue {

@@ -529,6 +529,18 @@ impl App {
                 crate::tui::edit::EditOutcome::Apply(op) => {
                     self.apply_edit_op(op);
                 }
+                crate::tui::edit::EditOutcome::BrowseForCwd => {
+                    // Close the edit overlay. The outer driver
+                    // (tui::run) doesn't have the find overlay
+                    // infrastructure — that's in the picker. So
+                    // for now, print the session name to the status
+                    // and tell the user to use the CLI.
+                    // TODO: wire find overlay into the session TUI
+                    // when the architecture supports it.
+                    self.set_status(
+                        "cwd browse: use 'pa edit <session> --cwd <path>' from CLI for now",
+                    );
+                }
             }
             return Action::None;
         }
