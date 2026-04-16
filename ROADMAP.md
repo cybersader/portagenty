@@ -178,6 +178,82 @@ real projects:
 12. **Termux polish pass.** Over-SSH verification + any rough
     edges found in real use. Core keybindings are already
     Termux-safe by default (`DESIGN.md` §10).
+13. **"Jump back to pa" from inside a running session.** Currently
+    once `pa` launches you into a zellij/tmux session, `pa` itself
+    exits — the multiplexer owns the terminal. There's no way to
+    jump back to the picker or session list without detaching from
+    the multiplexer first (`Ctrl+O d` in zellij, `Ctrl+B d` in
+    tmux) and then re-running `pa`. This is the #1 UX confusion
+    reported during Termux mobile testing.
+
+    **The problem in detail**: `pa`'s current lifecycle is
+    "show TUI → user picks a session → restore terminal → exec
+    the multiplexer attach command → `pa` process exits." After
+    that, `pa` is gone from the process tree. The multiplexer is
+    in charge. Typing `pa` inside the session hits the nested-mpx
+    pre-flight check and refuses with an error. The user is stuck
+    until they remember the detach chord.
+
+    **Solution options explored (ranked by feasibility)**:
+
+    **(A) Relax the nested-mpx check — read-only picker inside a
+    session.** Instead of refusing when `pa` is run inside zellij/
+    tmux, open a lightweight read-only TUI that shows the workspace
+    picker and session list. The user can browse, see what's running,
+    and the footer says "detach: Ctrl+O d to switch sessions" with
+    the correct chord prominently displayed. On Enter, instead of
+    trying to attach (which would nest), print the detach
+    instructions or, for tmux, run `tmux switch-client -t <target>`
+    (tmux supports switching between sessions from inside a client
+    — zellij does not). **Effort**: medium. Requires a new
+    `--nested` mode in the TUI that skips the attach path and
+    replaces it with informational output. Tmux gets real
+    switching; zellij gets a "here's how to detach" hint.
+
+    **(B) Tab-based session model.** Instead of creating each
+    workspace session as a separate zellij/tmux session, create
+    them as **tabs within one multiplexer session.** The user
+    switches between Claude Code and shell via Alt+1 / Alt+2
+    (zellij tab switching) or Ctrl+B 1 / Ctrl+B 2 (tmux window
+    switching). `pa` could be a permanent first tab — the "home
+    screen" the user always returns to. Switching tabs is instant,
+    no detach/reattach needed, no chord to remember.
+    **Effort**: large. Requires rearchitecting the launch path
+    to use `zellij action new-tab` / `tmux new-window` instead of
+    `zellij attach --create` / `tmux new-session`. The
+    cross-device takeover story changes too (you'd take over the
+    whole multiplexer session, not individual sub-sessions).
+    Trade-off: simpler in-session switching, but the workspace-
+    session model becomes multiplexer-window-based, which may
+    conflict with users who already have their own tab layouts.
+
+    **(C) `pa` as a persistent background process.** Instead of
+    exiting after launch, `pa` stays resident and listens for a
+    keybind (e.g. a global tmux/zellij keybind that sends a signal
+    or runs `pa --show`). When triggered, `pa` pops the TUI
+    overlay on top of whatever is running, like a quake-style
+    dropdown terminal. **Effort**: very large. Requires `pa` to
+    manage its own lifecycle, IPC, and terminal multiplexing —
+    essentially becoming a mini window manager. Conflicts with
+    DESIGN.md's anti-daemon stance (§5). Not recommended unless
+    the simpler options prove insufficient.
+
+    **(D) Multiplexer keybind snippet.** Ship a zellij/tmux config
+    snippet (via `pa snippets install zellij-jump-back`) that
+    binds a key (e.g. Ctrl+P or a custom chord) to: detach from
+    current session, then run `pa` in the resulting shell. This is
+    a two-step operation collapsed into one keypress via the mpx
+    config. **Effort**: small, but it's a config snippet, not a
+    code feature — lives in the user's mpx config and is
+    fragile across mpx version updates. Best as a complement to
+    option (A), not a replacement.
+
+    **Recommended path**: ship **(A)** first (read-only picker
+    inside a session, with tmux switch-client for real tab
+    switching), then evaluate whether **(B)** is worth the
+    architecture change based on real usage. **(D)** can ship
+    alongside (A) as an ergonomic bonus. **(C)** is deferred
+    unless demand justifies the complexity.
 
 ---
 

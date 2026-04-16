@@ -476,6 +476,38 @@ timeout. No new C deps; only `nucleo-matcher` was added (pure Rust,
   on plocate / Everything when present; we never spin up an indexer
   process or write to one. Aligns with §5's anti-daemon stance.
 
+### In-session navigation — the "jump back to pa" problem
+
+**Status**: known gap, documented in ROADMAP item 13.
+
+The current lifecycle is fire-and-forget: `pa` shows the TUI, the
+user picks a session, `pa` restores the terminal and execs the
+multiplexer attach command, then the `pa` process exits. From that
+point on, the multiplexer owns the terminal. There is no `pa`
+process to "jump back to."
+
+This is architecturally correct for the cross-device takeover
+model (one session, multiple devices, detach-and-reattach) but
+creates a UX dead-end: the user is inside Claude Code, wants to
+switch to another session, and doesn't remember the detach chord.
+Typing `pa` inside the session hits the nested-mpx pre-flight
+check and refuses.
+
+The recommended fix is a two-phase approach:
+
+1. **Short term**: relax the nested-mpx check to show a read-only
+   picker instead of refusing. For tmux, use `switch-client` to
+   actually switch sessions from inside a client. For zellij (which
+   has no equivalent CLI), show the detach chord prominently.
+2. **Long term**: evaluate whether sessions should be tabs within
+   one multiplexer session (instant tab-switching, `pa` as a home
+   tab) vs. the current separate-sessions model. The tab model is
+   simpler for in-session switching but changes the cross-device
+   story and may conflict with users' existing mpx layouts.
+
+See ROADMAP item 13 for the full solution matrix with effort
+estimates.
+
 ## 13. Explicitly out of scope
 
 - **Scaffolding**. A tool for that exists (`agentic-workflow-and-tech-stack`'s `setup.sh`). Integration with a purpose-built scaffolder may happen later via a separate `pa new` subcommand that shells out.
