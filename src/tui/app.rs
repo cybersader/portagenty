@@ -82,6 +82,9 @@ pub struct App {
     /// diverted to `crate::tui::edit::handle_key` and the row list
     /// renders normally underneath. Mutually exclusive with `pending`.
     editing: Option<crate::tui::edit::EditState>,
+    /// When Some, the find overlay is open for cwd selection.
+    /// Tuple: (session_name being edited, search state).
+    browsing_cwd: Option<(String, crate::tui::find::SearchState)>,
 }
 
 /// How long status messages stick around before auto-clearing.
@@ -143,6 +146,7 @@ impl App {
             status: None,
             status_set_at: None,
             editing: None,
+            browsing_cwd: None,
         }
     }
 
@@ -510,6 +514,65 @@ impl App {
             self.help_open = false;
             return Action::None;
         }
+        // CWD browse overlay: find overlay open for folder selection.
+        if self.browsing_cwd.is_some() {
+            let (ref session_name, ref mut search) = self.browsing_cwd.as_mut().unwrap();
+            search.poll_background();
+            search.tick_animation();
+            use crate::tui::find::SearchOutcome;
+            let result = crate::tui::find::handle_key(search, code, mods);
+            // Extract the picked path (if any) before we drop the borrow.
+            let picked_dir = match &result {
+                SearchOutcome::ScaffoldAt(p) => Some(p.clone()),
+                SearchOutcome::OpenExisting(p) => {
+                    // p is a .portagenty.toml file; use its parent dir.
+                    p.parent().map(|d| d.to_path_buf())
+                }
+                _ => None,
+            };
+            let sn = session_name.clone();
+            match result {
+                SearchOutcome::Continue => {}
+                SearchOutcome::Cancel | SearchOutcome::BackToSearch => {
+                    self.browsing_cwd = None;
+                    self.set_status("cwd browse cancelled");
+                }
+                SearchOutcome::OpenHelp => {
+                    self.help_open = true;
+                }
+                SearchOutcome::ScaffoldAt(_) | SearchOutcome::OpenExisting(_) => {
+                    self.browsing_cwd = None;
+                    if let Some(dir) = picked_dir {
+                        let op = crate::cli::EditOp {
+                            cwd: Some(dir.display().to_string()),
+                            ..Default::default()
+                        };
+                        if let Some(ws_path) = self.workspace.file_path.clone() {
+                            match crate::cli::edit_session_in_file(&ws_path, &sn, &op) {
+                                Ok(()) => {
+                                    if let Ok(reloaded) =
+                                        crate::config::load(&crate::config::LoadOptions {
+                                            workspace_path: Some(ws_path),
+                                            ..Default::default()
+                                        })
+                                    {
+                                        self.workspace = reloaded;
+                                        let live = self.mux.list_sessions().unwrap_or_default();
+                                        self.rows =
+                                            crate::tui::view::build_rows(&self.workspace, &live);
+                                    }
+                                    self.set_status(format!("cwd updated for {sn:?}"));
+                                }
+                                Err(e) => {
+                                    self.set_status(format!("cwd update failed: {e:#}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Action::None;
+        }
         // Edit overlay: divert keys to the edit module's state
         // machine. Apply outcomes go through cli::edit_session_in_file
         // (the same toml_edit-preserving helper the CLI uses) so
@@ -530,16 +593,12 @@ impl App {
                     self.apply_edit_op(op);
                 }
                 crate::tui::edit::EditOutcome::BrowseForCwd => {
-                    // Close the edit overlay. The outer driver
-                    // (tui::run) doesn't have the find overlay
-                    // infrastructure — that's in the picker. So
-                    // for now, print the session name to the status
-                    // and tell the user to use the CLI.
-                    // TODO: wire find overlay into the session TUI
-                    // when the architecture supports it.
-                    self.set_status(
-                        "cwd browse: use 'pa edit <session> --cwd <path>' from CLI for now",
-                    );
+                    let session_name = self
+                        .selected_row()
+                        .map(|r| r.display_name.clone())
+                        .unwrap_or_default();
+                    self.browsing_cwd =
+                        Some((session_name, crate::tui::find::SearchState::default()));
                 }
             }
             return Action::None;
@@ -790,6 +849,11 @@ impl App {
                 .map(|r| r.display_name.clone())
                 .unwrap_or_default();
             crate::tui::edit::render(frame, area, &session_name, state);
+        }
+
+        // CWD browse overlay — same find overlay as the picker's `n`.
+        if let Some((_, ref mut search)) = self.browsing_cwd {
+            crate::tui::find::render(frame, area, search);
         }
 
         // Help overlay renders last so it sits on top of everything.

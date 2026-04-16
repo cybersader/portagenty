@@ -97,13 +97,7 @@ pub fn handle_key(state: &mut EditState, code: KeyCode, mods: KeyModifiers) -> E
                 };
                 EditOutcome::Continue
             }
-            KeyCode::Char('c') => {
-                *state = EditState::TypingValue {
-                    field: TextField::Cwd,
-                    input: String::new(),
-                };
-                EditOutcome::Continue
-            }
+            KeyCode::Char('c') => EditOutcome::BrowseForCwd,
             KeyCode::Char('m') => {
                 *state = EditState::TypingValue {
                     field: TextField::Command,
