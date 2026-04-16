@@ -35,16 +35,301 @@ pub enum FindMode {
     Tree(Box<TreeBrowseState>),
 }
 
-/// State for the file-explorer tree mode.
+/// State for the file-explorer tree mode. Built without external
+/// tree widgets to avoid ratatui version conflicts. Uses a flattened
+/// list of `TreeRow`s rendered via ratatui's `List` + `ListState`.
 #[derive(Debug)]
 pub struct TreeBrowseState {
-    /// tui-tree-widget's internal state (open nodes + selection).
-    pub tree_state: tui_tree_widget::TreeState<String>,
-    /// Lazily-loaded directory children, keyed by path string.
-    /// Only populated when the user expands a node.
+    /// Expanded directory paths.
+    pub expanded: std::collections::HashSet<String>,
+    /// Lazily-loaded children, keyed by parent path string.
     pub children_cache: std::collections::HashMap<String, Vec<PathBuf>>,
-    /// The root directory the tree is showing.
+    /// Root directory.
     pub root: PathBuf,
+    /// Flattened rows for the current view. Rebuilt on expand/collapse.
+    pub rows: Vec<TreeRow>,
+    /// Selection index into `rows`.
+    pub selected: usize,
+    /// ListState for ratatui.
+    pub list_state: ListState,
+}
+
+/// One visible row in the tree.
+#[derive(Debug, Clone)]
+pub struct TreeRow {
+    pub path: PathBuf,
+    pub name: String,
+    pub depth: usize,
+    pub is_dir: bool,
+    pub is_expanded: bool,
+    pub is_last_sibling: bool,
+}
+
+impl TreeBrowseState {
+    fn new(root: PathBuf) -> Self {
+        let mut s = Self {
+            expanded: std::collections::HashSet::new(),
+            children_cache: std::collections::HashMap::new(),
+            root: root.clone(),
+            rows: Vec::new(),
+            selected: 0,
+            list_state: ListState::default(),
+        };
+        s.load_children(&root);
+        s.rebuild_rows();
+        s
+    }
+
+    fn load_children(&mut self, dir: &Path) {
+        let key = dir.display().to_string();
+        if self.children_cache.contains_key(&key) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            self.children_cache.insert(key, Vec::new());
+            return;
+        };
+        let ignore = [
+            ".git",
+            ".hg",
+            ".svn",
+            "node_modules",
+            "target",
+            ".cache",
+            "venv",
+            ".venv",
+            "__pycache__",
+            "dist",
+            "build",
+        ];
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| {
+                let Ok(ft) = e.file_type() else { return false };
+                if !ft.is_dir() {
+                    return false;
+                }
+                let name = e.file_name();
+                let n = name.to_string_lossy();
+                if n.starts_with('.') && n != "." {
+                    return false;
+                }
+                !ignore.iter().any(|i| *i == &*n)
+            })
+            .map(|e| e.path())
+            .collect();
+        dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        self.children_cache.insert(key, dirs);
+    }
+
+    fn rebuild_rows(&mut self) {
+        self.rows.clear();
+        let root = self.root.clone();
+        self.add_children_rows(&root, 0);
+        if !self.rows.is_empty() {
+            self.selected = self.selected.min(self.rows.len() - 1);
+            self.list_state.select(Some(self.selected));
+        } else {
+            self.list_state.select(None);
+        }
+    }
+
+    fn add_children_rows(&mut self, dir: &Path, depth: usize) {
+        let key = dir.display().to_string();
+        let children = self.children_cache.get(&key).cloned().unwrap_or_default();
+        let count = children.len();
+        for (i, child) in children.iter().enumerate() {
+            let name = child
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let is_dir = child.is_dir();
+            let id = child.display().to_string();
+            let is_expanded = self.expanded.contains(&id);
+            self.rows.push(TreeRow {
+                path: child.clone(),
+                name,
+                depth,
+                is_dir,
+                is_expanded,
+                is_last_sibling: i + 1 == count,
+            });
+            if is_expanded {
+                self.load_children(child);
+                self.add_children_rows(child, depth + 1);
+            }
+        }
+    }
+
+    fn selected_row(&self) -> Option<&TreeRow> {
+        self.rows.get(self.selected)
+    }
+
+    fn toggle_expand(&mut self) {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
+            return;
+        };
+        if !row.is_dir {
+            return;
+        }
+        let id = row.path.display().to_string();
+        if self.expanded.contains(&id) {
+            self.expanded.remove(&id);
+        } else {
+            self.load_children(&row.path);
+            self.expanded.insert(id);
+        }
+        self.rebuild_rows();
+    }
+
+    fn expand_selected(&mut self) {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
+            return;
+        };
+        if !row.is_dir || row.is_expanded {
+            return;
+        }
+        let id = row.path.display().to_string();
+        self.load_children(&row.path);
+        self.expanded.insert(id);
+        self.rebuild_rows();
+    }
+
+    fn collapse_selected(&mut self) {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
+            return;
+        };
+        let id = row.path.display().to_string();
+        if self.expanded.contains(&id) {
+            self.expanded.remove(&id);
+            self.rebuild_rows();
+        } else if let Some(parent) = row.path.parent() {
+            let pid = parent.display().to_string();
+            let parent_buf = parent.to_path_buf();
+            self.expanded.remove(&pid);
+            self.rebuild_rows();
+            if let Some(idx) = self.rows.iter().position(|r| r.path == parent_buf) {
+                self.selected = idx;
+                self.list_state.select(Some(idx));
+            }
+        }
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        let n = self.rows.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.selected as i32 + delta).rem_euclid(n as i32) as usize;
+        self.selected = next;
+        self.list_state.select(Some(next));
+    }
+}
+
+/// Handle a key press in tree mode.
+pub fn handle_tree_key(
+    state: &mut TreeBrowseState,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> SearchOutcome {
+    match (code, mods) {
+        (KeyCode::Esc, _) => SearchOutcome::Cancel,
+        (KeyCode::Char('?'), _) => SearchOutcome::OpenHelp,
+        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::Cancel,
+        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+            state.move_selection(1);
+            SearchOutcome::Continue
+        }
+        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+            state.move_selection(-1);
+            SearchOutcome::Continue
+        }
+        (KeyCode::Char('>'), _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
+            state.expand_selected();
+            SearchOutcome::Continue
+        }
+        (KeyCode::Char('<'), _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => {
+            state.collapse_selected();
+            SearchOutcome::Continue
+        }
+        (KeyCode::Char(' '), _) => {
+            state.toggle_expand();
+            SearchOutcome::Continue
+        }
+        (KeyCode::Enter, _) => {
+            if let Some(row) = state.selected_row() {
+                return classify_pick(&row.path);
+            }
+            SearchOutcome::Continue
+        }
+        (KeyCode::Char('g'), _) | (KeyCode::Home, _) => {
+            if !state.rows.is_empty() {
+                state.selected = 0;
+                state.list_state.select(Some(0));
+            }
+            SearchOutcome::Continue
+        }
+        (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
+            if !state.rows.is_empty() {
+                state.selected = state.rows.len() - 1;
+                state.list_state.select(Some(state.selected));
+            }
+            SearchOutcome::Continue
+        }
+        _ => SearchOutcome::Continue,
+    }
+}
+
+/// Render the tree as a ratatui List with manual indentation.
+pub fn render_tree(frame: &mut Frame<'_>, area: Rect, state: &mut TreeBrowseState) {
+    let items: Vec<ListItem> = state
+        .rows
+        .iter()
+        .map(|row| {
+            let indent = "  ".repeat(row.depth);
+            let icon = if row.is_dir {
+                if row.is_expanded {
+                    "📂 "
+                } else {
+                    "📁 "
+                }
+            } else {
+                "  "
+            };
+            let connector = if row.is_last_sibling {
+                "└─"
+            } else {
+                "├─"
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("  {indent}{connector}")),
+                Span::styled(
+                    format!("{icon}{}", row.name),
+                    if row.is_dir {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ]))
+        })
+        .collect();
+
+    if items.is_empty() {
+        let empty = Paragraph::new("  (empty directory)")
+            .style(Style::default().add_modifier(Modifier::DIM));
+        frame.render_widget(empty, area);
+    } else {
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        frame.render_stateful_widget(list, area, &mut state.list_state);
+    }
 }
 
 /// What the picker should do after a key press inside the search
@@ -112,6 +397,8 @@ pub struct SearchState {
     /// showing the highlighted candidate's complete path with
     /// auto-copy. Any key dismisses.
     fullscreen_path: Option<FullscreenPath>,
+    /// Current mode: search (default) or tree browser.
+    pub mode: FindMode,
 }
 
 /// Full-path expand modal content. Built on `f` press, dismissed
@@ -165,6 +452,7 @@ impl Default for SearchState {
             anim_tick: 0,
             anim_offset: 0,
             fullscreen_path: None,
+            mode: FindMode::Search,
         };
         s.rerank();
         s
@@ -334,6 +622,24 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         state.fullscreen_path = None;
         return SearchOutcome::Continue;
     }
+
+    // Tree mode: dispatch to tree handler. `t` toggles back.
+    if let FindMode::Tree(ref mut tree) = state.mode {
+        if matches!(code, KeyCode::Char('t')) && mods.is_empty() {
+            state.mode = FindMode::Search;
+            return SearchOutcome::Continue;
+        }
+        // Ctrl+F works in tree mode too.
+        if matches!(code, KeyCode::Char('f')) && mods.contains(KeyModifiers::CONTROL) {
+            if let Some(row) = tree.selected_row() {
+                state.fullscreen_path = Some(build_fullscreen_path(&row.path));
+            }
+            return SearchOutcome::Continue;
+        }
+        return handle_tree_key(tree, code, mods);
+    }
+
+    // Search mode below.
     match (code, mods) {
         (KeyCode::Esc, _) => SearchOutcome::Cancel,
         (KeyCode::Char('?'), _) => SearchOutcome::OpenHelp,
@@ -408,6 +714,17 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             state.opts.roots = crate::find::default_roots();
             state.input.clear();
             state.restart_walk();
+            SearchOutcome::Continue
+        }
+        // `t`: toggle to tree browser mode rooted at current search root.
+        (KeyCode::Char('t'), _) => {
+            let root = state
+                .opts
+                .roots
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("."));
+            state.mode = FindMode::Tree(Box::new(TreeBrowseState::new(root)));
             SearchOutcome::Continue
         }
         // Ctrl+F: expand the highlighted candidate's full path into
@@ -570,42 +887,63 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 .add_modifier(Modifier::SLOW_BLINK),
         ),
     ]);
-    frame.render_widget(Paragraph::new(input_line), chunks[1]);
+    // Content area + hint depend on the current mode.
+    match &mut state.mode {
+        FindMode::Search => {
+            // Search mode: input line + candidate list.
+            frame.render_widget(Paragraph::new(input_line), chunks[1]);
 
-    // Candidate list.
-    let items: Vec<ListItem> = state
-        .candidates
-        .iter()
-        .map(|c| candidate_item(c, chunks[2].width))
-        .collect();
-    if items.is_empty() {
-        let msg = if state.scanning {
-            "  scanning filesystem… results will appear as they're found"
-        } else if state.input.is_empty() {
-            "  (no recents yet — type to search your filesystem)"
-        } else {
-            "  no matches — try > to drill into a folder, or < to go up"
-        };
-        let empty = Paragraph::new(msg).style(Style::default().add_modifier(Modifier::DIM));
-        frame.render_widget(empty, chunks[2]);
-    } else {
-        let list = List::new(items)
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+            let items: Vec<ListItem> = state
+                .candidates
+                .iter()
+                .map(|c| candidate_item(c, chunks[2].width))
+                .collect();
+            if items.is_empty() {
+                let msg = if state.scanning {
+                    "  scanning filesystem… results will appear as they're found"
+                } else if state.input.is_empty() {
+                    "  (no recents yet — type to search, or t for tree browser)"
+                } else {
+                    "  no matches — try > to drill, < to go up, or t for tree"
+                };
+                let empty = Paragraph::new(msg).style(Style::default().add_modifier(Modifier::DIM));
+                frame.render_widget(empty, chunks[2]);
+            } else {
+                let list = List::new(items)
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▶ ");
+                frame.render_stateful_widget(list, chunks[2], &mut state.list_state);
+            }
+
+            let hint = Paragraph::new(
+                " Enter · t tree · >/Alt+J drill · </Alt+K up · Ctrl+F path · Esc · ↑/↓ ",
             )
-            .highlight_symbol("▶ ");
-        frame.render_stateful_widget(list, chunks[2], &mut state.list_state);
-    }
+            .style(Style::default().add_modifier(Modifier::DIM));
+            frame.render_widget(hint, chunks[3]);
+        }
+        FindMode::Tree(tree) => {
+            // Tree mode: no input line (use the space for tree).
+            // Merge chunks[1] + chunks[2] for more tree room.
+            let tree_area = Rect {
+                x: chunks[1].x,
+                y: chunks[1].y,
+                width: chunks[1].width,
+                height: chunks[1].height + chunks[2].height,
+            };
+            render_tree(frame, tree_area, tree);
 
-    // Bottom hint.
-    let hint = Paragraph::new(
-        " Enter · >/Alt+J drill · </Alt+K up · Ctrl+F path · Ctrl+R reset · Esc · ↑/↓ ",
-    )
-    .style(Style::default().add_modifier(Modifier::DIM));
-    frame.render_widget(hint, chunks[3]);
+            let hint = Paragraph::new(
+                " Enter open · >/l expand · </h collapse · Space toggle · t search · Ctrl+F path · Esc ",
+            )
+            .style(Style::default().add_modifier(Modifier::DIM));
+            frame.render_widget(hint, chunks[3]);
+        }
+    }
 
     // Full-path modal renders on top of everything when active.
     if let Some(fp) = &state.fullscreen_path {
@@ -1031,6 +1369,7 @@ mod tests {
             anim_tick: 0,
             anim_offset: 0,
             fullscreen_path: None,
+            mode: FindMode::Search,
         };
         s.list_state.select(Some(0));
         s
