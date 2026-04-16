@@ -153,6 +153,7 @@ mod tests {
     fn ws(sessions: Vec<(&str, &str)>) -> Workspace {
         Workspace {
             name: "x".into(),
+            id: None,
             file_path: None,
             multiplexer: Multiplexer::Tmux,
             projects: vec![],
@@ -172,6 +173,7 @@ mod tests {
     fn ws_with_kinds(sessions: Vec<(&str, Option<SessionKind>)>) -> Workspace {
         Workspace {
             name: "x".into(),
+            id: None,
             file_path: None,
             multiplexer: Multiplexer::Tmux,
             projects: vec![],

@@ -54,6 +54,12 @@ pub struct GlobalWorkspaceEntry {
 pub struct WorkspaceFile {
     pub name: String,
 
+    /// Stable identity that survives folder moves and cross-env access.
+    /// Auto-generated UUIDv4 on `pa init`; older files without one
+    /// continue to work — the field is purely additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
     /// Overrides the global default. `None` → inherit global.
     #[serde(default)]
     pub multiplexer: Option<Multiplexer>,

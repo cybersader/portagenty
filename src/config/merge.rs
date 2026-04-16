@@ -143,6 +143,7 @@ pub fn merge(
 
     Ok(Workspace {
         name: workspace_file.name.clone(),
+        id: workspace_file.id.clone(),
         file_path: Some(workspace_file_path.to_path_buf()),
         multiplexer,
         projects,
@@ -200,6 +201,7 @@ mod tests {
         let ws_path = PathBuf::from("/ws/example.portagenty.toml");
         let wf = WorkspaceFile {
             name: "ex".into(),
+            id: None,
             multiplexer: None,
             projects: vec!["/p".into()],
             sessions: vec![session("s1", "/abs", "echo 1")],
@@ -219,6 +221,7 @@ mod tests {
         let ws_path = PathBuf::from("/ws/example.portagenty.toml");
         let wf = WorkspaceFile {
             name: "ex".into(),
+            id: None,
             multiplexer: None,
             projects: vec!["/p".into()],
             sessions: vec![session("shared", "/abs", "workspace-version")],
@@ -248,6 +251,7 @@ mod tests {
         let ws_path = PathBuf::from("/ws/example.portagenty.toml");
         let wf_empty = WorkspaceFile {
             name: "ex".into(),
+            id: None,
             multiplexer: None,
             projects: vec![],
             sessions: vec![],
@@ -286,6 +290,7 @@ mod tests {
         let ws_path = PathBuf::from("/ws/example.portagenty.toml");
         let wf = WorkspaceFile {
             name: "ex".into(),
+            id: None,
             multiplexer: None,
             projects: vec!["/real/project".into()],
             sessions: vec![],

@@ -168,6 +168,12 @@ real projects:
   file that isn't in the global registry (e.g. the user moved the
   folder), it's silently re-registered so the picker sees it next
   time. Makes folder moves transparent without manual config fixes.
+- **Stable workspace `id` field.** Every new workspace TOML gets an
+  auto-generated UUIDv4 `id` field. Optional — old files without
+  one keep working. The ID is committed, survives git clone and
+  machine migration, and gives external tools (like
+  `claudecode-project-sync`) a path-independent handle to track a
+  workspace across folder moves and environments. See DESIGN §11.
 
 ### Still to ship (rough priority order)
 
@@ -300,7 +306,7 @@ These are plausibly valuable, but we're committing to not thinking about them un
 - **Agent adapter plugin runtime.** A formal extension mechanism so third parties can add `kind:` handlers without patching the core.
 - **Remote-machine awareness.** portagenty as a multi-host tool. Currently: SSH in and run `pa` there.
 - **Scaffolding hooks.** A `pa new` subcommand that shells out to a purpose-built project scaffolder.
-- **Claude-sessions cross-environment sync.** Either (a) a `pa` plugin that consumes a sync tool, or (b) a documented recommendation pointing at the best-in-class standalone tool. Not owned by the core, but worth a slot here so it doesn't fall off the radar. See `DESIGN.md` §11.
+- **Claude-sessions cross-environment sync.** The stable workspace `id` field (v1.x) provides the anchor. The actual sync logic lives in `claudecode-project-sync` (agentic-workflow-and-tech-stack repo). A future `pa` plugin could consume that tool automatically, but the core deliberately doesn't embed sync logic. See `DESIGN.md` §11.
 - **Session override layer.** A clean way to commit a workspace file while keeping machine-specific path overrides local.
 - **Session dependencies / DAG.** "Start B only after A is attached." Interesting, but risks scope explosion.
 - **Multi-workspace views.** A meta-view that spans workspaces (e.g. "all my claude sessions across workspaces").

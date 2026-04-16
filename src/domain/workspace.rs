@@ -28,6 +28,12 @@ pub enum Multiplexer {
 pub struct Workspace {
     pub name: String,
 
+    /// Stable identity that survives folder moves and cross-env access.
+    /// Threaded through from the workspace TOML's `id` field. `None`
+    /// for old workspaces that predate the field or synthetic browse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
     /// The workspace file this was loaded from, if any. `None` when the
     /// workspace was synthesized from the global registry + per-project
     /// tier with no explicit `*.portagenty.toml` in the mix.
@@ -83,6 +89,7 @@ mod tests {
     fn workspace_round_trip_minimal() {
         let w = Workspace {
             name: "Agentic stuff".into(),
+            id: None,
             file_path: None,
             multiplexer: Multiplexer::Tmux,
             projects: vec![],
@@ -97,6 +104,7 @@ mod tests {
     fn workspace_round_trip_with_sessions() {
         let w = Workspace {
             name: "Agentic stuff".into(),
+            id: None,
             file_path: Some(PathBuf::from("/home/u/ws/agentic.portagenty.toml")),
             multiplexer: Multiplexer::Tmux,
             projects: vec![PathBuf::from("/home/u/code/portagenty")],

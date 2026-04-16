@@ -122,12 +122,14 @@ pub fn render_toml_body(display_name: &str, mpx: Multiplexer, with_claude: bool)
         Multiplexer::Wezterm => "wezterm",
     };
     let name_lit = toml_basic_string(display_name);
+    let id = uuid::Uuid::new_v4();
     let mut out = String::with_capacity(256);
     out.push_str(
         "# Workspace file for portagenty. See:\n\
          # https://cybersader.github.io/portagenty/reference/schema/\n",
     );
     out.push_str(&format!("name = {name_lit}\n"));
+    out.push_str(&format!("id = \"{id}\"\n"));
     out.push_str(&format!("multiplexer = \"{mpx_wire}\"\n\n"));
     out.push_str(
         "[[session]]\nname = \"shell\"\ncwd = \".\"\ncommand = \"bash\"\nkind = \"shell\"\n",

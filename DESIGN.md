@@ -283,17 +283,59 @@ A primary access path for this tool is **Termux on Android → SSH → desktop �
 
 The net effect: a TUI that feels generous on a desktop but remains one-handed-on-a-phone usable over SSH. That's the bar.
 
-## 11. WSL ↔ native Windows sync — scope
+## 11. Agent context persistence and cross-environment sync
 
-Claude Code stores its sessions under `~/.claude/projects/<path-encoded-cwd>/`, where the encoding differs between environments (`-mnt-c-Users-X-project` on WSL, `C--Users-X-project` on PowerShell). `--resume` and `--continue` only find sessions from the current environment's encoding. Similarly, portagenty's global config under `$XDG_CONFIG_HOME/portagenty/` resolves to different paths on WSL vs. Windows native.
+### The two problems
 
-**portagenty's position**:
+1. **Folder moves break agent context.** Claude Code stores
+   conversations at `~/.claude/projects/<path-encoded-cwd>/`. Move
+   a project folder and the encoded path changes — `--continue`
+   can't find old sessions. portagenty's walk-up and auto-re-register
+   handle the *workspace* side transparently, but Claude Code's own
+   context storage is keyed to the old path.
 
-- **Workspace files and per-project `portagenty.toml` are designed to commit** and use relative paths (§2, §3). They cross environments trivially via git. No sync work needed there.
-- **Global config is machine-local by design.** Users who want the same registry across WSL and Windows native handle it themselves (Syncthing, dotfiles repo, symlink into a shared mount). Portagenty does not ship a sync daemon.
-- **Claude-session sync is not portagenty's problem to solve.** It's a Claude Code storage concern. If/when a tool solves it well, portagenty can reference it from docs but never embeds the logic.
+2. **WSL vs Windows path encoding divergence.** The same project at
+   `/mnt/c/Users/X/code/proj` (WSL) vs `C:\Users\X\code\proj`
+   (PowerShell) produces two different Claude context directories.
+   Context is siloed per environment.
 
-A **future `kind:` hint plus adapter** (see §7 and ROADMAP v2+) could, in principle, know how to present "your most-recent Claude session from the other environment" — but that's a consumer of whatever cross-env session sync tool exists, not a replacement for it. Path-encoding translation belongs in a purpose-built tool like `claudecode-project-sync` (in `agentic-workflow-and-tech-stack`) or a successor that's had more eyes on it than we have.
+### What portagenty does
+
+- **Stable workspace `id` field.** Every workspace TOML created by
+  `pa init` / the onboarding wizard / the in-TUI scaffold flow now
+  includes an `id` field (UUIDv4). The field is optional — old
+  workspaces without one continue to work unchanged. The ID is
+  committed alongside the file, survives git clone and machine
+  migration, and gives external tools a path-independent handle to
+  track a workspace across folder moves and environments.
+
+- **Workspace files are designed to commit** and use relative paths
+  (§2, §3). They cross environments trivially via git.
+
+- **Global config is machine-local by design.** Users who want the
+  same registry across WSL and Windows native handle it themselves
+  (Syncthing, dotfiles repo, symlink into a shared mount).
+  portagenty does not ship a sync daemon.
+
+### What portagenty does NOT do
+
+portagenty does not read, write, or sync Claude Code's conversation
+storage. The `id` field is a stable anchor that external tools can
+use; the actual context bridging (symlinks, copies, or future Claude
+Code-native solutions) belongs outside the launcher.
+
+### External tools
+
+- **`claudecode-project-sync`** (in `agentic-workflow-and-tech-stack`
+  repo, `tools/claudecode-project-sync/`). A ~270-line Python script
+  that creates symlinks between WSL-encoded and Windows-encoded
+  Claude project dirs. Handles cross-environment context sharing.
+  Does not yet handle folder moves — the workspace `id` field makes
+  that possible in a future version.
+
+- If Claude Code adds native project-ID or path-migration support,
+  the `id` field becomes redundant for that use case but remains
+  useful as a general workspace identity anchor.
 
 ## 12. Entry-point behavior — what `pa` does from any directory
 

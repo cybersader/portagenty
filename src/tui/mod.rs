@@ -253,6 +253,7 @@ fn synthetic_browse_workspace() -> Result<crate::domain::Workspace> {
         });
     Ok(crate::domain::Workspace {
         name: "(no workspace — live sessions)".into(),
+        id: None,
         file_path: None,
         multiplexer: mpx,
         projects: vec![],

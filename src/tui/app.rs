@@ -1248,6 +1248,7 @@ mod tests {
     fn sample_workspace(name: &str, sessions: usize) -> Workspace {
         Workspace {
             name: name.into(),
+            id: None,
             file_path: None,
             multiplexer: MpxEnum::Tmux,
             projects: vec![],
@@ -1379,6 +1380,7 @@ mod tests {
     fn renders_session_cwd_and_command_alongside_name() {
         let ws = Workspace {
             name: "x".into(),
+            id: None,
             file_path: None,
             multiplexer: MpxEnum::Tmux,
             projects: vec![],
@@ -1838,6 +1840,7 @@ mod tests {
     fn ws_with_kinds(items: Vec<(&str, Option<crate::domain::SessionKind>)>) -> Workspace {
         Workspace {
             name: "x".into(),
+            id: None,
             file_path: None,
             multiplexer: MpxEnum::Tmux,
             projects: vec![],

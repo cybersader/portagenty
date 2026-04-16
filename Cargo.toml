@@ -38,6 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # candidate folders against the user's query. Tiny — keeps the
 # single-static-binary contract intact.
 nucleo-matcher = "0.3"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 insta = "1.41"

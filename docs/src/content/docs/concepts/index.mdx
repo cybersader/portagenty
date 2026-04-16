@@ -292,6 +292,33 @@ in the global `[[workspace]]` registry, it silently appends the new
 path. This makes folder moves transparent: you don't need to
 manually re-register a workspace after moving its parent directory.
 
+## Agent context persistence
+
+<Aside type="caution">
+This is a known limitation of path-based agent storage, not a
+portagenty bug. portagenty provides the stable `id` field as an
+anchor; the actual context bridging lives in external tools.
+</Aside>
+
+Claude Code stores conversations at
+`~/.claude/projects/<path-encoded-cwd>/`. Two scenarios break this:
+
+- **Folder moves** — move a project and the encoded path changes.
+  `--continue` can't find old sessions.
+- **WSL vs Windows** — the same project gets different encoded paths
+  in each environment. Context is siloed.
+
+portagenty helps by shipping a **stable `id` field** (UUIDv4) in
+every new workspace TOML. The ID is committed, survives git clone,
+and gives external tools a path-independent handle. The
+`claudecode-project-sync` tool (in the
+[agentic-workflow-and-tech-stack](https://github.com/cybersader/agentic-workflow-and-tech-stack)
+repo) uses symlinks to bridge WSL and Windows context directories.
+
+If Claude Code adds native project-ID or path-migration support,
+the `id` field becomes redundant for that use case but remains
+useful as a general workspace identity anchor.
+
 ## Pre-launch banner
 
 When you press Enter to attach, `pa` restores your terminal and

@@ -187,6 +187,7 @@ mod tests {
     fn ws_with(sessions: Vec<Session>) -> Workspace {
         Workspace {
             name: "Demo".into(),
+            id: None,
             file_path: None,
             multiplexer: Multiplexer::Tmux,
             projects: vec![],
