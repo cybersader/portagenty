@@ -85,14 +85,143 @@ pub struct FindOpts {
 
 impl Default for FindOpts {
     fn default() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
         Self {
-            roots: vec![home],
+            roots: default_roots(),
             max_depth: 6,
             limit: 30,
         }
+    }
+}
+
+/// Compute the default search-root list. Always includes `$HOME`.
+/// On WSL the user's projects often live under
+/// `/mnt/c/Users/<user>/...` (Documents, Desktop, code, etc.) —
+/// `$HOME` never reaches there. We auto-detect WSL via
+/// `/proc/version` containing "microsoft" (case-insensitive) and
+/// add `/mnt/c/Users/<windows-user>` as an extra root, deduped.
+///
+/// `$PORTAGENTY_SEARCH_ROOTS` (colon-separated list, like `$PATH`)
+/// overrides the defaults entirely so power users can pin exactly
+/// where the finder walks. Useful for projects on external mounts
+/// or non-standard layouts.
+pub fn default_roots() -> Vec<PathBuf> {
+    if let Ok(env_roots) = std::env::var("PORTAGENTY_SEARCH_ROOTS") {
+        let parsed: Vec<PathBuf> = std::env::split_paths(&env_roots)
+            .filter(|p| p.is_dir())
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if home.is_dir() {
+            roots.push(home);
+        }
+    }
+    if is_wsl() {
+        if let Some(win_users_root) = wsl_windows_user_dir() {
+            if win_users_root.is_dir() && !roots.iter().any(|r| r == &win_users_root) {
+                roots.push(win_users_root);
+            }
+        }
+    }
+    if roots.is_empty() {
+        roots.push(PathBuf::from("."));
+    }
+    roots
+}
+
+/// Detect WSL by reading `/proc/version`. Best-effort — anything
+/// that looks like the Microsoft-built kernel string counts.
+pub fn is_wsl() -> bool {
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        return true;
+    }
+    if let Ok(s) = std::fs::read_to_string("/proc/version") {
+        return s.to_lowercase().contains("microsoft");
+    }
+    false
+}
+
+/// Best-effort guess at the Windows user's home dir from inside
+/// WSL. Reads `$USER` and looks at `/mnt/c/Users/<user>`. Falls
+/// back to the first existing entry under `/mnt/c/Users/` if
+/// `$USER` doesn't match a folder there.
+fn wsl_windows_user_dir() -> Option<PathBuf> {
+    let users_root = PathBuf::from("/mnt/c/Users");
+    if !users_root.is_dir() {
+        return None;
+    }
+    if let Ok(user) = std::env::var("USER") {
+        let candidate = users_root.join(&user);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        // Common case: WSL $USER is lowercase but the Windows user
+        // dir is title-case. Try matching case-insensitively.
+        if let Ok(entries) = std::fs::read_dir(&users_root) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.eq_ignore_ascii_case(&user) {
+                    return Some(e.path());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Probe which search backends are available on this machine.
+/// Used by the TUI to surface a "via tool" hint in the search
+/// overlay's title — so the user can tell at a glance whether
+/// fd / zoxide / plocate are contributing or not.
+#[derive(Debug, Clone, Default)]
+pub struct BackendAvailability {
+    pub recency: bool,
+    pub zoxide: bool,
+    pub locate: bool,
+    pub fd: bool,
+    pub walk: bool,
+}
+
+impl BackendAvailability {
+    pub fn probe() -> Self {
+        Self {
+            // Recency is always populated from state.toml (which
+            // may be empty on a brand-new install — that's fine,
+            // just no recents to show).
+            recency: true,
+            zoxide: shell::on_path("zoxide"),
+            locate: shell::on_path("plocate")
+                || shell::on_path("locate")
+                || shell::on_path("es.exe"),
+            fd: shell::on_path("fd"),
+            walk: true,
+        }
+    }
+
+    /// Compact one-liner like `recents · zoxide · fd · scan` for
+    /// the search overlay's title bar.
+    pub fn one_liner(&self) -> String {
+        let mut parts: Vec<&'static str> = Vec::with_capacity(5);
+        if self.recency {
+            parts.push("recents");
+        }
+        if self.zoxide {
+            parts.push("zoxide");
+        }
+        if self.locate {
+            parts.push("locate");
+        }
+        if self.fd {
+            parts.push("fd");
+        }
+        if self.walk {
+            parts.push("scan");
+        }
+        parts.join(" · ")
     }
 }
 

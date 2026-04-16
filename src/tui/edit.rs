@@ -167,7 +167,10 @@ pub fn handle_key(state: &mut EditState, code: KeyCode, mods: KeyModifiers) -> E
             };
             match k {
                 Some(kind) => {
-                    let op = crate::cli::EditOp { kind: Some(kind), ..Default::default() };
+                    let op = crate::cli::EditOp {
+                        kind: Some(kind),
+                        ..Default::default()
+                    };
                     EditOutcome::Apply(op)
                 }
                 None => EditOutcome::Continue,
@@ -209,7 +212,10 @@ pub fn handle_key(state: &mut EditState, code: KeyCode, mods: KeyModifiers) -> E
                 }
                 match action {
                     EnvAction::Unset => {
-                        let op = crate::cli::EditOp { env_unset: vec![input.clone()], ..Default::default() };
+                        let op = crate::cli::EditOp {
+                            env_unset: vec![input.clone()],
+                            ..Default::default()
+                        };
                         EditOutcome::Apply(op)
                     }
                     EnvAction::Set => {
@@ -239,7 +245,10 @@ pub fn handle_key(state: &mut EditState, code: KeyCode, mods: KeyModifiers) -> E
                 EditOutcome::Continue
             }
             KeyCode::Enter => {
-                let op = crate::cli::EditOp { env_set: vec![(key.clone(), input.clone())], ..Default::default() };
+                let op = crate::cli::EditOp {
+                    env_set: vec![(key.clone(), input.clone())],
+                    ..Default::default()
+                };
                 EditOutcome::Apply(op)
             }
             _ => EditOutcome::Continue,

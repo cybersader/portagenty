@@ -23,7 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::find::{find_candidates, Candidate, FindOpts};
+use crate::find::{find_candidates, BackendAvailability, Candidate, FindOpts};
 
 /// What the picker should do after a key press inside the search
 /// overlay. Mirrors the picker's normal action vocabulary so the
@@ -58,7 +58,15 @@ pub struct SearchState {
     /// Highlighted index into `candidates`. Wraps on under/overflow.
     pub selected: usize,
     /// Knobs passed to the find pipeline (roots, depth, limit).
+    /// Mutable so the user can drill into a highlighted folder
+    /// via `>` (search-from-here) and the new root takes effect on
+    /// the next refresh.
     opts: FindOpts,
+    /// Probed availability of fd / zoxide / plocate / etc. Cached
+    /// once at overlay open time; surfaces as a hint in the title
+    /// bar so users can tell which tools are actually contributing
+    /// to the result set.
+    backends: BackendAvailability,
     /// `ListState` for the candidate list widget. Tracks viewport
     /// scrolling so long lists don't push the selection off-screen.
     list_state: ListState,
@@ -71,6 +79,7 @@ impl Default for SearchState {
             candidates: Vec::new(),
             selected: 0,
             opts: FindOpts::default(),
+            backends: BackendAvailability::probe(),
             list_state: ListState::default(),
         };
         s.refresh();
@@ -134,6 +143,25 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             None => SearchOutcome::Continue,
             Some(c) => classify_pick(&c.path),
         },
+        // `>` drills into the highlighted folder: pivots the
+        // search root to that path, clears the input, and refreshes.
+        // Lets users jump from "give me everything under $HOME" to
+        // "give me everything under ~/code" with one keystroke.
+        (KeyCode::Char('>'), _) => {
+            if let Some(c) = state.highlighted() {
+                state.opts.roots = vec![c.path.clone()];
+                state.input.clear();
+                state.refresh();
+            }
+            SearchOutcome::Continue
+        }
+        // `<` pops back to the default roots if you over-drilled.
+        (KeyCode::Char('<'), _) => {
+            state.opts.roots = crate::find::default_roots();
+            state.input.clear();
+            state.refresh();
+            SearchOutcome::Continue
+        }
         (KeyCode::Char(ch), _) => {
             state.input.push(ch);
             state.refresh();
@@ -188,8 +216,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
 
     frame.render_widget(Clear, region);
 
+    // Title bar conveys two things: the active backend cohort
+    // (so users know which tools are in the mix) and the current
+    // search root(s) (so a `>`-drill is obvious from a glance).
+    let backends_str = state.backends.one_liner();
+    let roots_str = compact_roots(&state.opts.roots);
+    let title = format!(" find folder · backends: {backends_str} · roots: {roots_str} ");
     let outer = Block::default()
-        .title(" find folder for new workspace ")
+        .title(title)
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -262,10 +296,30 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     }
 
     // Bottom hint.
-    let hint =
-        Paragraph::new(" Enter open / scaffold · Esc cancel · ↑/↓ nav · Ctrl+U clear · ? help ")
-            .style(Style::default().add_modifier(Modifier::DIM));
+    let hint = Paragraph::new(
+        " Enter open/scaffold · > drill in · < reset roots · Esc cancel · ↑/↓ nav · ? help ",
+    )
+    .style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(hint, chunks[3]);
+}
+
+/// Render `roots` compactly for the title bar — replace `$HOME`
+/// with `~`, join with " + ", truncate the whole thing to ~40 chars.
+fn compact_roots(roots: &[PathBuf]) -> String {
+    if roots.is_empty() {
+        return "(none)".to_string();
+    }
+    let pieces: Vec<String> = roots
+        .iter()
+        .map(|p| compact_home(&p.display().to_string()))
+        .collect();
+    let joined = pieces.join(" + ");
+    if joined.chars().count() > 40 {
+        let head: String = joined.chars().take(38).collect();
+        format!("{head}…")
+    } else {
+        joined
+    }
 }
 
 fn candidate_item(c: &Candidate, width: u16) -> ListItem<'static> {
@@ -363,6 +417,7 @@ mod tests {
                 max_depth: 0,
                 limit: 30,
             },
+            backends: BackendAvailability::default(),
             list_state: ListState::default(),
         };
         s.list_state.select(Some(0));
