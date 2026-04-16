@@ -255,6 +255,55 @@ real projects:
     alongside (A) as an ergonomic bonus. **(C)** is deferred
     unless demand justifies the complexity.
 
+14. **Session-name namespacing (collision bug).** All workspaces
+    scaffold sessions with generic names like `"shell"` and
+    `"claude"`. The multiplexer doesn't namespace them — `zellij
+    attach --create shell` attaches to whichever `shell` session
+    exists, regardless of which workspace created it. If you have
+    cyberchaste and dataflowy both with a `"shell"` session, opening
+    cyberchaste's shell might land you in dataflowy's session (or
+    vice versa) because the mpx sees them as the same name.
+
+    **The problem**: `mux::sanitize_session_name` produces the mpx
+    session name from the session's declared `name` field. Two
+    workspaces with `name = "shell"` produce the same mpx name
+    `"shell"`. There's no workspace prefix, no hash suffix, no
+    disambiguation.
+
+    **Fix options**:
+
+    **(A) Prefix with workspace name.** Sanitized mpx name becomes
+    `<workspace>-<session>`, e.g. `cyberchaste-shell`,
+    `dataflowy-shell`. Simple, readable in `tmux list-sessions` /
+    `zellij list-sessions`. Breaks existing sessions (they'd need
+    to be killed and recreated). The TUI's session-list display
+    name stays unprefixed (user sees "shell", mpx sees
+    "cyberchaste-shell").
+
+    **(B) Hash suffix.** Append a short hash of the workspace file
+    path to the session name: `shell-a3f2`. Less readable but
+    guarantees uniqueness even across workspaces with the same name.
+
+    **(C) Workspace-scoped mpx sessions.** Use tmux's `-L` /
+    zellij's `--session` to scope sessions per workspace. Each
+    workspace gets its own tmux socket / zellij session group.
+    Clean isolation but makes `pa list` and untracked adoption
+    more complex (need to probe multiple sockets).
+
+    **Recommended**: **(A)** — simple, solves 99% of collisions,
+    human-readable. Migrate existing sessions by killing and
+    re-creating on first launch after the change.
+
+15. **CWD edit should use the find/tree browser.** The `e → c`
+    (edit cwd) flow currently asks for a raw text path via a tiny
+    input box. This is confusing — editing a cwd is fundamentally
+    "point me at a folder," which is what the find overlay and tree
+    browser were built for. The edit-cwd flow should open the same
+    find/tree interface, with the current cwd as the starting root,
+    and on selection write the chosen path back to the session's
+    `cwd` field. Same UX as the `n` (new workspace) flow but
+    targeting an existing session's cwd instead of scaffolding.
+
 ---
 
 ## v2+ — Parked
