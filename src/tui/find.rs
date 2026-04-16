@@ -87,6 +87,18 @@ pub struct SearchState {
     /// the path is too long to fit, segments rotate upward from
     /// the leaf toward the root. Resets to 0 when the root changes.
     anim_offset: usize,
+    /// When Some, a full-path modal is overlaid on the search
+    /// showing the highlighted candidate's complete path with
+    /// auto-copy. Any key dismisses.
+    fullscreen_path: Option<FullscreenPath>,
+}
+
+/// Full-path expand modal content. Built on `f` press, dismissed
+/// on any keypress.
+#[derive(Debug, Clone)]
+struct FullscreenPath {
+    title: String,
+    lines: Vec<Line<'static>>,
 }
 
 impl std::fmt::Debug for SearchState {
@@ -131,6 +143,7 @@ impl Default for SearchState {
             scanning: true,
             anim_tick: 0,
             anim_offset: 0,
+            fullscreen_path: None,
         };
         s.rerank();
         s
@@ -295,6 +308,11 @@ fn spawn_bg_walk(opts: FindOpts) -> mpsc::Receiver<Vec<PathBuf>> {
 /// should take. Pure dispatch — the caller is responsible for the
 /// terminal redraw.
 pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) -> SearchOutcome {
+    // Full-path modal: any key dismisses. No passthrough.
+    if state.fullscreen_path.is_some() {
+        state.fullscreen_path = None;
+        return SearchOutcome::Continue;
+    }
     match (code, mods) {
         (KeyCode::Esc, _) => SearchOutcome::Cancel,
         (KeyCode::Char('?'), _) => SearchOutcome::OpenHelp,
@@ -370,10 +388,18 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             state.restart_walk();
             SearchOutcome::Continue
         }
+        // Ctrl+F: expand the highlighted candidate's full path into
+        // a modal overlay with auto-copy. Any key dismisses. Using
+        // Ctrl+F instead of bare 'f' so the user can still type 'f'
+        // in their search query.
+        (KeyCode::Char('f'), m) if m.contains(KeyModifiers::CONTROL) => {
+            if let Some(c) = state.highlighted() {
+                state.fullscreen_path = Some(build_fullscreen_path(&c.path));
+            }
+            SearchOutcome::Continue
+        }
         (KeyCode::Char(ch), _) => {
             state.input.push(ch);
-            // Re-rank only — never re-walk on a keystroke. The
-            // background thread feeds new dirs; nucleo ranks them.
             state.rerank();
             SearchOutcome::Continue
         }
@@ -522,10 +548,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     }
 
     // Bottom hint.
-    let hint =
-        Paragraph::new(" Enter open · > drill in · < go up · Ctrl+R reset · Esc cancel · ↑/↓ nav ")
-            .style(Style::default().add_modifier(Modifier::DIM));
+    let hint = Paragraph::new(
+        " Enter open · > drill · < up · Ctrl+F path · Ctrl+R reset · Esc cancel · ↑/↓ nav ",
+    )
+    .style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(hint, chunks[3]);
+
+    // Full-path modal renders on top of everything when active.
+    if let Some(fp) = &state.fullscreen_path {
+        crate::tui::confirm::render_info(frame, area, &fp.title, fp.lines.clone());
+    }
 }
 
 /// Render `roots` compactly for the title bar — replace `$HOME`
@@ -814,6 +846,66 @@ fn render_animated_breadcrumb(
     Line::from(spans)
 }
 
+/// Build the full-path expand modal. Chunks the path into clean
+/// lines, auto-copies to clipboard, and formats the result.
+fn build_fullscreen_path(path: &Path) -> FullscreenPath {
+    const CHUNK_W: usize = 52;
+    let path_str = path.display().to_string();
+    let copy_result = crate::clipboard::copy(&path_str);
+    let copy_line = match copy_result {
+        Ok(tool) => Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "✓ copied",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" to clipboard via `{tool}`")),
+        ]),
+        Err(e) => Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "couldn't copy:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                e.to_string().lines().next().unwrap_or("").to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(8);
+    lines.push(Line::raw(""));
+    let chars: Vec<char> = path_str.chars().collect();
+    for chunk in chars.chunks(CHUNK_W.max(1)) {
+        let s: String = chunk.iter().collect();
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(s, Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(copy_line);
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "Any key closes.",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]));
+
+    FullscreenPath {
+        title: "Full path".into(),
+        lines,
+    }
+}
+
 fn compact_home(p: &str) -> String {
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
@@ -885,6 +977,7 @@ mod tests {
             scanning: false,
             anim_tick: 0,
             anim_offset: 0,
+            fullscreen_path: None,
         };
         s.list_state.select(Some(0));
         s
