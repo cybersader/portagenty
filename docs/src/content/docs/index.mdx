@@ -16,34 +16,73 @@ hero:
 
 import { Card, CardGrid, Code, Tabs, TabItem, Aside, Steps } from "@astrojs/starlight/components";
 
-```
-                        ┌──────────────────────────────────┐
-                        │          portagenty (pa)         │
-                        │   portable agent workspace TUI   │
-                        └──────────┬───────────────────────┘
-                                   │
-              ┌────────────────────┼────────────────────┐
-              ▼                    ▼                     ▼
-     ┌────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-     │  Workspace      │  │  Workspace      │  │  Live sessions  │
-     │  cyberchaste    │  │  dataflowy      │  │  (untracked)    │
-     └───────┬────────┘  └───────┬─────────┘  └───────┬─────────┘
-             │                   │                     │
-        ┌────┴────┐         ┌────┴────┐               │
-        ▼         ▼         ▼         ▼               ▼
-    ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐     ┌───────────┐
-    │claude │ │ shell │ │ dev   │ │ tests │     │ mystery   │
-    │  [C]  │ │       │ │  [D]  │ │       │     │   [?]     │
-    └───┬───┘ └───┬───┘ └───┬───┘ └───┬───┘     └─────┬─────┘
-        └─────────┴─────────┴─────────┴───────────────┘
-                              │
-                    ┌─────────┴─────────┐
-                    ▼                   ▼
-               ┌─────────┐       ┌──────────┐
-               │  tmux   │       │  zellij  │
-               │ adapter │       │ adapter  │
-               └─────────┘       └──────────┘
-```
+## The problem
+
+<div style="display: flex; flex-direction: column; gap: 1.5rem; margin: 1.5rem 0;">
+  <div style="border: 2px solid var(--sl-color-red); border-radius: 12px; padding: 1.25rem 1.5rem; background: var(--sl-color-red-low);">
+    <div style="font-weight: 700; font-size: 1.05rem; margin-bottom: 0.75rem; color: var(--sl-color-red-high);">Filesystem: one parent per project</div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem; text-align: center; font-size: 0.85rem;">
+      <div style="background: var(--sl-color-gray-6); border-radius: 8px; padding: 0.5rem;">
+        <div style="opacity: 0.6;">{`~/code/`}</div>
+        <div style="display: flex; flex-direction: column; gap: 0.25rem; margin-top: 0.4rem;">
+          <div style="background: var(--sl-color-gray-5); border-radius: 4px; padding: 0.25rem;">portagenty</div>
+          <div style="background: var(--sl-color-gray-5); border-radius: 4px; padding: 0.25rem;">cyberbase</div>
+          <div style="background: var(--sl-color-gray-5); border-radius: 4px; padding: 0.25rem;">crosswalker</div>
+        </div>
+      </div>
+      <div style="background: var(--sl-color-gray-6); border-radius: 8px; padding: 0.5rem;">
+        <div style="opacity: 0.6;">{`~/work/`}</div>
+        <div style="display: flex; flex-direction: column; gap: 0.25rem; margin-top: 0.4rem;">
+          <div style="background: var(--sl-color-gray-5); border-radius: 4px; padding: 0.25rem;">client-app</div>
+          <div style="background: var(--sl-color-gray-5); border-radius: 4px; padding: 0.25rem;">api-server</div>
+        </div>
+      </div>
+      <div style="background: var(--sl-color-gray-6); border-radius: 8px; padding: 0.5rem;">
+        <div style="opacity: 0.6;">{`~/learn/`}</div>
+        <div style="display: flex; flex-direction: column; gap: 0.25rem; margin-top: 0.4rem;">
+          <div style="background: var(--sl-color-gray-5); border-radius: 4px; padding: 0.25rem;">rust-book</div>
+          <div style="background: var(--sl-color-gray-5); border-radius: 4px; padding: 0.25rem;">ml-sandbox</div>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top: 0.75rem; font-size: 0.85rem; opacity: 0.8; text-align: center;">
+      Every project stuck in <strong>one</strong> parent directory. No cross-cutting views.
+      <br/>Want "all my agentic projects"? You <code>cd</code> between three different folders.
+    </div>
+  </div>
+
+  <div style="text-align: center; font-size: 1.5rem; opacity: 0.5;">
+    portagenty adds a layer on top
+  </div>
+
+  <div style="border: 2px solid var(--sl-color-green); border-radius: 12px; padding: 1.25rem 1.5rem; background: var(--sl-color-green-low);">
+    <div style="font-weight: 700; font-size: 1.05rem; margin-bottom: 0.75rem; color: var(--sl-color-green-high);">Workspaces: many views, nothing moves</div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; font-size: 0.85rem;">
+      <div style="background: var(--sl-color-gray-6); border-radius: 8px; padding: 0.75rem;">
+        <div style="font-weight: 600; margin-bottom: 0.4rem;">agentic.portagenty.toml</div>
+        <div style="display: flex; flex-direction: column; gap: 0.2rem; opacity: 0.85;">
+          <div>{`~/code/`}<strong>portagenty</strong></div>
+          <div>{`~/work/`}<strong>api-server</strong></div>
+          <div>{`~/learn/`}<strong>ml-sandbox</strong></div>
+        </div>
+        <div style="margin-top: 0.4rem; opacity: 0.6; font-size: 0.8rem;">Projects from 3 different parent dirs</div>
+      </div>
+      <div style="background: var(--sl-color-gray-6); border-radius: 8px; padding: 0.75rem;">
+        <div style="font-weight: 600; margin-bottom: 0.4rem;">client-work.portagenty.toml</div>
+        <div style="display: flex; flex-direction: column; gap: 0.2rem; opacity: 0.85;">
+          <div>{`~/work/`}<strong>client-app</strong></div>
+          <div>{`~/work/`}<strong>api-server</strong></div>
+          <div>{`~/code/`}<strong>crosswalker</strong></div>
+        </div>
+        <div style="margin-top: 0.4rem; opacity: 0.6; font-size: 0.8rem;">Same api-server, different context</div>
+      </div>
+    </div>
+    <div style="margin-top: 0.75rem; font-size: 0.85rem; opacity: 0.8; text-align: center;">
+      Projects stay where they are. Workspaces are <strong>views</strong> — recency, tags, curated groups.
+      <br/>The same project can appear in many workspaces.
+    </div>
+  </div>
+</div>
 
 ## Why
 
@@ -91,27 +130,11 @@ running; only the terminal attached to them changes.
     workspace-file lifecycle from the command line. Phone-keyboard
     friendly, comment-preserving.
   </Card>
-  <Card title="Bundled bash ergonomics" icon="puzzle">
-    `pa snippets install pa-aliases` drops curated, idempotent
-    shell snippets into your rc file. Short aliases, Termux-friendly
-    tweaks, all opt-in.
-  </Card>
-  <Card title="Committable layouts" icon="document">
-    `pa export` renders your workspace as a tmux starter script or
-    zellij KDL layout. Commit it; teammates launch without needing
-    `pa` installed.
-  </Card>
   <Card title="Find folder + scaffold" icon="magnifier">
     Press `n` in the workspace picker to fuzzy-search your filesystem
     for project folders. Tiered backends (recency, zoxide, plocate,
     fd, stdlib walker) ranked by nucleo. Pick a folder and `pa`
     scaffolds a workspace TOML on the spot.
-  </Card>
-  <Card title="Tree browser" icon="seti:folder">
-    Press `t` inside the find overlay to switch to a filesystem tree
-    view. Expand/collapse directories, navigate with arrow keys or
-    vim bindings, select a folder with Shift+Enter. Used for both new
-    workspace creation and CWD editing.
   </Card>
   <Card title="In-TUI session editing" icon="pencil">
     Press `e` on any session row to edit name, cwd, command, kind, or
@@ -119,25 +142,69 @@ running; only the terminal attached to them changes.
     find/tree browser. All changes are comment-preserving writes to
     your TOML file.
   </Card>
+  <Card title="Committable layouts" icon="document">
+    `pa export` renders your workspace as a tmux starter script or
+    zellij KDL layout. Commit it; teammates launch without needing
+    `pa` installed.
+  </Card>
+  <Card title="Bundled bash ergonomics" icon="puzzle">
+    `pa snippets install pa-aliases` drops curated, idempotent
+    shell snippets into your rc file. Short aliases, Termux-friendly
+    tweaks, all opt-in.
+  </Card>
+  <Card title="Tree browser" icon="seti:folder">
+    Press `t` inside the find overlay to switch to a filesystem tree
+    view. Expand/collapse directories, navigate with arrow keys or
+    vim bindings, select a folder with Shift+Enter.
+  </Card>
 </CardGrid>
 
 ## How it works
 
-```
-  ┌──────────┐  SSH   ┌──────────┐  SSH   ┌──────────┐
-  │  Phone   │───────▶│  Desktop │◀───────│  Laptop  │
-  │ (Termux) │        │ (server) │        │          │
-  └──────────┘        └─────┬────┘        └──────────┘
-                            │
-                     ┌──────┴──────┐
-                     │ tmux/zellij │  sessions persist
-                     │   sessions  │  across all devices
-                     ├─────────────┤
-                     │ ● claude    │  ← pa claim (takeover)
-                     │ ● dev       │  ← pa launch dev
-                     │ ○ tests     │  ← not started yet
-                     └─────────────┘
-```
+<div style="display: flex; flex-direction: column; gap: 1.5rem; margin: 1.5rem 0;">
+  {/* Devices row */}
+  <div style="display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 0; align-items: center; text-align: center;">
+    <div style="background: var(--sl-color-gray-6); border-radius: 10px; padding: 0.75rem;">
+      <div style="font-size: 1.5rem;">📱</div>
+      <div style="font-weight: 600; font-size: 0.85rem;">Phone</div>
+      <div style="font-size: 0.75rem; opacity: 0.7;">Termux + SSH</div>
+    </div>
+    <div style="font-size: 0.8rem; opacity: 0.5; padding: 0 0.5rem;">SSH</div>
+    <div style="background: var(--sl-color-blue-low); border: 2px solid var(--sl-color-blue); border-radius: 10px; padding: 0.75rem;">
+      <div style="font-size: 1.5rem;">🖥️</div>
+      <div style="font-weight: 600; font-size: 0.85rem;">Server</div>
+      <div style="font-size: 0.75rem; opacity: 0.7;">tmux / zellij</div>
+    </div>
+    <div style="font-size: 0.8rem; opacity: 0.5; padding: 0 0.5rem;">SSH</div>
+    <div style="background: var(--sl-color-gray-6); border-radius: 10px; padding: 0.75rem;">
+      <div style="font-size: 1.5rem;">💻</div>
+      <div style="font-weight: 600; font-size: 0.85rem;">Laptop</div>
+      <div style="font-size: 0.75rem; opacity: 0.7;">direct or SSH</div>
+    </div>
+  </div>
+
+  {/* Sessions box */}
+  <div style="border: 2px solid var(--sl-color-blue); border-radius: 12px; padding: 1rem 1.25rem; background: var(--sl-color-blue-low); max-width: 24rem; margin: 0 auto; width: 100%;">
+    <div style="font-weight: 700; text-align: center; margin-bottom: 0.75rem;">Sessions persist on the server</div>
+    <div style="display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.9rem; font-family: var(--sl-font-mono);">
+      <div style="display: flex; align-items: center; gap: 0.5rem;">
+        <span style="color: var(--sl-color-green);">●</span>
+        <span>claude</span>
+        <span style="margin-left: auto; opacity: 0.6; font-size: 0.8rem;">pa claim</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 0.5rem;">
+        <span style="color: var(--sl-color-green);">●</span>
+        <span>dev</span>
+        <span style="margin-left: auto; opacity: 0.6; font-size: 0.8rem;">pa launch dev</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 0.5rem;">
+        <span style="opacity: 0.4;">○</span>
+        <span style="opacity: 0.6;">tests</span>
+        <span style="margin-left: auto; opacity: 0.6; font-size: 0.8rem;">not started</span>
+      </div>
+    </div>
+  </div>
+</div>
 
 <Aside type="tip">
 Sessions live in the multiplexer, not in `pa`. When you close your
@@ -152,7 +219,7 @@ re-attaches and reshapes the terminal to the new screen size.
     ```sh
     # SSH into your desktop from your phone (Termux)
     ssh desktop
-    cd ~/code/new-project
+    cd {`~/code/`}new-project
 
     # Scaffold a workspace — no editor required
     pa init
@@ -198,37 +265,87 @@ re-attaches and reshapes the terminal to the new screen size.
 
 ### The navigation model
 
-```
-  ┌─────────────────────────────────────────────┐
-  │            Workspace Picker                  │
-  │  (home screen — Esc always returns here)     │
-  │                                              │
-  │   ▸ cyberchaste          2h ago              │
-  │     dataflowy            yesterday           │
-  │     live sessions on this machine            │
-  │                                              │
-  │  n: find   d: unregister   ?: help   q: quit │
-  └────────────────────┬────────────────────────-┘
-                       │ Enter
-                       ▼
-  ┌─────────────────────────────────────────────┐
-  │          Session List  [zellij]              │
-  │                                              │
-  │   ● claude  [C]         live · 1 client      │
-  │   ○ shell               idle                 │
-  │   ○ dev     [D]         idle                 │
-  │   ? mystery             untracked            │
-  │                                              │
-  │  e: edit   d: delete   x: kill   Esc: back   │
-  └────────────────────┬────────────────────────-┘
-                       │ Enter
-                       ▼
-  ┌─────────────────────────────────────────────┐
-  │   pa → zellij session "claude"               │
-  │         detach: Ctrl+O then d                │
-  │         re-attach: pa claim claude            │
-  └──────────────────────────────────────────────┘
-```
+<div style="display: flex; flex-direction: column; gap: 0; margin: 1.5rem 0; align-items: center;">
+  {/* Picker */}
+  <div style="border: 2px solid var(--sl-color-accent); border-radius: 12px; padding: 1rem 1.25rem; width: 100%; max-width: 32rem; background: var(--sl-color-accent-low);">
+    <div style="font-weight: 700; margin-bottom: 0.5rem;">Workspace Picker <span style="opacity: 0.5; font-weight: 400; font-size: 0.85rem;">— home screen, Esc always returns here</span></div>
+    <div style="font-family: var(--sl-font-mono); font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.25rem;">
+      <div style="display: flex; gap: 0.5rem;">
+        <span style="color: var(--sl-color-accent);">▸</span>
+        <span style="font-weight: 600;">cyberchaste</span>
+        <span style="margin-left: auto; opacity: 0.5;">2h ago</span>
+      </div>
+      <div style="display: flex; gap: 0.5rem; opacity: 0.7;">
+        <span>&nbsp;</span>
+        <span>dataflowy</span>
+        <span style="margin-left: auto; opacity: 0.5;">yesterday</span>
+      </div>
+      <div style="display: flex; gap: 0.5rem; opacity: 0.5;">
+        <span>&nbsp;</span>
+        <span style="font-style: italic;">live sessions on this machine</span>
+      </div>
+    </div>
+    <div style="margin-top: 0.5rem; font-size: 0.75rem; opacity: 0.6; border-top: 1px solid var(--sl-color-gray-5); padding-top: 0.4rem;">
+      n: find &nbsp; d: unregister &nbsp; ?: help &nbsp; q: quit
+    </div>
+  </div>
+
+  {/* Arrow */}
+  <div style="display: flex; flex-direction: column; align-items: center; padding: 0.25rem 0;">
+    <div style="width: 2px; height: 1rem; background: var(--sl-color-gray-4);"></div>
+    <div style="font-size: 0.75rem; opacity: 0.6; padding: 0.1rem 0;">Enter</div>
+    <div style="width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 8px solid var(--sl-color-gray-4);"></div>
+  </div>
+
+  {/* Session list */}
+  <div style="border: 2px solid var(--sl-color-blue); border-radius: 12px; padding: 1rem 1.25rem; width: 100%; max-width: 32rem; background: var(--sl-color-blue-low);">
+    <div style="display: flex; align-items: center; gap: 0.5rem; font-weight: 700; margin-bottom: 0.5rem;">
+      Session List
+      <span style="background: var(--sl-color-purple-low); color: var(--sl-color-purple-high); font-size: 0.7rem; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 600;">[zellij]</span>
+    </div>
+    <div style="font-family: var(--sl-font-mono); font-size: 0.85rem; display: flex; flex-direction: column; gap: 0.25rem;">
+      <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <span style="color: var(--sl-color-green);">●</span>
+        <span style="color: var(--sl-color-green);">claude</span>
+        <span style="color: var(--sl-color-blue); font-size: 0.75rem; font-weight: 700;">C</span>
+        <span style="margin-left: auto; opacity: 0.6; font-size: 0.8rem;">live &middot; 1 client</span>
+      </div>
+      <div style="display: flex; gap: 0.5rem; align-items: center; opacity: 0.5;">
+        <span>○</span>
+        <span>shell</span>
+        <span style="margin-left: auto; font-size: 0.8rem;">idle</span>
+      </div>
+      <div style="display: flex; gap: 0.5rem; align-items: center; opacity: 0.5;">
+        <span>○</span>
+        <span>dev</span>
+        <span style="color: var(--sl-color-green); font-size: 0.75rem; font-weight: 700;">D</span>
+        <span style="margin-left: auto; font-size: 0.8rem;">idle</span>
+      </div>
+      <div style="display: flex; gap: 0.5rem; align-items: center;">
+        <span style="color: var(--sl-color-orange);">?</span>
+        <span style="color: var(--sl-color-orange);">mystery</span>
+        <span style="margin-left: auto; opacity: 0.6; font-size: 0.8rem;">untracked</span>
+      </div>
+    </div>
+    <div style="margin-top: 0.5rem; font-size: 0.75rem; opacity: 0.6; border-top: 1px solid var(--sl-color-gray-5); padding-top: 0.4rem;">
+      e: edit &nbsp; d: delete &nbsp; x: kill &nbsp; Esc: back
+    </div>
+  </div>
+
+  {/* Arrow */}
+  <div style="display: flex; flex-direction: column; align-items: center; padding: 0.25rem 0;">
+    <div style="width: 2px; height: 1rem; background: var(--sl-color-gray-4);"></div>
+    <div style="font-size: 0.75rem; opacity: 0.6; padding: 0.1rem 0;">Enter</div>
+    <div style="width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 8px solid var(--sl-color-gray-4);"></div>
+  </div>
+
+  {/* Launch banner */}
+  <div style="border: 2px solid var(--sl-color-green); border-radius: 12px; padding: 0.75rem 1.25rem; width: 100%; max-width: 32rem; background: var(--sl-color-green-low); font-family: var(--sl-font-mono); font-size: 0.85rem;">
+    <div>pa → zellij session "claude"</div>
+    <div style="opacity: 0.7; padding-left: 1.5rem;">detach: Ctrl+O then d</div>
+    <div style="opacity: 0.7; padding-left: 1.5rem;">re-attach: pa claim claude</div>
+  </div>
+</div>
 
 ## Architecture
 
@@ -238,21 +355,37 @@ register projects and sessions; the workspace layer is the primary
 authoring surface.
 </Aside>
 
-```
-  Priority        Tier                      Location
-  ─────────────────────────────────────────────────────────────
-  highest    ┌─────────────┐     *.portagenty.toml (committable)
-             │  Workspace  │     sessions, projects, mpx choice
-             └──────┬──────┘
-                    │ merges with
-             ┌──────┴──────┐     portagenty.toml at project root
-  medium     │ Per-project │     sessions defined by the repo
-             └──────┬──────┘
-                    │ merges with
-             ┌──────┴──────┐     $XDG_CONFIG_HOME/portagenty/
-  lowest     │   Global    │     default mpx, workspace registry
-             └─────────────┘
-```
+<div style="display: flex; flex-direction: column; gap: 0; margin: 1.5rem 0; align-items: center;">
+  <div style="display: flex; align-items: center; gap: 1rem; width: 100%; max-width: 36rem;">
+    <div style="font-size: 0.75rem; font-weight: 700; color: var(--sl-color-green-high); width: 4rem; text-align: right; flex-shrink: 0;">highest</div>
+    <div style="flex: 1; border: 2px solid var(--sl-color-green); border-radius: 10px; padding: 0.6rem 1rem; background: var(--sl-color-green-low);">
+      <div style="font-weight: 700;">Workspace</div>
+      <div style="font-size: 0.8rem; opacity: 0.7;"><code>*.portagenty.toml</code> — sessions, projects, mpx choice. Committable.</div>
+    </div>
+  </div>
+  <div style="width: 2px; height: 0.75rem; background: var(--sl-color-gray-4); margin-left: 4rem;"></div>
+  <div style="font-size: 0.7rem; opacity: 0.5; margin-left: 4rem;">merges with</div>
+  <div style="width: 2px; height: 0.75rem; background: var(--sl-color-gray-4); margin-left: 4rem;"></div>
+
+  <div style="display: flex; align-items: center; gap: 1rem; width: 100%; max-width: 36rem;">
+    <div style="font-size: 0.75rem; font-weight: 700; color: var(--sl-color-orange-high); width: 4rem; text-align: right; flex-shrink: 0;">medium</div>
+    <div style="flex: 1; border: 2px solid var(--sl-color-orange); border-radius: 10px; padding: 0.6rem 1rem; background: var(--sl-color-orange-low);">
+      <div style="font-weight: 700;">Per-project</div>
+      <div style="font-size: 0.8rem; opacity: 0.7;"><code>portagenty.toml</code> at project root — repo-defined sessions. Committable.</div>
+    </div>
+  </div>
+  <div style="width: 2px; height: 0.75rem; background: var(--sl-color-gray-4); margin-left: 4rem;"></div>
+  <div style="font-size: 0.7rem; opacity: 0.5; margin-left: 4rem;">merges with</div>
+  <div style="width: 2px; height: 0.75rem; background: var(--sl-color-gray-4); margin-left: 4rem;"></div>
+
+  <div style="display: flex; align-items: center; gap: 1rem; width: 100%; max-width: 36rem;">
+    <div style="font-size: 0.75rem; font-weight: 700; color: var(--sl-color-gray-3); width: 4rem; text-align: right; flex-shrink: 0;">lowest</div>
+    <div style="flex: 1; border: 2px solid var(--sl-color-gray-4); border-radius: 10px; padding: 0.6rem 1rem; background: var(--sl-color-gray-6);">
+      <div style="font-weight: 700;">Global</div>
+      <div style="font-size: 0.8rem; opacity: 0.7;"><code>$XDG_CONFIG_HOME/portagenty/</code> — default mpx, workspace registry. Machine-local.</div>
+    </div>
+  </div>
+</div>
 
 The workspace file is designed to commit — no absolute paths, no
 machine-specific state, no secrets. Volatile state (recency, last-

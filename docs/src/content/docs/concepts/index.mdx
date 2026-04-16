@@ -3,30 +3,36 @@ title: Concepts
 description: The vocabulary portagenty uses, defined precisely.
 ---
 
+import { Aside } from "@astrojs/starlight/components";
+
 The full architectural deep-dive lives in
 [DESIGN.md](https://github.com/cybersader/portagenty/blob/main/DESIGN.md)
 in the repo. This page is the short version — one-line definitions
 for everything you'll see in the TUI and the TOML.
 
-```
-  Concepts at a glance
-  ────────────────────────────────────────────────
-  Workspace  ──▶  named view over projects + sessions
-       │              (committable TOML file)
-       ├── Session ──▶  name + cwd + command + kind + env
-       │                   │
-       │              ┌────┴────┐
-       │              ▼         ▼
-       │          ● Live    ○ Idle    ? Untracked
-       │
-       └── Project ──▶  a directory on disk
-                          (referenced, never moved)
+<div style="border: 2px solid var(--sl-color-gray-4); border-radius: 12px; padding: 1.25rem 1.5rem; margin: 1.5rem 0; background: var(--sl-color-gray-6);">
+  <div style="font-weight: 700; margin-bottom: 1rem; font-size: 1.05rem;">Concepts at a glance</div>
+  <div style="display: grid; grid-template-columns: auto 1fr; gap: 0.4rem 1rem; font-size: 0.9rem; align-items: start;">
+    <div style="font-weight: 600; color: var(--sl-color-accent);">Workspace</div>
+    <div>Named view over projects + sessions <span style="opacity: 0.6;">(committable TOML file)</span></div>
 
-  Multiplexer (tmux / zellij)
-       │
-       └── owns terminal panes, keeps them alive
-           pa drives it — never replaces it
-```
+    <div style="padding-left: 1rem; font-weight: 600; color: var(--sl-color-blue);">Session</div>
+    <div>name + cwd + command + kind + env</div>
+
+    <div style="padding-left: 2rem; opacity: 0.85;">
+      <span style="color: var(--sl-color-green);">●</span> Live &nbsp;
+      <span style="opacity: 0.5;">○</span> Idle &nbsp;
+      <span style="color: var(--sl-color-orange);">?</span> Untracked
+    </div>
+    <div style="opacity: 0.6; font-size: 0.85rem;">Three states, each with a distinct TUI marker</div>
+
+    <div style="padding-left: 1rem; font-weight: 600; color: var(--sl-color-blue);">Project</div>
+    <div>A directory on disk <span style="opacity: 0.6;">(referenced, never moved)</span></div>
+
+    <div style="font-weight: 600; color: var(--sl-color-purple);">Multiplexer</div>
+    <div>tmux / zellij — owns terminal panes, <code>pa</code> drives it, never replaces it</div>
+  </div>
+</div>
 
 ## Project
 
@@ -62,26 +68,40 @@ Shown in the TUI as colored markers next to each row:
 Untracked = the tmux/zellij session you started manually last week
 that `pa` can see via `list-sessions` and let you re-attach to.
 
-```
-  Session lifecycle
-  ─────────────────────────────────────────────
-  ○ Idle (in TOML, not running)
-     │
-     │  Enter → create_and_attach
-     ▼
-  ● Live (running in mpx)
-     │
-     │  x → kill         Enter → attach
-     ▼                      │
-  ○ Idle (stopped)          ▼
-                     attached to terminal
-
-  ? Untracked (running in mpx, not in TOML)
-     │
-     │  Enter → attach
-     ▼
-  attached to terminal
-```
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.5rem 0;">
+  <div style="border: 2px solid var(--sl-color-gray-4); border-radius: 10px; padding: 1rem; background: var(--sl-color-gray-6);">
+    <div style="font-weight: 700; margin-bottom: 0.5rem; font-size: 0.9rem;">Tracked session lifecycle</div>
+    <div style="display: flex; flex-direction: column; gap: 0.5rem; font-size: 0.85rem;">
+      <div style="display: flex; align-items: center; gap: 0.5rem;">
+        <span style="opacity: 0.5; font-size: 1.1rem;">○</span>
+        <span><strong>Idle</strong> — in TOML, not running</span>
+      </div>
+      <div style="text-align: center; opacity: 0.5; font-size: 0.75rem;">Enter → create_and_attach</div>
+      <div style="display: flex; align-items: center; gap: 0.5rem;">
+        <span style="color: var(--sl-color-green); font-size: 1.1rem;">●</span>
+        <span><strong>Live</strong> — running in mpx</span>
+      </div>
+      <div style="display: flex; gap: 1rem; justify-content: center; font-size: 0.75rem; opacity: 0.5;">
+        <span>x → kill → ○ Idle</span>
+        <span>Enter → attach</span>
+      </div>
+    </div>
+  </div>
+  <div style="border: 2px solid var(--sl-color-orange); border-radius: 10px; padding: 1rem; background: var(--sl-color-orange-low);">
+    <div style="font-weight: 700; margin-bottom: 0.5rem; font-size: 0.9rem;">Untracked session</div>
+    <div style="display: flex; flex-direction: column; gap: 0.5rem; font-size: 0.85rem;">
+      <div style="display: flex; align-items: center; gap: 0.5rem;">
+        <span style="color: var(--sl-color-orange); font-size: 1.1rem;">?</span>
+        <span><strong>Untracked</strong> — in mpx, not in TOML</span>
+      </div>
+      <div style="text-align: center; opacity: 0.5; font-size: 0.75rem;">Enter → attach</div>
+      <div style="opacity: 0.7; font-size: 0.8rem; margin-top: 0.25rem;">
+        Sessions you started manually outside <code>pa</code>.
+        Visible via <code>list-sessions</code>.
+      </div>
+    </div>
+  </div>
+</div>
 
 ## Kind hint
 
@@ -125,15 +145,14 @@ Sessions + project registrations can be declared at:
 Merge rule on session-name collision: **workspace > per-project >
 global**. Closer to the user's current intent wins.
 
-```
-  Merge precedence (on collision)
-  ─────────────────────────────────
-  Workspace     ←── wins (closest to intent)
-     │
-  Per-project   ←── middle
-     │
-  Global        ←── lowest priority
-```
+<div style="display: flex; align-items: center; gap: 0.5rem; margin: 1rem 0; font-size: 0.9rem;">
+  <div style="background: var(--sl-color-green-low); border: 1px solid var(--sl-color-green); border-radius: 6px; padding: 0.3rem 0.75rem; font-weight: 600;">Workspace</div>
+  <div style="opacity: 0.4;">&gt;</div>
+  <div style="background: var(--sl-color-orange-low); border: 1px solid var(--sl-color-orange); border-radius: 6px; padding: 0.3rem 0.75rem; font-weight: 600;">Per-project</div>
+  <div style="opacity: 0.4;">&gt;</div>
+  <div style="background: var(--sl-color-gray-6); border: 1px solid var(--sl-color-gray-4); border-radius: 6px; padding: 0.3rem 0.75rem; font-weight: 600;">Global</div>
+  <div style="opacity: 0.5; font-size: 0.8rem; margin-left: 0.5rem;">on collision</div>
+</div>
 
 ## State store
 
@@ -221,18 +240,34 @@ are deduped and ranked by **nucleo** (Helix's pure-Rust fuzzy
 matcher). Enter on a candidate either opens an existing workspace
 there or scaffolds a new one with a confirm prompt.
 
-```
-  Find pipeline (fastest → broadest)
-  ─────────────────────────────────────────────
-  ① Recency (state.toml)     instant, ~10 paths
-  ② Zoxide (frecency)        instant, ~50 paths
-  ③ plocate / locate / Everything   pre-built index
-  ④ fd (.gitignore-aware)    live walk, fast
-  ⑤ stdlib walker            always available, depth-capped
-         │
-         ▼
-  dedup on canonical path → nucleo fuzzy rank → top N
-```
+<div style="border: 2px solid var(--sl-color-blue); border-radius: 12px; padding: 1rem 1.25rem; margin: 1.5rem 0; background: var(--sl-color-blue-low);">
+  <div style="font-weight: 700; margin-bottom: 0.75rem;">Find pipeline — fastest to broadest</div>
+  <div style="display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.85rem;">
+    <div style="display: flex; align-items: center; gap: 0.75rem;">
+      <span style="background: var(--sl-color-green-low); border: 1px solid var(--sl-color-green); border-radius: 50%; width: 1.5rem; height: 1.5rem; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700; flex-shrink: 0;">1</span>
+      <span><strong>Recency</strong> — state.toml, instant, ~10 paths</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 0.75rem;">
+      <span style="background: var(--sl-color-green-low); border: 1px solid var(--sl-color-green); border-radius: 50%; width: 1.5rem; height: 1.5rem; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700; flex-shrink: 0;">2</span>
+      <span><strong>Zoxide</strong> — frecency scores, instant, ~50 paths</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 0.75rem;">
+      <span style="background: var(--sl-color-orange-low); border: 1px solid var(--sl-color-orange); border-radius: 50%; width: 1.5rem; height: 1.5rem; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700; flex-shrink: 0;">3</span>
+      <span><strong>plocate / locate / Everything</strong> — pre-built index</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 0.75rem;">
+      <span style="background: var(--sl-color-orange-low); border: 1px solid var(--sl-color-orange); border-radius: 50%; width: 1.5rem; height: 1.5rem; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700; flex-shrink: 0;">4</span>
+      <span><strong>fd</strong> — .gitignore-aware live walk</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 0.75rem;">
+      <span style="background: var(--sl-color-gray-5); border: 1px solid var(--sl-color-gray-4); border-radius: 50%; width: 1.5rem; height: 1.5rem; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700; flex-shrink: 0;">5</span>
+      <span><strong>Stdlib walker</strong> — always available, depth-capped</span>
+    </div>
+  </div>
+  <div style="border-top: 1px solid var(--sl-color-gray-5); margin-top: 0.75rem; padding-top: 0.6rem; text-align: center; font-size: 0.8rem; opacity: 0.7;">
+    dedup on canonical path → <strong>nucleo fuzzy rank</strong> → top N
+  </div>
+</div>
 
 ## Tree browser
 
