@@ -16,6 +16,7 @@
 //! decides what to do with the user's selection.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
@@ -23,7 +24,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::find::{find_candidates, BackendAvailability, Candidate, FindOpts};
+use crate::find::{BackendAvailability, Candidate, FindOpts, Source};
 
 /// What the picker should do after a key press inside the search
 /// overlay. Mirrors the picker's normal action vocabulary so the
@@ -49,49 +50,161 @@ pub enum SearchOutcome {
 
 /// Mutable state for the search overlay. Lives inside
 /// `picker::PickerState::search` as `Option<SearchState>`.
-#[derive(Debug)]
+///
+/// Architecture (freeze fix): the slow filesystem walk runs once
+/// in a background thread when the overlay opens (and again on
+/// `>` / `<` / Ctrl+R root changes). The TUI thread never walks.
+/// Each keystroke only re-ranks the already-cached candidate set
+/// via nucleo, which is O(ms) even for thousands of entries. The
+/// 250ms poll loop drains any new results from the background
+/// thread and merges them into the cache.
 pub struct SearchState {
     /// What the user has typed so far.
     pub input: String,
-    /// Cached candidate list, refreshed on every input change.
+    /// Ranked candidates currently shown — subset of `raw_dirs`
+    /// filtered + scored by nucleo against `input`.
     pub candidates: Vec<Candidate>,
     /// Highlighted index into `candidates`. Wraps on under/overflow.
     pub selected: usize,
     /// Knobs passed to the find pipeline (roots, depth, limit).
-    /// Mutable so the user can drill into a highlighted folder
-    /// via `>` (search-from-here) and the new root takes effect on
-    /// the next refresh.
     opts: FindOpts,
-    /// Probed availability of fd / zoxide / plocate / etc. Cached
-    /// once at overlay open time; surfaces as a hint in the title
-    /// bar so users can tell which tools are actually contributing
-    /// to the result set.
     backends: BackendAvailability,
-    /// `ListState` for the candidate list widget. Tracks viewport
-    /// scrolling so long lists don't push the selection off-screen.
     list_state: ListState,
+    /// Accumulator of all directories discovered by the background
+    /// walker. Grows as the walker sends results over the channel.
+    /// On keystroke we rank this set — no re-walk.
+    raw_dirs: Vec<PathBuf>,
+    /// Receiver end of the channel the background walker sends
+    /// `Vec<PathBuf>` batches into. Drained on each render cycle.
+    bg_rx: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    /// Whether a background walk is still in flight. Used to show
+    /// a "scanning..." indicator in the UI.
+    pub scanning: bool,
+}
+
+impl std::fmt::Debug for SearchState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchState")
+            .field("input", &self.input)
+            .field("candidates", &self.candidates.len())
+            .field("raw_dirs", &self.raw_dirs.len())
+            .field("scanning", &self.scanning)
+            .finish()
+    }
 }
 
 impl Default for SearchState {
     fn default() -> Self {
+        let opts = FindOpts::default();
+        let backends = BackendAvailability::probe();
+
+        // Tiers 1 + 2 (recency + zoxide) are instant — collect
+        // them synchronously so the overlay has content on first
+        // frame. Tiers 3–5 (locate, fd, walk) are slow on DrvFs /
+        // large trees and run in the background.
+        let mut raw_dirs: Vec<PathBuf> = Vec::new();
+        for p in crate::find::recency::collect() {
+            raw_dirs.push(p);
+        }
+        for p in crate::find::zoxide::collect() {
+            raw_dirs.push(p);
+        }
+
+        let bg_rx = Some(spawn_bg_walk(opts.clone()));
+
         let mut s = Self {
             input: String::new(),
             candidates: Vec::new(),
             selected: 0,
-            opts: FindOpts::default(),
-            backends: BackendAvailability::probe(),
+            opts,
+            backends,
             list_state: ListState::default(),
+            raw_dirs,
+            bg_rx,
+            scanning: true,
         };
-        s.refresh();
+        s.rerank();
         s
     }
 }
 
 impl SearchState {
-    /// Re-run the find pipeline with the current input. Resets
-    /// `selected` to 0 since the candidate ordering changed.
-    fn refresh(&mut self) {
-        self.candidates = find_candidates(&self.input, &self.opts);
+    /// Drain any new results from the background walker and re-rank
+    /// if the set changed. Called from the picker's poll loop on
+    /// each 250ms tick — keeps the TUI responsive while directories
+    /// trickle in from the background.
+    pub fn poll_background(&mut self) {
+        let Some(rx) = &self.bg_rx else { return };
+        let mut changed = false;
+        while let Ok(batch) = rx.try_recv() {
+            self.raw_dirs.extend(batch);
+            changed = true;
+        }
+        // Check if the sender hung up (walk complete).
+        if changed || rx.try_recv().is_err() {
+            // Sender dropped → walk is done.
+            if self.scanning {
+                self.scanning = false;
+                changed = true; // trigger one more rerank
+            }
+        }
+        if changed {
+            self.rerank();
+        }
+    }
+
+    /// Re-rank `raw_dirs` against `self.input` via nucleo. This is
+    /// the ONLY place that touches the matcher — keystrokes just
+    /// call this, never the walker.
+    fn rerank(&mut self) {
+        let trimmed = self.input.trim();
+        if trimmed.is_empty() {
+            // No query → show all raw_dirs, deduped, up to the limit.
+            let mut seen = std::collections::HashSet::new();
+            self.candidates = self
+                .raw_dirs
+                .iter()
+                .filter(|p| {
+                    let key = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                    seen.insert(key)
+                })
+                .take(self.opts.limit)
+                .map(|p| Candidate {
+                    path: p.clone(),
+                    source: Source::Walk,
+                    score: 0,
+                })
+                .collect();
+        } else {
+            let mut matcher =
+                nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
+            let pattern = nucleo_matcher::pattern::Pattern::parse(
+                trimmed,
+                nucleo_matcher::pattern::CaseMatching::Smart,
+                nucleo_matcher::pattern::Normalization::Smart,
+            );
+            let mut scored: Vec<Candidate> = Vec::with_capacity(self.raw_dirs.len());
+            let mut seen = std::collections::HashSet::new();
+            for p in &self.raw_dirs {
+                let key = p.canonicalize().unwrap_or_else(|_| p.clone());
+                if !seen.insert(key) {
+                    continue;
+                }
+                let haystack = p.to_string_lossy();
+                let mut buf: Vec<char> = Vec::new();
+                let utf32 = nucleo_matcher::Utf32Str::new(&haystack, &mut buf);
+                if let Some(score) = pattern.score(utf32, &mut matcher) {
+                    scored.push(Candidate {
+                        path: p.clone(),
+                        source: Source::Walk,
+                        score: score as i32,
+                    });
+                }
+            }
+            scored.sort_by(|a, b| b.score.cmp(&a.score));
+            scored.truncate(self.opts.limit);
+            self.candidates = scored;
+        }
         self.selected = 0;
         self.list_state.select(if self.candidates.is_empty() {
             None
@@ -100,9 +213,51 @@ impl SearchState {
         });
     }
 
+    /// Trigger a fresh background walk (used by > / < / Ctrl+R).
+    /// Clears old results and starts a new thread.
+    fn restart_walk(&mut self) {
+        self.raw_dirs.clear();
+        // Re-seed with instant tiers so we have something immediately.
+        for p in crate::find::recency::collect() {
+            self.raw_dirs.push(p);
+        }
+        for p in crate::find::zoxide::collect() {
+            self.raw_dirs.push(p);
+        }
+        self.bg_rx = Some(spawn_bg_walk(self.opts.clone()));
+        self.scanning = true;
+        self.rerank();
+    }
+
     fn highlighted(&self) -> Option<&Candidate> {
         self.candidates.get(self.selected)
     }
+}
+
+/// Spawn a background thread that runs tiers 3–5 (locate, fd, walk)
+/// and sends results back over a channel. The walker runs at most
+/// once per overlay-open or root-change; keystrokes never trigger it.
+fn spawn_bg_walk(opts: FindOpts) -> mpsc::Receiver<Vec<PathBuf>> {
+    let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
+    std::thread::spawn(move || {
+        // Tier 3: locate.
+        let batch = crate::find::locate::collect("");
+        if !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+        // Tier 4: fd.
+        let batch = crate::find::fd::collect("", &opts);
+        if !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+        // Tier 5: stdlib walk.
+        let batch = crate::find::walk::collect("", &opts);
+        if !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+        // tx drops here → receiver sees disconnect → scanning = false.
+    });
+    rx
 }
 
 /// Process a single key press. Returns the action the outer picker
@@ -115,12 +270,12 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::Cancel,
         (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
             state.input.clear();
-            state.refresh();
+            state.rerank();
             SearchOutcome::Continue
         }
         (KeyCode::Backspace, _) => {
             state.input.pop();
-            state.refresh();
+            state.rerank();
             SearchOutcome::Continue
         }
         (KeyCode::Up, _) => {
@@ -143,47 +298,37 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             None => SearchOutcome::Continue,
             Some(c) => classify_pick(&c.path),
         },
-        // `>` drills into the highlighted folder: pivots the
-        // search root to that path, clears the input, and refreshes.
-        // Lets users jump from "give me everything under $HOME" to
-        // "give me everything under ~/code" with one keystroke.
         (KeyCode::Char('>'), _) => {
             if let Some(c) = state.highlighted() {
                 state.opts.roots = vec![c.path.clone()];
                 state.input.clear();
-                state.refresh();
+                state.restart_walk();
             }
             SearchOutcome::Continue
         }
-        // `<` navigates UP one level — sets the root to the parent
-        // of the current root. Recursive: keep pressing `<` to walk
-        // up the tree. At `/` (or when the parent equals the root)
-        // it's a no-op. Ctrl+R resets all the way back to defaults
-        // if you want to start over from $HOME.
         (KeyCode::Char('<'), _) => {
             if let Some(root) = state.opts.roots.first().cloned() {
                 if let Some(parent) = root.parent() {
                     if parent != root {
                         state.opts.roots = vec![parent.to_path_buf()];
                         state.input.clear();
-                        state.refresh();
+                        state.restart_walk();
                     }
                 }
             }
             SearchOutcome::Continue
         }
-        // Ctrl+R fully resets roots to the machine defaults ($HOME
-        // + WSL root if applicable). The nuclear "go back to square
-        // one" for when > / < navigation lost the user.
         (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
             state.opts.roots = crate::find::default_roots();
             state.input.clear();
-            state.refresh();
+            state.restart_walk();
             SearchOutcome::Continue
         }
         (KeyCode::Char(ch), _) => {
             state.input.push(ch);
-            state.refresh();
+            // Re-rank only — never re-walk on a keystroke. The
+            // background thread feeds new dirs; nucleo ranks them.
+            state.rerank();
             SearchOutcome::Continue
         }
         _ => SearchOutcome::Continue,
@@ -295,12 +440,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
         .map(|c| candidate_item(c, chunks[2].width))
         .collect();
     if items.is_empty() {
-        let empty = Paragraph::new(if state.input.is_empty() {
+        let msg = if state.scanning {
+            "  scanning filesystem… results will appear as they're found"
+        } else if state.input.is_empty() {
             "  (no recents yet — type to search your filesystem)"
         } else {
-            "  no matches"
-        })
-        .style(Style::default().add_modifier(Modifier::DIM));
+            "  no matches — try > to drill into a folder, or < to go up"
+        };
+        let empty = Paragraph::new(msg).style(Style::default().add_modifier(Modifier::DIM));
         frame.render_widget(empty, chunks[2]);
     } else {
         let list = List::new(items)
@@ -413,8 +560,7 @@ mod tests {
 
     fn make_state(input: &str) -> SearchState {
         // Don't call SearchState::default() — that fires real FS
-        // probes via refresh(). Build the struct manually with
-        // synthetic candidates so tests stay deterministic.
+        // probes. Build the struct manually with synthetic candidates.
         let mut s = SearchState {
             input: input.to_string(),
             candidates: vec![
@@ -437,6 +583,12 @@ mod tests {
             },
             backends: BackendAvailability::default(),
             list_state: ListState::default(),
+            raw_dirs: vec![
+                PathBuf::from("/home/u/cyberchaste"),
+                PathBuf::from("/home/u/cybersader/portagenty"),
+            ],
+            bg_rx: None,
+            scanning: false,
         };
         s.list_state.select(Some(0));
         s
