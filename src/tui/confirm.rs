@@ -68,10 +68,11 @@ pub fn render_info(frame: &mut Frame<'_>, area: Rect, title: &str, body: Vec<Lin
     let overlay_w = want_w
         .max(title.len() as u16 + 6) // accommodate the title
         .min(w.saturating_sub(2))
-        .max(24);
+        .max(24)
+        .min(w);
     // 2 borders + body height.
     let want_h: u16 = (body.len() as u16) + 2;
-    let overlay_h = want_h.min(h.saturating_sub(2)).max(5);
+    let overlay_h = want_h.min(h.saturating_sub(2)).max(5).min(h);
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;
     let region = Rect {
@@ -108,7 +109,7 @@ pub fn render_info(frame: &mut Frame<'_>, area: Rect, title: &str, body: Vec<Lin
 pub fn render(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str) {
     let w = area.width;
     let h = area.height;
-    let overlay_w = w.saturating_sub(4).clamp(28, 64);
+    let overlay_w = w.saturating_sub(4).clamp(28, 64).min(w);
 
     // Pre-wrap the body so we can size the overlay's height to fit
     // exactly the wrapped content + spacer + prompt line + borders.
@@ -117,7 +118,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str) {
     let body_lines = wrap_to_width(body, inner_w.max(10));
     // 2 borders + body lines + 1 spacer + 1 prompt line + 1 trailing pad.
     let want_h = (body_lines.len() as u16).saturating_add(5);
-    let overlay_h = want_h.min(h.saturating_sub(2)).max(6);
+    let overlay_h = want_h.min(h.saturating_sub(2)).max(6).min(h);
 
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;

@@ -32,11 +32,11 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, ctx: HelpContext) {
     // Centered box, generous on wide screens, full-width on narrow.
     let w = area.width;
     let h = area.height;
-    let overlay_w = w.saturating_sub(4).clamp(20, 70);
+    let overlay_w = w.saturating_sub(4).clamp(20, 70).min(w);
     // Enough height on a desktop to show all sections (keys + markers
     // + kind glyphs + title-bar + coming-soon) without clipping.
     // Narrow terminals (Termux portrait) clamp to available height.
-    let overlay_h = h.saturating_sub(2).clamp(10, 40);
+    let overlay_h = h.saturating_sub(2).clamp(10, 40).min(h);
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;
     let region = Rect {

@@ -275,9 +275,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, session_name: &str, state: &Edi
         .max(title.len() + 4);
     let overlay_w = ((max_line as u16).saturating_add(4))
         .min(w.saturating_sub(2))
-        .max(28);
+        .max(28)
+        .min(w);
     let want_h = (body.len() as u16).saturating_add(2);
-    let overlay_h = want_h.min(h.saturating_sub(2)).max(6);
+    let overlay_h = want_h.min(h.saturating_sub(2)).max(6).min(h);
 
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;

@@ -384,8 +384,8 @@ fn classify_pick(path: &Path) -> SearchOutcome {
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     let w = area.width;
     let h = area.height;
-    let overlay_w = (w as u32 * 8 / 10).clamp(28, 90) as u16;
-    let overlay_h = (h as u32 * 8 / 10).clamp(8, 30) as u16;
+    let overlay_w = ((w as u32 * 8 / 10).clamp(28, 90) as u16).min(w);
+    let overlay_h = ((h as u32 * 8 / 10).clamp(8, 30) as u16).min(h);
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;
     let region = Rect {
