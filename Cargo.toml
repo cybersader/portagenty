@@ -33,6 +33,11 @@ anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Pure-Rust fuzzy matcher from the Helix editor team. Used by the
+# in-TUI workspace finder (`n` key in the picker) to rank merged
+# candidate folders against the user's query. Tiny — keeps the
+# single-static-binary contract intact.
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 insta = "1.41"

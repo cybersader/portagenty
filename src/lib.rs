@@ -9,6 +9,7 @@ pub mod clipboard;
 pub mod config;
 pub mod domain;
 pub mod export;
+pub mod find;
 pub mod mux;
 pub mod onboarding;
 pub mod scaffold;
