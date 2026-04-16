@@ -80,6 +80,13 @@ pub struct SearchState {
     /// Whether a background walk is still in flight. Used to show
     /// a "scanning..." indicator in the UI.
     pub scanning: bool,
+    /// Monotonic tick counter, incremented every poll cycle (~250ms).
+    /// Drives the breadcrumb animation.
+    anim_tick: u32,
+    /// Current segment offset for the breadcrumb barber-pole. When
+    /// the path is too long to fit, segments rotate upward from
+    /// the leaf toward the root. Resets to 0 when the root changes.
+    anim_offset: usize,
 }
 
 impl std::fmt::Debug for SearchState {
@@ -122,6 +129,8 @@ impl Default for SearchState {
             raw_dirs,
             bg_rx,
             scanning: true,
+            anim_tick: 0,
+            anim_offset: 0,
         };
         s.rerank();
         s
@@ -133,6 +142,30 @@ impl SearchState {
     /// if the set changed. Called from the picker's poll loop on
     /// each 250ms tick — keeps the TUI responsive while directories
     /// trickle in from the background.
+    /// Advance the breadcrumb animation by one tick. Called from
+    /// the picker's 250ms poll loop. The rotation speed increases
+    /// as the offset climbs toward the root — slow near the leaf
+    /// (where the user's attention is), fast near `/` (less useful
+    /// context). Specifically: each segment is shown for
+    /// `max(2, 8 - offset)` ticks, so the leaf sits for ~2s and
+    /// the root for ~0.5s before advancing.
+    pub fn tick_animation(&mut self) {
+        self.anim_tick = self.anim_tick.wrapping_add(1);
+        let segments = path_segments(&self.opts.roots);
+        if segments.len() <= 1 {
+            return; // nothing to animate
+        }
+        // Ticks per step: starts at 8 (~2s), decreases to 2 (~0.5s).
+        let ticks_per_step = 8u32.saturating_sub(self.anim_offset as u32).max(2);
+        if self.anim_tick % ticks_per_step == 0 {
+            self.anim_offset += 1;
+            if self.anim_offset >= segments.len() {
+                // Reached the root — pause an extra beat then wrap.
+                self.anim_offset = 0;
+            }
+        }
+    }
+
     pub fn poll_background(&mut self) {
         let Some(rx) = &self.bg_rx else { return };
         let mut changed = false;
@@ -219,6 +252,8 @@ impl SearchState {
     /// Trigger a fresh background walk (used by > / < / Ctrl+R).
     /// Clears old results and starts a new thread.
     fn restart_walk(&mut self) {
+        self.anim_offset = 0;
+        self.anim_tick = 0;
         self.raw_dirs.clear();
         // Re-seed with instant tiers so we have something immediately.
         for p in crate::find::recency::collect() {
@@ -429,28 +464,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
         ])
         .split(inner);
 
-    // Root breadcrumb: shows the current search root(s) + backend
-    // list. Gets the full overlay width so long paths are readable
-    // (the title bar was too narrow for both backends + roots).
-    let roots_str = compact_roots(&state.opts.roots);
-    let backends_str = state.backends.one_liner();
+    // Animated root breadcrumb. Path segments are displayed
+    // leaf-first; when they overflow the line, a rotating window
+    // cycles upward toward the root (barber-pole style), slow near
+    // the leaf, fast near `/`. If the full path fits, no animation.
     let inner_w = inner.width as usize;
-    // Truncate the combined line to fit, favoring the root path.
-    let combined = format!("  {roots_str}  [{backends_str}]");
-    let breadcrumb = if combined.chars().count() > inner_w {
-        let budget = inner_w.saturating_sub(4); // "  " + "…"
-        let head: String = roots_str.chars().take(budget).collect();
-        format!("  {head}…")
-    } else {
-        combined
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            breadcrumb,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-        )])),
-        chunks[0],
+    let segments = path_segments(&state.opts.roots);
+    let breadcrumb_line = render_animated_breadcrumb(
+        &segments,
+        state.anim_offset,
+        inner_w,
+        &state.backends.one_liner(),
     );
+    frame.render_widget(Paragraph::new(breadcrumb_line), chunks[0]);
 
     // Input line: prompt char + user text + caret (block style).
     let input_line = Line::from(vec![
@@ -510,6 +536,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
 
 /// Render `roots` compactly for the title bar — replace `$HOME`
 /// with `~`, join with " + ", truncate the whole thing to ~40 chars.
+#[allow(dead_code)]
 fn compact_roots(roots: &[PathBuf]) -> String {
     if roots.is_empty() {
         return "(none)".to_string();
@@ -558,6 +585,96 @@ fn candidate_item(c: &Candidate, width: u16) -> ListItem<'static> {
         Span::raw("  "),
         Span::styled(badge, Style::default().fg(Color::Magenta)),
     ]))
+}
+
+/// Split the first root path into its directory segments, leaf-first.
+/// Example: `/mnt/c/Users/Cybersader/Documents` →
+///   `["Documents", "Cybersader", "Users", "c", "mnt"]`
+fn path_segments(roots: &[PathBuf]) -> Vec<String> {
+    let Some(root) = roots.first() else {
+        return vec!["(no root)".into()];
+    };
+    let display = compact_home(&root.display().to_string());
+    let mut segs: Vec<String> = display
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    segs.reverse(); // leaf first
+    if segs.is_empty() {
+        segs.push("/".into());
+    }
+    segs
+}
+
+/// Render the animated breadcrumb line. Shows a window of segments
+/// starting from `offset` (which the animation advances over time).
+/// When all segments fit, the full path is shown leaf-first with no
+/// animation indicator. When they overflow, a `⇡` prefix hints
+/// that more segments are above the visible window.
+fn render_animated_breadcrumb(
+    segments: &[String],
+    offset: usize,
+    width: usize,
+    backends: &str,
+) -> Line<'static> {
+    if segments.is_empty() {
+        return Line::from(Span::raw(""));
+    }
+    let dim = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+    let bright = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    // Build the visible segment window starting from `offset`.
+    // Segments are leaf-first, so offset=0 shows the leaf + parents;
+    // offset=N shows the Nth ancestor + its parents.
+    let start = offset % segments.len();
+    let mut visible: Vec<&str> = Vec::new();
+    let mut used = 4usize; // "  " padding + " /" separator budget
+                           // Walk from `start` upward (toward root), accumulating segments
+                           // that fit in the width budget.
+    for seg in &segments[start..] {
+        let cost = seg.chars().count() + 3; // " / " separator
+        if used + cost > width && !visible.is_empty() {
+            break;
+        }
+        visible.push(seg);
+        used += cost;
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(visible.len() * 3 + 4);
+    spans.push(Span::raw("  "));
+
+    // If we're not showing from the leaf, add an animation hint.
+    if start > 0 {
+        spans.push(Span::styled("⇣ ", bright));
+    }
+
+    // Render segments: the first visible (closest to leaf) is bold,
+    // the rest dim — draws the eye to "where am I" at the bottom.
+    for (i, seg) in visible.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" / ", dim));
+        }
+        let style = if i == 0 { bright } else { dim };
+        spans.push(Span::styled(seg.to_string(), style));
+    }
+
+    // If there are segments beyond what's visible toward the root,
+    // add an upward hint.
+    let shown_to = start + visible.len();
+    if shown_to < segments.len() {
+        spans.push(Span::styled(" / ⇡", dim));
+    }
+
+    // Backends suffix if room.
+    let remaining = width.saturating_sub(used + 4);
+    if remaining > backends.chars().count() + 4 {
+        spans.push(Span::styled(format!("  [{backends}]"), dim));
+    }
+
+    Line::from(spans)
 }
 
 fn compact_home(p: &str) -> String {
@@ -629,6 +746,8 @@ mod tests {
             ],
             bg_rx: None,
             scanning: false,
+            anim_tick: 0,
+            anim_offset: 0,
         };
         s.list_state.select(Some(0));
         s
@@ -683,5 +802,67 @@ mod tests {
         s.candidates.clear();
         let out = handle_key(&mut s, KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(out, SearchOutcome::Continue));
+    }
+}
+
+#[cfg(test)]
+mod anim_tests {
+    use super::*;
+
+    #[test]
+    fn breadcrumb_shows_leaf_first_at_offset_zero() {
+        let segs = vec!["leaf".into(), "mid".into(), "root".into()];
+        let line = render_animated_breadcrumb(&segs, 0, 40, "scan");
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            text.contains("leaf"),
+            "leaf should be first at offset 0: {text:?}"
+        );
+    }
+
+    #[test]
+    fn breadcrumb_shifts_to_mid_at_offset_one() {
+        let segs = vec!["leaf".into(), "mid".into(), "root".into()];
+        let line = render_animated_breadcrumb(&segs, 1, 40, "scan");
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            text.contains("mid"),
+            "mid should be visible at offset 1: {text:?}"
+        );
+        assert!(text.contains("⇣"), "should have down-arrow hint: {text:?}");
+    }
+
+    #[test]
+    fn breadcrumb_wraps_at_segment_count() {
+        let segs = vec!["a".into(), "b".into(), "c".into()];
+        // offset=3 should wrap to 0
+        let line = render_animated_breadcrumb(&segs, 3, 40, "");
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("a"), "should wrap back to leaf: {text:?}");
+    }
+
+    #[test]
+    fn breadcrumb_doesnt_panic_at_narrow_width() {
+        let segs = vec!["very-long-segment-name".into(), "another".into()];
+        let _ = render_animated_breadcrumb(&segs, 0, 10, "");
+        let _ = render_animated_breadcrumb(&segs, 1, 10, "");
+        // Just verify no panic at tiny widths.
+    }
+
+    #[test]
+    fn breadcrumb_shows_full_path_when_it_fits() {
+        let segs = vec!["leaf".into(), "root".into()];
+        let line = render_animated_breadcrumb(&segs, 0, 60, "recents · scan");
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("leaf"), "leaf: {text:?}");
+        assert!(text.contains("root"), "root: {text:?}");
+        assert!(
+            !text.contains("⇡"),
+            "no overflow indicator when everything fits: {text:?}"
+        );
+        assert!(
+            text.contains("recents"),
+            "backends suffix when room: {text:?}"
+        );
     }
 }

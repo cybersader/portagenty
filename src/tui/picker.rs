@@ -118,11 +118,11 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             )
         })?;
 
-        // Drain background walker results each render tick — even
-        // without a key press. Keeps the candidate list updating
-        // while the user is reading the overlay.
+        // Drain background walker results + advance the breadcrumb
+        // animation each render tick — even without a key press.
         if let Some(s) = search.as_mut() {
             s.poll_background();
+            s.tick_animation();
         }
 
         if !event::poll(std::time::Duration::from_millis(250))? {

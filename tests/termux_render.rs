@@ -184,7 +184,6 @@ fn edit_env_flow_renders_at_termux_sizes() {
 // ---------------------------------------------------------------
 #[test]
 fn find_overlay_renders_at_termux_sizes() {
-
     // We can't call SearchState::default() (fires real FS probes).
     // Build a minimal one with synthetic data just for rendering.
     // SearchState fields are pub(crate) so we access from tests
