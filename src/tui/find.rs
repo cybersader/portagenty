@@ -397,17 +397,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
 
     frame.render_widget(Clear, region);
 
-    // Title bar conveys two things: the active backend cohort
-    // (so users know which tools are in the mix) and the current
-    // search root(s) (so a `>`-drill is obvious from a glance).
-    let backends_str = state.backends.one_liner();
-    let roots_str = compact_roots(&state.opts.roots);
+    // Title bar: backends + scan count only (short). The current
+    // root gets its own dedicated line INSIDE the overlay so it's
+    // always fully visible even on narrow terminals.
     let scan_str = if state.scanning {
         format!(" · scanning {}…", state.raw_dirs.len())
     } else {
         format!(" · {} dirs", state.raw_dirs.len())
     };
-    let title = format!(" find folder · {backends_str} · {roots_str}{scan_str} ");
+    let title = format!(" find folder{scan_str} ");
     let outer = Block::default()
         .title(title)
         .title_style(
@@ -420,16 +418,39 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     let inner = outer.inner(region);
     frame.render_widget(outer, region);
 
-    // Inner layout: 1-line input + spacer + candidate list + 1-line hint.
+    // Inner layout: root breadcrumb + input + candidate list + hint.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
+            Constraint::Length(1), // root breadcrumb
+            Constraint::Length(1), // input
+            Constraint::Min(1),    // candidate list
             Constraint::Length(1),
         ])
         .split(inner);
+
+    // Root breadcrumb: shows the current search root(s) + backend
+    // list. Gets the full overlay width so long paths are readable
+    // (the title bar was too narrow for both backends + roots).
+    let roots_str = compact_roots(&state.opts.roots);
+    let backends_str = state.backends.one_liner();
+    let inner_w = inner.width as usize;
+    // Truncate the combined line to fit, favoring the root path.
+    let combined = format!("  {roots_str}  [{backends_str}]");
+    let breadcrumb = if combined.chars().count() > inner_w {
+        let budget = inner_w.saturating_sub(4); // "  " + "…"
+        let head: String = roots_str.chars().take(budget).collect();
+        format!("  {head}…")
+    } else {
+        combined
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            breadcrumb,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        )])),
+        chunks[0],
+    );
 
     // Input line: prompt char + user text + caret (block style).
     let input_line = Line::from(vec![
@@ -450,10 +471,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 .add_modifier(Modifier::SLOW_BLINK),
         ),
     ]);
-    frame.render_widget(Paragraph::new(input_line), chunks[0]);
-
-    // Spacer.
-    frame.render_widget(Paragraph::new(""), chunks[1]);
+    frame.render_widget(Paragraph::new(input_line), chunks[1]);
 
     // Candidate list.
     let items: Vec<ListItem> = state

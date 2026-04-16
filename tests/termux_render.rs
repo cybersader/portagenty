@@ -184,9 +184,6 @@ fn edit_env_flow_renders_at_termux_sizes() {
 // ---------------------------------------------------------------
 #[test]
 fn find_overlay_renders_at_termux_sizes() {
-    use portagenty::find::{BackendAvailability, Candidate, FindOpts, Source};
-    use ratatui::widgets::ListState;
-    use std::path::PathBuf;
 
     // We can't call SearchState::default() (fires real FS probes).
     // Build a minimal one with synthetic data just for rendering.
