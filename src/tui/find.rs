@@ -928,9 +928,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 frame.render_stateful_widget(list, chunks[2], &mut state.list_state);
             }
 
-            let hint = Paragraph::new(" Enter open · t tree · Ctrl+F path · Esc back · ↑/↓ nav ")
-                .style(Style::default().add_modifier(Modifier::DIM));
-            frame.render_widget(hint, chunks[3]);
+            use crate::tui::footer::Entry;
+            crate::tui::footer::render(
+                frame,
+                chunks[3],
+                &[
+                    Entry::new("Esc", "back"),
+                    Entry::new("↑/↓", "nav"),
+                    Entry::new("Enter", "open"),
+                    Entry::new("t", "tree"),
+                    Entry::new("Ctrl+F", "path"),
+                    Entry::new(">", "drill"),
+                    Entry::new("<", "up"),
+                ],
+            );
         }
         FindMode::Tree(tree) => {
             // Tree mode: no input line (use the space for tree).
@@ -943,11 +954,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
             };
             render_tree(frame, tree_area, tree);
 
-            let hint = Paragraph::new(
-                " Enter open · >/l expand · </h collapse · t search · Esc back · q quit ",
-            )
-            .style(Style::default().add_modifier(Modifier::DIM));
-            frame.render_widget(hint, chunks[3]);
+            use crate::tui::footer::Entry;
+            crate::tui::footer::render(
+                frame,
+                chunks[3],
+                &[
+                    Entry::new("Esc", "back"),
+                    Entry::new("↑/↓", "nav"),
+                    Entry::new("Enter", "open"),
+                    Entry::new(">", "expand"),
+                    Entry::new("<", "collapse"),
+                    Entry::new("t", "search"),
+                    Entry::new("q", "quit"),
+                ],
+            );
         }
     }
 
