@@ -271,7 +271,14 @@ mod tests {
         ];
         let out = dedup_keep_first(items);
         let paths: Vec<&PathBuf> = out.iter().map(|c| &c.path).collect();
-        assert_eq!(paths, vec![&PathBuf::from("/a"), &PathBuf::from("/b"), &PathBuf::from("/c")]);
+        assert_eq!(
+            paths,
+            vec![
+                &PathBuf::from("/a"),
+                &PathBuf::from("/b"),
+                &PathBuf::from("/c")
+            ]
+        );
         // First occurrence preserved → /a stays Recency, not Walk.
         assert_eq!(out[0].source, Source::Recency);
     }
@@ -286,10 +293,7 @@ mod tests {
         let out = rank_and_truncate(items, "cyber", 10);
         // 'cyber' should match cyberchaste and cybersader but not the
         // notebooks dir.
-        let paths: Vec<String> = out
-            .iter()
-            .map(|c| c.path.display().to_string())
-            .collect();
+        let paths: Vec<String> = out.iter().map(|c| c.path.display().to_string()).collect();
         assert!(
             paths.iter().any(|p| p.contains("cyberchaste")),
             "missing cyberchaste in: {paths:?}"

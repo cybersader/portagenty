@@ -67,6 +67,10 @@ enum PickerPending {
     /// Delete the workspace file from disk *and* drop the registry
     /// entry. Files-on-disk are gone after this.
     DeleteFile(PathBuf),
+    /// Confirm scaffolding a new workspace at the given directory.
+    /// Triggered from the find overlay's Enter on a no-workspace
+    /// folder. On confirm: scaffold + open the new workspace.
+    ScaffoldAt(PathBuf),
 }
 
 /// Sticky info modal contents. Distinct from `PickerPending` because
@@ -94,6 +98,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
     let mut help_open = false;
     let mut pending: Option<PickerPending> = None;
     let mut info: Option<InfoModal> = None;
+    let mut search: Option<crate::tui::find::SearchState> = None;
     let mut status = StatusLine::default();
 
     loop {
@@ -108,6 +113,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                 help_open,
                 &pending,
                 &info,
+                &mut search,
                 &status.text,
             )
         })?;
@@ -132,12 +138,47 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             info = None;
             continue;
         }
-        // Confirm modal: divert keys.
+        // Search overlay: divert keys to the find module's handler.
+        if let Some(s) = search.as_mut() {
+            use crate::tui::find::SearchOutcome;
+            match crate::tui::find::handle_key(s, key.code, key.modifiers) {
+                SearchOutcome::Continue => {}
+                SearchOutcome::Cancel => {
+                    search = None;
+                }
+                SearchOutcome::OpenHelp => {
+                    help_open = true;
+                }
+                SearchOutcome::OpenExisting(path) => {
+                    return Ok(PickerOutcome::Workspace(path));
+                }
+                SearchOutcome::ScaffoldAt(path) => {
+                    search = None;
+                    pending = Some(PickerPending::ScaffoldAt(path));
+                }
+            }
+            continue;
+        }
+        // Confirm modal: divert keys. ScaffoldAt is special — on
+        // confirm we exit the picker with the new workspace as the
+        // outcome so the outer driver opens its session TUI right
+        // away (per DESIGN §12: "scaffold + open immediately").
         if let Some(action) = pending.take() {
             match crate::tui::confirm::classify(key.code) {
                 crate::tui::confirm::ConfirmKey::Confirm => {
-                    let msg = perform_picker_action(action, &mut workspaces, &mut state);
-                    status.set(msg);
+                    if let PickerPending::ScaffoldAt(dir) = &action {
+                        match perform_scaffold_at(dir) {
+                            Ok(new_path) => {
+                                return Ok(PickerOutcome::Workspace(new_path));
+                            }
+                            Err(e) => {
+                                status.set(format!("scaffold failed: {e:#}"));
+                            }
+                        }
+                    } else {
+                        let msg = perform_picker_action(action, &mut workspaces, &mut state);
+                        status.set(msg);
+                    }
                 }
                 crate::tui::confirm::ConfirmKey::Cancel => {
                     status.set("cancelled".into());
@@ -201,10 +242,10 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                 }
             }
             (KeyCode::Char('n'), _) => {
-                status.set(
-                    "n: to scaffold a new workspace, exit pa and run 'pa onboard' or 'pa init <name>'"
-                        .into(),
-                );
+                // Open the in-TUI find-folder overlay. Default opts
+                // search from $HOME with depth 6, recency + zoxide
+                // tiers populate the initial list before any typing.
+                search = Some(crate::tui::find::SearchState::default());
             }
             (KeyCode::Char('e'), _) => {
                 status.set("e: in-TUI workspace editing is coming soon".into());
@@ -346,7 +387,29 @@ fn perform_picker_action(
                 Err(e) => format!("delete failed: {e}"),
             }
         }
+        // ScaffoldAt is handled inline in the run loop because on
+        // success we exit the picker entirely, returning the new
+        // workspace as the outcome. Reaching this arm is a bug.
+        PickerPending::ScaffoldAt(_) => "scaffold path took the wrong branch (bug)".into(),
     }
+}
+
+/// Run the scaffold at `dir` for a fresh workspace. The display
+/// name is the directory's basename; multiplexer comes from the
+/// machine default (or tmux). Returns the new workspace file path
+/// on success.
+fn perform_scaffold_at(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let display_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+    let mpx = crate::config::current_default_multiplexer()
+        .ok()
+        .flatten()
+        .unwrap_or(crate::domain::Multiplexer::Tmux);
+    let outcome = crate::scaffold::create_at(dir, &display_name, mpx, false, false)?;
+    Ok(outcome.path().to_path_buf())
 }
 
 fn clamp_selection(workspaces: &[PathBuf], state: &mut ListState) {
@@ -359,6 +422,7 @@ fn clamp_selection(workspaces: &[PathBuf], state: &mut ListState) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut Frame<'_>,
     workspaces: &[PathBuf],
@@ -366,6 +430,7 @@ fn render(
     help_open: bool,
     pending: &Option<PickerPending>,
     info: &Option<InfoModal>,
+    search: &mut Option<crate::tui::find::SearchState>,
     status: &Option<String>,
 ) {
     let area = frame.area();
@@ -527,6 +592,13 @@ fn render(
         crate::tui::confirm::render_info(frame, area, &modal.title, modal.lines.clone());
     }
 
+    // Search overlay renders above all the picker rows but below
+    // the help / confirm overlays so help still wins if a user
+    // hits `?` from inside search.
+    if let Some(s) = search.as_mut() {
+        crate::tui::find::render(frame, area, s);
+    }
+
     if help_open {
         crate::tui::help::render_overlay(frame, area, crate::tui::help::HelpContext::Picker);
     }
@@ -552,6 +624,22 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
                 path.display(),
             ),
         ),
+        PickerPending::ScaffoldAt(path) => {
+            let stem = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workspace");
+            (
+                "Scaffold new workspace".into(),
+                format!(
+                    "Create a new workspace named '{stem}' at {}? \
+                     A `{stem}.portagenty.toml` will be written there with \
+                     a starter shell session, registered globally, and opened \
+                     in the session TUI immediately.",
+                    path.display(),
+                ),
+            )
+        }
     }
 }
 

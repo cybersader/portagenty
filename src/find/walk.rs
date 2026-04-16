@@ -88,10 +88,16 @@ mod tests {
     fn skips_node_modules_and_dot_git() {
         let tmp = assert_fs::TempDir::new().unwrap();
         tmp.child("project_a").create_dir_all().unwrap();
-        tmp.child("project_a/node_modules").create_dir_all().unwrap();
-        tmp.child("project_a/node_modules/lodash").create_dir_all().unwrap();
+        tmp.child("project_a/node_modules")
+            .create_dir_all()
+            .unwrap();
+        tmp.child("project_a/node_modules/lodash")
+            .create_dir_all()
+            .unwrap();
         tmp.child("project_a/.git").create_dir_all().unwrap();
-        tmp.child("project_a/.git/objects").create_dir_all().unwrap();
+        tmp.child("project_a/.git/objects")
+            .create_dir_all()
+            .unwrap();
         tmp.child("project_a/src").create_dir_all().unwrap();
         tmp.child("project_b").create_dir_all().unwrap();
 
