@@ -579,12 +579,20 @@ impl SearchState {
         self.anim_offset = 0;
         self.anim_tick = 0;
         self.raw_dirs.clear();
-        // Re-seed with instant tiers so we have something immediately.
+        // Re-seed with instant tiers, but FILTER to only include
+        // paths under the current root. Without this, drilling into
+        // "truenas-home-server" still shows recents from completely
+        // unrelated directories (the bug the user reported).
+        let roots = &self.opts.roots;
         for p in crate::find::recency::collect() {
-            self.raw_dirs.push(p);
+            if is_under_any_root(&p, roots) {
+                self.raw_dirs.push(p);
+            }
         }
         for p in crate::find::zoxide::collect() {
-            self.raw_dirs.push(p);
+            if is_under_any_root(&p, roots) {
+                self.raw_dirs.push(p);
+            }
         }
         self.bg_rx = Some(spawn_bg_walk(self.opts.clone()));
         self.scanning = true;
@@ -1177,20 +1185,25 @@ fn render_static_breadcrumb_inner(
 ) -> Vec<Line<'static>> {
     let budget = width.saturating_sub(2);
     if full.chars().count() <= budget {
+        // Fits on one line. Backends on line 1 (top), path on line 2
+        // (bottom, closer to the input — the deeper/leaf part is
+        // what the user cares about).
         vec![
-            Line::from(Span::styled(full.to_string(), bold)),
             Line::from(Span::styled(format!("     [{backends}]"), dim)),
+            Line::from(Span::styled(full.to_string(), bold)),
         ]
     } else {
+        // Wraps: line 1 = start of path (ancestors), line 2 = end
+        // (deeper/leaf part, closer to input where eyes are).
         let line1: String = full.chars().take(budget).collect();
         let line2: String = full.chars().skip(budget).collect();
         vec![
-            Line::from(Span::styled(format!("  {line1}"), bold)),
             Line::from(vec![
-                Span::styled(format!("  {line2}"), bold),
+                Span::styled(format!("  {line1}"), dim),
                 Span::raw("  "),
                 Span::styled(format!("[{backends}]"), dim),
             ]),
+            Line::from(Span::styled(format!("  {line2}"), bold)),
         ]
     }
 }
@@ -1390,6 +1403,15 @@ fn build_fullscreen_path(path: &Path) -> FullscreenPath {
         title: "Full path".into(),
         lines,
     }
+}
+
+/// Check if `path` is a descendant of any of the given `roots`.
+fn is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    let path_str = path.display().to_string();
+    roots.iter().any(|r| {
+        let root_str = r.display().to_string();
+        path_str.starts_with(&root_str)
+    })
 }
 
 fn compact_home(p: &str) -> String {
