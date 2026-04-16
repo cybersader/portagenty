@@ -682,8 +682,8 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             None => SearchOutcome::Continue,
             Some(c) => classify_pick(&c.path),
         },
-        // `>` drill into highlighted folder.
-        (KeyCode::Char('>'), _) => {
+        // Drill into highlighted folder: → or Alt+J or >
+        (KeyCode::Right, _) | (KeyCode::Char('>'), _) => {
             if let Some(c) = state.highlighted() {
                 state.opts.roots = vec![c.path.clone()];
                 state.input.clear();
@@ -697,7 +697,8 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         // wrong folder with `>`, one `<` gets you back to its
         // parent's siblings. Falls back to root's parent if nothing
         // is highlighted.
-        (KeyCode::Char('<'), _) => {
+        // Go up: ← or Alt+K or <
+        (KeyCode::Left, _) | (KeyCode::Char('<'), _) => {
             let target = state
                 .highlighted()
                 .and_then(|c| c.path.parent())
@@ -948,14 +949,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 Paragraph::new(Line::from(vec![
                     Span::styled(" ─── ", sep),
                     Span::styled(
-                        "> ",
+                        "→ ",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("drill  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
-                        "< ",
+                        "← ",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -1006,14 +1007,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 Paragraph::new(Line::from(vec![
                     Span::styled(" ─── ", sep),
                     Span::styled(
-                        "> ",
+                        "l/→ ",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("expand  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
-                        "< ",
+                        "h/← ",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
