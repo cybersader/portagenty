@@ -98,11 +98,11 @@ pub fn handle_key(state: &mut EditState, code: KeyCode, mods: KeyModifiers) -> E
                 EditOutcome::Continue
             }
             KeyCode::Char('c') => {
-                // Instead of a text input, signal the caller to open
-                // the find/tree overlay for folder selection. The
-                // caller (App) handles the overlay lifecycle and
-                // writes the chosen path back via edit_session_in_file.
-                EditOutcome::BrowseForCwd
+                *state = EditState::TypingValue {
+                    field: TextField::Cwd,
+                    input: String::new(),
+                };
+                EditOutcome::Continue
             }
             KeyCode::Char('m') => {
                 *state = EditState::TypingValue {
