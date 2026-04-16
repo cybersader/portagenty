@@ -155,8 +155,27 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             }
             SearchOutcome::Continue
         }
-        // `<` pops back to the default roots if you over-drilled.
+        // `<` navigates UP one level — sets the root to the parent
+        // of the current root. Recursive: keep pressing `<` to walk
+        // up the tree. At `/` (or when the parent equals the root)
+        // it's a no-op. Ctrl+R resets all the way back to defaults
+        // if you want to start over from $HOME.
         (KeyCode::Char('<'), _) => {
+            if let Some(root) = state.opts.roots.first().cloned() {
+                if let Some(parent) = root.parent() {
+                    if parent != root {
+                        state.opts.roots = vec![parent.to_path_buf()];
+                        state.input.clear();
+                        state.refresh();
+                    }
+                }
+            }
+            SearchOutcome::Continue
+        }
+        // Ctrl+R fully resets roots to the machine defaults ($HOME
+        // + WSL root if applicable). The nuclear "go back to square
+        // one" for when > / < navigation lost the user.
+        (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
             state.opts.roots = crate::find::default_roots();
             state.input.clear();
             state.refresh();
@@ -296,10 +315,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     }
 
     // Bottom hint.
-    let hint = Paragraph::new(
-        " Enter open/scaffold · > drill in · < reset roots · Esc cancel · ↑/↓ nav · ? help ",
-    )
-    .style(Style::default().add_modifier(Modifier::DIM));
+    let hint =
+        Paragraph::new(" Enter open · > drill in · < go up · Ctrl+R reset · Esc cancel · ↑/↓ nav ")
+            .style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(hint, chunks[3]);
 }
 
