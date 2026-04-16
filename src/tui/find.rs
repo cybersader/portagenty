@@ -149,22 +149,14 @@ impl SearchState {
     /// context). Specifically: each segment is shown for
     /// `max(2, 8 - offset)` ticks, so the leaf sits for ~2s and
     /// the root for ~0.5s before advancing.
+    /// Advance the marquee by one character every 2 ticks (~0.5s
+    /// per char). Readable scrolling speed — fast enough to not
+    /// feel stuck, slow enough to read as it passes.
     pub fn tick_animation(&mut self) {
         self.anim_tick = self.anim_tick.wrapping_add(1);
-        let segments = path_segments(&self.opts.roots);
-        if segments.len() <= 1 {
-            return; // nothing to animate
-        }
-        // Ticks per step: starts at 16 (~4s at the leaf — where the
-        // user needs time to read), decreases to 4 (~1s near the
-        // root — less useful context scrolls faster).
-        let ticks_per_step = 16u32.saturating_sub(self.anim_offset as u32 * 2).max(4);
-        if self.anim_tick % ticks_per_step == 0 {
+        // Advance 1 character every 2 ticks (= every 0.5s).
+        if self.anim_tick % 2 == 0 {
             self.anim_offset += 1;
-            if self.anim_offset >= segments.len() {
-                // Reached the root — pause an extra beat then wrap.
-                self.anim_offset = 0;
-            }
         }
     }
 
@@ -467,12 +459,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
         ])
         .split(inner);
 
-    // Static 2-line breadcrumb. Line 1: folder icon + path (wraps to
-    // line 2 if too long). Backends on line 2 as dim suffix.
-    // No animation — just clear, always-readable text.
+    // 2-line marquee breadcrumb. If the path fits in 2 lines, show
+    // it statically. If it overflows, scroll character-by-character
+    // (barbershop ticker) so the user sees every part of the path
+    // rotate through the visible window.
     let inner_w = inner.width as usize;
-    let breadcrumb =
-        render_static_breadcrumb(&state.opts.roots, inner_w, &state.backends.one_liner());
+    let breadcrumb = render_marquee_breadcrumb(
+        &state.opts.roots,
+        inner_w,
+        &state.backends.one_liner(),
+        state.anim_offset,
+    );
     frame.render_widget(Paragraph::new(breadcrumb), chunks[0]);
 
     // Input line: prompt char + user text + caret (block style).
@@ -594,9 +591,94 @@ fn candidate_item(c: &Candidate, width: u16) -> ListItem<'static> {
 ///   `/mnt/c/Users/Cybersader/Documents/1 Projects, Workspaces`
 ///   → `["1 Projects, Workspaces", "Documents", "C", "U", "c", "m"]`
 ///
-/// Render a static 2-line breadcrumb. Line 1: the full path with
-/// ~ for home and a folder icon. Line 2: backends, or overflow
-/// from line 1 + backends. No animation — just clear, readable.
+/// Render a 2-line marquee breadcrumb. If the path fits in the
+/// available space, it's shown statically. If it overflows, the
+/// text scrolls left character-by-character (news-ticker style)
+/// within the 2-line container, wrapping around with a gap.
+fn render_marquee_breadcrumb(
+    roots: &[PathBuf],
+    width: usize,
+    backends: &str,
+    char_offset: usize,
+) -> Vec<Line<'static>> {
+    let bold = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+
+    let path_str = roots
+        .first()
+        .map(|p| compact_home(&p.display().to_string()))
+        .unwrap_or_else(|| "(no root)".into());
+
+    let prefix = "  📂 ";
+    let full = format!("{prefix}{path_str}");
+    let capacity = width.saturating_sub(2) * 2; // 2 lines worth
+
+    if full.chars().count() <= capacity {
+        // Fits — show statically across 2 lines with backends.
+        return render_static_breadcrumb_inner(&full, width, backends, bold, dim);
+    }
+
+    // Overflow: marquee scroll. Build a looping string with a gap
+    // separator so the wrap point is visually obvious.
+    let gap = "   ···   ";
+    let looping = format!("{full}{gap}");
+    let loop_len = looping.chars().count();
+    let offset = char_offset % loop_len;
+
+    // Extract a window of `capacity` characters starting at offset,
+    // wrapping around the loop.
+    let chars: Vec<char> = looping.chars().collect();
+    let mut visible = String::with_capacity(capacity);
+    for i in 0..capacity {
+        visible.push(chars[(offset + i) % loop_len]);
+    }
+
+    // Split into 2 lines.
+    let line1_budget = width.saturating_sub(2);
+    let line1: String = visible.chars().take(line1_budget).collect();
+    let line2: String = visible.chars().skip(line1_budget).collect();
+
+    vec![
+        Line::from(Span::styled(format!("  {line1}"), bold)),
+        Line::from(vec![
+            Span::styled(format!("  {line2}"), bold),
+            Span::raw("  "),
+            Span::styled(format!("[{backends}]"), dim),
+        ]),
+    ]
+}
+
+fn render_static_breadcrumb_inner(
+    full: &str,
+    width: usize,
+    backends: &str,
+    bold: Style,
+    dim: Style,
+) -> Vec<Line<'static>> {
+    let budget = width.saturating_sub(2);
+    if full.chars().count() <= budget {
+        vec![
+            Line::from(Span::styled(full.to_string(), bold)),
+            Line::from(Span::styled(format!("     [{backends}]"), dim)),
+        ]
+    } else {
+        let line1: String = full.chars().take(budget).collect();
+        let line2: String = full.chars().skip(budget).collect();
+        vec![
+            Line::from(Span::styled(format!("  {line1}"), bold)),
+            Line::from(vec![
+                Span::styled(format!("  {line2}"), bold),
+                Span::raw("  "),
+                Span::styled(format!("[{backends}]"), dim),
+            ]),
+        ]
+    }
+}
+
+/// (Previous static-only version, kept for reference)
+#[allow(dead_code)]
 fn render_static_breadcrumb(roots: &[PathBuf], width: usize, backends: &str) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
     let bold = Style::default()
@@ -636,6 +718,7 @@ fn render_static_breadcrumb(roots: &[PathBuf], width: usize, backends: &str) -> 
 /// Leaf + parent stay full (they're the useful context); the rest
 /// compress. This is the "much smaller" path the user asked for —
 /// the terminal can't change font size, so we abbreviate instead.
+#[allow(dead_code)]
 fn path_segments(roots: &[PathBuf]) -> Vec<String> {
     let Some(root) = roots.first() else {
         return vec!["(no root)".into()];
