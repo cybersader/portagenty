@@ -230,61 +230,32 @@ fn scaffold_flow<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<
     let answer = read_line(input)?;
     let with_claude = !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no");
 
-    // Sanitize filename stem the same way `pa init` does.
-    let stem: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let filename = format!("{stem}.portagenty.toml");
-    let path = cwd.join(&filename);
-
-    if path.exists() {
-        writeln!(output)?;
-        writeln!(
-            output,
-            "  {} already exists; leaving it alone.",
-            path.display()
-        )?;
-        writeln!(output, "  Run `pa init --force` if you want to overwrite.")?;
-        writeln!(output, "  Run `pa onboard` anytime to re-run this wizard.")?;
-        mark_onboarded()?;
-        return Ok(OnboardOutcome::Skipped);
+    // Delegate the file mutation to crate::scaffold so init / wizard
+    // / future TUI flow share one scaffolder. The wizard owns the
+    // user prompts; the scaffolder owns the file write + global
+    // registry update.
+    let outcome = crate::scaffold::create_at(&cwd, &name, mpx_enum, with_claude, false)?;
+    let path = outcome.path().to_path_buf();
+    match outcome {
+        crate::scaffold::ScaffoldOutcome::AlreadyExisted(_) => {
+            writeln!(output)?;
+            writeln!(
+                output,
+                "  {} already exists; leaving it alone.",
+                path.display()
+            )?;
+            writeln!(output, "  Run `pa init --force` if you want to overwrite.")?;
+            writeln!(output, "  Run `pa onboard` anytime to re-run this wizard.")?;
+            mark_onboarded()?;
+            return Ok(OnboardOutcome::Skipped);
+        }
+        crate::scaffold::ScaffoldOutcome::Created(_) => {
+            writeln!(output)?;
+            writeln!(output, "  ✓ Created {}", path.display())?;
+            writeln!(output, "  Run `pa` here to open the TUI.")?;
+            writeln!(output, "  Run `pa onboard` anytime to re-run this wizard.")?;
+        }
     }
-
-    let mut body = String::new();
-    body.push_str(&format!(
-        "# Workspace file for portagenty. See:\n# https://cybersader.github.io/portagenty/reference/schema/\nname = \"{name}\"\nmultiplexer = \"{mpx_wire}\"\n\n"
-    ));
-    body.push_str(
-        "[[session]]\nname = \"shell\"\ncwd = \".\"\ncommand = \"bash\"\nkind = \"shell\"\n",
-    );
-    if with_claude {
-        body.push_str(
-            "\n[[session]]\nname = \"claude\"\ncwd = \".\"\ncommand = \"claude\"\nkind = \"claude-code\"\n",
-        );
-    }
-
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-
-    // Register globally so `pa` from any directory can see this
-    // workspace without the user having to walk back into the tree.
-    // Best-effort: a registry failure shouldn't break a successful
-    // scaffold — the local file still works via walk-up.
-    if let Err(e) = crate::config::register_global_workspace(&path) {
-        writeln!(output)?;
-        writeln!(output, "  warning: couldn't register in global index: {e}")?;
-    }
-
-    writeln!(output)?;
-    writeln!(output, "  ✓ Created {}", path.display())?;
-    writeln!(output, "  Run `pa` here to open the TUI.")?;
-    writeln!(output, "  Run `pa onboard` anytime to re-run this wizard.")?;
 
     mark_onboarded()?;
     Ok(OnboardOutcome::Scaffolded { path })

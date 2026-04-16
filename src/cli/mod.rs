@@ -472,6 +472,7 @@ fn toml_basic_string(s: &str) -> String {
 /// bash) so `pa` works end-to-end on the first run. Returns the path
 /// that got written.
 pub fn init(name: Option<String>, mpx: Option<InitMpxArg>, force: bool) -> Result<()> {
+    use crate::scaffold::{create_at, ScaffoldOutcome};
     let cwd = std::env::current_dir().context("reading current directory")?;
     let workspace_name = match name {
         Some(n) => n,
@@ -481,63 +482,29 @@ pub fn init(name: Option<String>, mpx: Option<InitMpxArg>, force: bool) -> Resul
             .unwrap_or("workspace")
             .to_string(),
     };
-
-    // Sanitize for filename use: replace anything non-safe with `_`.
-    // Filenames are strict about what's tolerable; the on-disk name
-    // is separate from the display name.
-    let filename_stem: String = workspace_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let filename = format!("{filename_stem}.portagenty.toml");
-    let path = cwd.join(&filename);
-
-    if path.exists() && !force {
-        return Err(anyhow!(
-            "{} already exists; pass --force to overwrite",
-            path.display()
-        ));
-    }
-
     let mpx = match mpx {
-        Some(InitMpxArg::Zellij) => "zellij",
-        Some(InitMpxArg::Tmux) | None => "tmux",
+        Some(InitMpxArg::Zellij) => MpxEnum::Zellij,
+        Some(InitMpxArg::Tmux) | None => MpxEnum::Tmux,
     };
 
-    let contents = format!(
-        r#"# Workspace file for portagenty. See:
-# https://cybersader.github.io/portagenty/reference/schema/
-name = {name}
-multiplexer = "{mpx}"
-
-[[session]]
-name = "shell"
-cwd = "."
-command = "bash"
-kind = "shell"
-"#,
-        name = toml_basic_string(&workspace_name),
-    );
-
-    std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
-
-    // Register globally so `pa` can list this workspace from any
-    // directory without relying on walk-up. Best-effort.
-    let _ = crate::config::register_global_workspace(&path);
-
+    let outcome = create_at(&cwd, &workspace_name, mpx, false, force)?;
     let out = io::stdout();
     let mut out = out.lock();
-    writeln!(out, "created {}", path.display())?;
-    writeln!(
-        out,
-        "run `pa` here to open the TUI, or `pa add` to append more sessions"
-    )?;
+    match outcome {
+        ScaffoldOutcome::Created(path) => {
+            writeln!(out, "created {}", path.display())?;
+            writeln!(
+                out,
+                "run `pa` here to open the TUI, or `pa add` to append more sessions"
+            )?;
+        }
+        ScaffoldOutcome::AlreadyExisted(path) => {
+            return Err(anyhow!(
+                "{} already exists; pass --force to overwrite",
+                path.display()
+            ));
+        }
+    }
     Ok(())
 }
 

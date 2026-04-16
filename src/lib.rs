@@ -11,6 +11,7 @@ pub mod domain;
 pub mod export;
 pub mod mux;
 pub mod onboarding;
+pub mod scaffold;
 pub mod snippets;
 pub mod state;
 pub mod tui;
