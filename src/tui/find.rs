@@ -155,8 +155,10 @@ impl SearchState {
         if segments.len() <= 1 {
             return; // nothing to animate
         }
-        // Ticks per step: starts at 8 (~2s), decreases to 2 (~0.5s).
-        let ticks_per_step = 8u32.saturating_sub(self.anim_offset as u32).max(2);
+        // Ticks per step: starts at 16 (~4s at the leaf — where the
+        // user needs time to read), decreases to 4 (~1s near the
+        // root — less useful context scrolls faster).
+        let ticks_per_step = 16u32.saturating_sub(self.anim_offset as u32 * 2).max(4);
         if self.anim_tick % ticks_per_step == 0 {
             self.anim_offset += 1;
             if self.anim_offset >= segments.len() {
@@ -590,20 +592,37 @@ fn candidate_item(c: &Candidate, width: u16) -> ListItem<'static> {
 /// Split the first root path into its directory segments, leaf-first.
 /// Example: `/mnt/c/Users/Cybersader/Documents` →
 ///   `["Documents", "Cybersader", "Users", "c", "mnt"]`
+/// Split the first root into path segments, leaf-first. Ancestors
+/// beyond the first two are abbreviated to their first character
+/// (fish-shell style) so the breadcrumb fits in much less space:
+///
+///   `/mnt/c/Users/Cybersader/Documents/1 Projects, Workspaces`
+///   → `["1 Projects, Workspaces", "Documents", "C", "U", "c", "m"]`
+///
+/// Leaf + parent stay full (they're the useful context); the rest
+/// compress. This is the "much smaller" path the user asked for —
+/// the terminal can't change font size, so we abbreviate instead.
 fn path_segments(roots: &[PathBuf]) -> Vec<String> {
     let Some(root) = roots.first() else {
         return vec!["(no root)".into()];
     };
     let display = compact_home(&root.display().to_string());
-    let mut segs: Vec<String> = display
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    segs.reverse(); // leaf first
-    if segs.is_empty() {
-        segs.push("/".into());
+    let raw_segs: Vec<&str> = display.split('/').filter(|s| !s.is_empty()).collect();
+    if raw_segs.is_empty() {
+        return vec!["/".into()];
     }
+    let n = raw_segs.len();
+    let mut segs: Vec<String> = Vec::with_capacity(n);
+    for (i, s) in raw_segs.iter().enumerate() {
+        // Last 2 segments (leaf + parent) stay full; the rest
+        // abbreviate to their first character.
+        if i + 2 >= n {
+            segs.push(s.to_string());
+        } else {
+            segs.push(s.chars().next().map(|c| c.to_string()).unwrap_or_default());
+        }
+    }
+    segs.reverse(); // leaf first
     segs
 }
 
