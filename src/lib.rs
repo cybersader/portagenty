@@ -16,6 +16,7 @@ pub mod scaffold;
 pub mod snippets;
 pub mod state;
 pub mod tui;
+pub mod workspace_edit;
 
 use cli::{Cli, Command};
 

@@ -99,6 +99,21 @@ enum PendingAction {
         /// about disconnecting other devices.
         attached_clients: Option<u32>,
     },
+    /// Switch the workspace's pinned multiplexer between tmux and
+    /// zellij. Edits the TOML in place via toml_edit (preserves
+    /// comments + sessions). Doesn't touch any live mpx sessions
+    /// already running — those stay in the old mpx and reappear
+    /// as Untracked rows.
+    SwitchMpx {
+        /// Multiplexer the workspace is currently pinned to.
+        from: crate::domain::Multiplexer,
+        /// Multiplexer to switch to.
+        to: crate::domain::Multiplexer,
+        /// How many sessions in the current mpx are live; included
+        /// in the confirm prompt as a "you'll orphan N sessions"
+        /// warning.
+        live_in_current: usize,
+    },
 }
 
 impl App {
@@ -273,6 +288,36 @@ impl App {
         });
     }
 
+    /// Queue a switch-mpx confirm modal. Toggles tmux <-> zellij
+    /// (the only two practical multiplexers); wezterm is a no-op
+    /// with a status hint. Requires a workspace file on disk —
+    /// the synthetic live-browse workspace can't be edited.
+    fn open_switch_mpx_prompt(&mut self) {
+        if self.workspace.file_path.is_none() {
+            self.set_status("m: live-browse mode has no workspace file to edit");
+            return;
+        }
+        use crate::domain::Multiplexer;
+        let (from, to) = match self.workspace.multiplexer {
+            Multiplexer::Tmux => (Multiplexer::Tmux, Multiplexer::Zellij),
+            Multiplexer::Zellij => (Multiplexer::Zellij, Multiplexer::Tmux),
+            Multiplexer::Wezterm => {
+                self.set_status("m: wezterm isn't supported; nothing to switch to");
+                return;
+            }
+        };
+        let live_in_current = self
+            .rows
+            .iter()
+            .filter(|r| r.state == SessionState::Live)
+            .count();
+        self.pending = Some(PendingAction::SwitchMpx {
+            from,
+            to,
+            live_in_current,
+        });
+    }
+
     fn open_delete_prompt(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -346,6 +391,31 @@ impl App {
                     }
                 }
             }
+            PendingAction::SwitchMpx { to, .. } => {
+                let Some(path) = self.workspace.file_path.clone() else {
+                    self.set_status("switch-mpx failed: no workspace file on disk");
+                    return;
+                };
+                match crate::workspace_edit::set_multiplexer(&path, to) {
+                    Ok(()) => {
+                        // The TUI's mux is the *old* mpx adapter
+                        // (constructed in tui::run before we entered
+                        // App::run); we can't safely swap it
+                        // mid-loop because attached sessions would
+                        // be left dangling. Instead, signal the
+                        // user to back to the picker (Esc) and
+                        // re-enter; on next entry the workspace
+                        // file is re-read with the new mpx.
+                        self.workspace.multiplexer = to;
+                        self.set_status(format!(
+                            "switched mpx to {to:?} — press Esc, then re-enter to use it"
+                        ));
+                    }
+                    Err(e) => {
+                        self.set_status(format!("switch-mpx failed: {e:#}"));
+                    }
+                }
+            }
         }
     }
 
@@ -386,6 +456,10 @@ impl App {
             }
             (KeyCode::Char('x'), _) => {
                 self.open_kill_prompt();
+                Action::None
+            }
+            (KeyCode::Char('m'), _) => {
+                self.open_switch_mpx_prompt();
                 Action::None
             }
             (KeyCode::Char('q'), _) => {
@@ -546,6 +620,7 @@ impl App {
                     Entry::new("j/k", "nav"),
                     Entry::new("d", "delete"),
                     Entry::new("x", "kill"),
+                    Entry::new("m", "switch mpx"),
                 ],
             );
         }
@@ -803,6 +878,45 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
                     "Terminate the live mpx session {display_name:?}?{extra} \
                      This does NOT edit the workspace file, so the declared \
                      session will reappear as idle on the next refresh."
+                ),
+            )
+        }
+        PendingAction::SwitchMpx {
+            from,
+            to,
+            live_in_current,
+        } => {
+            let from_name = match from {
+                crate::domain::Multiplexer::Tmux => "tmux",
+                crate::domain::Multiplexer::Zellij => "zellij",
+                crate::domain::Multiplexer::Wezterm => "wezterm",
+            };
+            let to_name = match to {
+                crate::domain::Multiplexer::Tmux => "tmux",
+                crate::domain::Multiplexer::Zellij => "zellij",
+                crate::domain::Multiplexer::Wezterm => "wezterm",
+            };
+            let extra = if *live_in_current >= 2 {
+                format!(
+                    " {live_in_current} sessions are currently live in {from_name}; \
+                     they keep running but won't appear in the new mpx until you \
+                     migrate or kill them."
+                )
+            } else if *live_in_current == 1 {
+                format!(
+                    " 1 session is currently live in {from_name}; it keeps running \
+                     but won't appear in {to_name} until you migrate or kill it."
+                )
+            } else {
+                String::new()
+            };
+            (
+                "Switch multiplexer".into(),
+                format!(
+                    "Change workspace {workspace_name:?} from {from_name} to {to_name}? \
+                     The TOML's `multiplexer` field is updated; comments and sessions \
+                     stay intact.{extra} You'll need to press Esc back to the picker \
+                     and re-enter the workspace for the new mpx adapter to take over."
                 ),
             )
         }
