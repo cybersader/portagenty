@@ -163,6 +163,12 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                     search = None;
                     pending = Some(PickerPending::ScaffoldAt(path));
                 }
+                SearchOutcome::BackToSearch => {
+                    // Tree mode Esc → switch back to search mode.
+                    if let Some(s) = search.as_mut() {
+                        s.mode = crate::tui::find::FindMode::Search;
+                    }
+                }
             }
             continue;
         }

@@ -226,14 +226,19 @@ impl TreeBrowseState {
     }
 }
 
-/// Handle a key press in tree mode.
+/// Handle a key press in tree mode. Returns `BackToSearch` when
+/// Esc is pressed so the user drops back to search mode (not all
+/// the way out to the picker — that's the Android-back pattern).
 pub fn handle_tree_key(
     state: &mut TreeBrowseState,
     code: KeyCode,
     mods: KeyModifiers,
 ) -> SearchOutcome {
     match (code, mods) {
-        (KeyCode::Esc, _) => SearchOutcome::Cancel,
+        // Esc → back to search (NOT cancel the whole overlay).
+        // q or Ctrl+C → close overlay entirely.
+        (KeyCode::Esc, _) => SearchOutcome::BackToSearch,
+        (KeyCode::Char('q'), _) => SearchOutcome::Cancel,
         (KeyCode::Char('?'), _) => SearchOutcome::OpenHelp,
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::Cancel,
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
@@ -352,6 +357,9 @@ pub enum SearchOutcome {
     /// User opened the help overlay via `?`. Picker handles the
     /// help bookkeeping.
     OpenHelp,
+    /// User pressed Esc in tree mode — switch back to search mode
+    /// instead of closing the entire overlay (Android-back pattern).
+    BackToSearch,
 }
 
 /// Mutable state for the search overlay. Lives inside
@@ -920,10 +928,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 frame.render_stateful_widget(list, chunks[2], &mut state.list_state);
             }
 
-            let hint = Paragraph::new(
-                " Enter · t tree · >/Alt+J drill · </Alt+K up · Ctrl+F path · Esc · ↑/↓ ",
-            )
-            .style(Style::default().add_modifier(Modifier::DIM));
+            let hint = Paragraph::new(" Enter open · t tree · Ctrl+F path · Esc back · ↑/↓ nav ")
+                .style(Style::default().add_modifier(Modifier::DIM));
             frame.render_widget(hint, chunks[3]);
         }
         FindMode::Tree(tree) => {
@@ -938,7 +944,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
             render_tree(frame, tree_area, tree);
 
             let hint = Paragraph::new(
-                " Enter open · >/l expand · </h collapse · Space toggle · t search · Ctrl+F path · Esc ",
+                " Enter open · >/l expand · </h collapse · t search · Esc back · q quit ",
             )
             .style(Style::default().add_modifier(Modifier::DIM));
             frame.render_widget(hint, chunks[3]);
