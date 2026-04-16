@@ -35,23 +35,61 @@ const IGNORE_NAMES: &[&str] = &[
 /// Walk each root up to `opts.max_depth` and return every visited
 /// directory. The `_query` is currently unused at this layer (the
 /// ranker filters by query), but keeping it in the signature lets a
-/// future depth-aware optimization opt in (e.g. early-stop when no
-/// children of a subtree could match a literal-prefix query).
+/// future depth-aware optimization opt in.
 pub fn collect(_query: &str, opts: &FindOpts) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for root in &opts.roots {
         if root.is_dir() {
-            walk_into(root, 0, opts.max_depth, &mut out);
+            walk_into(root, 0, opts.max_depth, &mut out, &mut None);
         }
     }
     out
 }
 
-fn walk_into(dir: &Path, depth: u16, max_depth: u16, out: &mut Vec<PathBuf>) {
+/// Streaming variant: sends batches of ~500 dirs over `tx` as they
+/// are discovered, so the TUI can show results before the walk
+/// finishes. Flushing the accumulator every BATCH_SIZE dirs keeps
+/// the channel busy without per-dir overhead.
+pub fn collect_streaming(
+    _query: &str,
+    opts: &FindOpts,
+    tx: &std::sync::mpsc::Sender<Vec<PathBuf>>,
+) {
+    let mut accum: Vec<PathBuf> = Vec::with_capacity(BATCH_SIZE);
+    let mut sender = Some(tx);
+    for root in &opts.roots {
+        if root.is_dir() {
+            walk_into(root, 0, opts.max_depth, &mut accum, &mut sender);
+        }
+    }
+    // Flush remaining.
+    if !accum.is_empty() {
+        if let Some(tx) = sender {
+            let _ = tx.send(accum);
+        }
+    }
+}
+
+const BATCH_SIZE: usize = 500;
+
+fn walk_into(
+    dir: &Path,
+    depth: u16,
+    max_depth: u16,
+    out: &mut Vec<PathBuf>,
+    tx: &mut Option<&std::sync::mpsc::Sender<Vec<PathBuf>>>,
+) {
     if depth > max_depth {
         return;
     }
     out.push(dir.to_path_buf());
+    // Flush batch to channel if we've accumulated enough.
+    if let Some(sender) = tx.as_ref() {
+        if out.len() >= BATCH_SIZE {
+            let batch = std::mem::take(out);
+            let _ = sender.send(batch);
+        }
+    }
     if depth == max_depth {
         return;
     }
@@ -65,17 +103,13 @@ fn walk_into(dir: &Path, depth: u16, max_depth: u16, out: &mut Vec<PathBuf>) {
         }
         let name = e.file_name();
         let name_str = name.to_string_lossy();
-        // Skip hidden dirs by default — most are dotfiles like
-        // `.cache`, `.config`, etc. Users searching with leading `.`
-        // intentionally still find them via the absolute-path mode
-        // in the orchestrator.
         if name_str.starts_with('.') && name_str != "." {
             continue;
         }
         if IGNORE_NAMES.iter().any(|ign| *ign == name_str) {
             continue;
         }
-        walk_into(&e.path(), depth + 1, max_depth, out);
+        walk_into(&e.path(), depth + 1, max_depth, out, tx);
     }
 }
 

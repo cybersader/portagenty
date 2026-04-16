@@ -136,16 +136,20 @@ impl SearchState {
     pub fn poll_background(&mut self) {
         let Some(rx) = &self.bg_rx else { return };
         let mut changed = false;
-        while let Ok(batch) = rx.try_recv() {
-            self.raw_dirs.extend(batch);
-            changed = true;
-        }
-        // Check if the sender hung up (walk complete).
-        if changed || rx.try_recv().is_err() {
-            // Sender dropped → walk is done.
-            if self.scanning {
-                self.scanning = false;
-                changed = true; // trigger one more rerank
+        loop {
+            match rx.try_recv() {
+                Ok(batch) => {
+                    self.raw_dirs.extend(batch);
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.scanning {
+                        self.scanning = false;
+                        changed = true;
+                    }
+                    break;
+                }
             }
         }
         if changed {
@@ -156,18 +160,18 @@ impl SearchState {
     /// Re-rank `raw_dirs` against `self.input` via nucleo. This is
     /// the ONLY place that touches the matcher — keystrokes just
     /// call this, never the walker.
+    /// Re-rank `raw_dirs` against `self.input` via nucleo. Runs on
+    /// the main thread so MUST be fast — no syscalls (canonicalize
+    /// on DrvFs was the old freeze; 5ms × 2500 paths = 12s blocked).
+    /// Dedup uses the raw path string instead.
     fn rerank(&mut self) {
         let trimmed = self.input.trim();
         if trimmed.is_empty() {
-            // No query → show all raw_dirs, deduped, up to the limit.
             let mut seen = std::collections::HashSet::new();
             self.candidates = self
                 .raw_dirs
                 .iter()
-                .filter(|p| {
-                    let key = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-                    seen.insert(key)
-                })
+                .filter(|p| seen.insert(p.to_string_lossy().into_owned()))
                 .take(self.opts.limit)
                 .map(|p| Candidate {
                     path: p.clone(),
@@ -186,8 +190,7 @@ impl SearchState {
             let mut scored: Vec<Candidate> = Vec::with_capacity(self.raw_dirs.len());
             let mut seen = std::collections::HashSet::new();
             for p in &self.raw_dirs {
-                let key = p.canonicalize().unwrap_or_else(|_| p.clone());
-                if !seen.insert(key) {
+                if !seen.insert(p.to_string_lossy().into_owned()) {
                     continue;
                 }
                 let haystack = p.to_string_lossy();
@@ -240,22 +243,21 @@ impl SearchState {
 fn spawn_bg_walk(opts: FindOpts) -> mpsc::Receiver<Vec<PathBuf>> {
     let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
     std::thread::spawn(move || {
-        // Tier 3: locate.
+        // Tier 3: locate (already batched — returns a Vec).
         let batch = crate::find::locate::collect("");
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
-        // Tier 4: fd.
+        // Tier 4: fd (already batched).
         let batch = crate::find::fd::collect("", &opts);
         if !batch.is_empty() {
             let _ = tx.send(batch);
         }
-        // Tier 5: stdlib walk.
-        let batch = crate::find::walk::collect("", &opts);
-        if !batch.is_empty() {
-            let _ = tx.send(batch);
-        }
-        // tx drops here → receiver sees disconnect → scanning = false.
+        // Tier 5: stdlib walk — streams ~500-dir batches over the
+        // channel so results arrive incrementally instead of waiting
+        // for the entire walk to finish.
+        crate::find::walk::collect_streaming("", &opts, &tx);
+        // tx drops here → receiver sees Disconnected → scanning = false.
     });
     rx
 }

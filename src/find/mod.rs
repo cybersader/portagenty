@@ -196,11 +196,11 @@ fn wsl_project_roots() -> Vec<PathBuf> {
 
 fn resolve_win_user_dir(users_root: &Path) -> Option<PathBuf> {
     if let Ok(user) = std::env::var("USER") {
-        let candidate = users_root.join(&user);
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        // WSL $USER is lowercase; Windows dir may be title-case.
+        // Always resolve via readdir so we get the on-disk casing
+        // (e.g. "Cybersader" not "cybersader"). DrvFs is case-
+        // insensitive so `is_dir()` accepts either, but the path
+        // we show in the title bar should match what the user
+        // actually sees in Explorer.
         if let Ok(entries) = std::fs::read_dir(users_root) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
