@@ -385,7 +385,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     // search root(s) (so a `>`-drill is obvious from a glance).
     let backends_str = state.backends.one_liner();
     let roots_str = compact_roots(&state.opts.roots);
-    let title = format!(" find folder · backends: {backends_str} · roots: {roots_str} ");
+    let scan_str = if state.scanning {
+        format!(" · scanning {}…", state.raw_dirs.len())
+    } else {
+        format!(" · {} dirs", state.raw_dirs.len())
+    };
+    let title = format!(" find folder · {backends_str} · {roots_str}{scan_str} ");
     let outer = Block::default()
         .title(title)
         .title_style(
