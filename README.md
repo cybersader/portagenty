@@ -1,4 +1,4 @@
-<![CDATA[<div align="center">
+<div align="center">
 
 # portagenty
 
@@ -177,4 +177,3 @@ Full docs: <https://cybersader.github.io/portagenty/>
 - **No agent-API wrapping.** Claude Code / OpenCode are external processes.
 - **No SQLite.** State is TOML files plus live polling.
 - **No GUI.** Terminal only. Forever.
-]]>
