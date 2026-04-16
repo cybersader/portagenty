@@ -156,8 +156,8 @@ fn export_to_stdout_uses_workspace_default_format() {
         .success()
         .stdout(contains("#!/usr/bin/env bash"))
         .stdout(contains("tmux new-session"))
-        .stdout(contains("'claude'"))
-        .stdout(contains("'tests'"));
+        .stdout(contains("'Demo-claude'"))
+        .stdout(contains("'Demo-tests'"));
 }
 
 #[test]

@@ -21,7 +21,8 @@ use crate::tui::view::{build_rows, SessionRow, SessionState};
 #[derive(Debug, Clone)]
 pub enum LaunchKind {
     /// Workspace-defined, not currently live: `create_and_attach`.
-    Create { session: Session },
+    /// `mpx_name` is the workspace-scoped name the mpx should use.
+    Create { session: Session, mpx_name: String },
     /// Already live (workspace or untracked): `attach` by sanitized name.
     Attach { mpx_name: String },
 }
@@ -237,10 +238,12 @@ impl App {
             Action::LaunchSelected => self.selected().and_then(|i| {
                 let row = self.rows.get(i)?;
                 let kind = match row.state {
-                    SessionState::NotStarted => row
-                        .session
-                        .as_ref()
-                        .map(|s| LaunchKind::Create { session: s.clone() })?,
+                    SessionState::NotStarted => {
+                        row.session.as_ref().map(|s| LaunchKind::Create {
+                            session: s.clone(),
+                            mpx_name: row.mpx_name.clone(),
+                        })?
+                    }
                     SessionState::Live | SessionState::Untracked => LaunchKind::Attach {
                         mpx_name: row.mpx_name.clone(),
                     },
@@ -1576,7 +1579,18 @@ mod tests {
     // based on row state.
     // ----------------------------------------------------------------
 
+    /// Tracked live session: prefixed with "x-" to match what
+    /// build_rows computes for workspace "x" + session name.
     fn live_session(name: &str) -> SessionInfo {
+        SessionInfo {
+            name: format!("x-{name}"),
+            cwd: None,
+            attached: None,
+        }
+    }
+
+    /// Untracked live session with bare name.
+    fn live_session_bare(name: &str) -> SessionInfo {
         SessionInfo {
             name: name.into(),
             cwd: None,
@@ -1595,7 +1609,7 @@ mod tests {
         let app = App::new(
             ws,
             Box::new(MockMultiplexer::new()),
-            vec![live_session("stranger")],
+            vec![live_session_bare("stranger")],
         );
         let rows = app.rows();
         assert_eq!(rows.len(), 3, "2 tracked + 1 untracked expected");
@@ -1625,8 +1639,12 @@ mod tests {
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let outcome = drive_enter(&mut app).expect("enter should produce outcome");
         match outcome {
-            AppOutcome::Launch(LaunchKind::Create { session }) => {
+            AppOutcome::Launch(LaunchKind::Create { session, mpx_name }) => {
                 assert_eq!(session.name, "s0");
+                assert!(
+                    mpx_name.contains("s0"),
+                    "mpx_name should contain session name: {mpx_name}"
+                );
             }
             other => panic!("expected Create, got {other:?}"),
         }
@@ -1644,7 +1662,7 @@ mod tests {
         let outcome = drive_enter(&mut app).expect("enter should produce outcome");
         match outcome {
             AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
-                assert_eq!(mpx_name, "s0");
+                assert_eq!(mpx_name, "x-s0");
             }
             other => panic!("expected Attach, got {other:?}"),
         }
@@ -1657,7 +1675,7 @@ mod tests {
         let mut app = App::new(
             ws,
             Box::new(MockMultiplexer::new()),
-            vec![live_session("orphan-session")],
+            vec![live_session_bare("orphan-session")],
         );
         let outcome = drive_enter(&mut app).expect("enter should produce outcome");
         match outcome {
@@ -1686,7 +1704,7 @@ mod tests {
         let mut app = App::new(
             ws,
             Box::new(MockMultiplexer::new()),
-            vec![live_session("s0"), live_session("extra")],
+            vec![live_session("s0"), live_session_bare("extra")],
         );
         let terminal = render_to_backend(&mut app, 100, 10);
         // Body begins at first_body_row. Three rows expected in order:
@@ -1718,7 +1736,7 @@ mod tests {
         let mut app = App::new(
             ws,
             Box::new(MockMultiplexer::new()),
-            vec![live_session("other"), live_session("another")],
+            vec![live_session_bare("other"), live_session_bare("another")],
         );
         let terminal = render_to_backend(&mut app, 80, 5);
         let header = line_at(&terminal, 0);

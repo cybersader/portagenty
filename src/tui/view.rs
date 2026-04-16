@@ -7,7 +7,7 @@
 //! multiplexer or a ratatui backend.
 
 use crate::domain::{Session, SessionKind, Workspace};
-use crate::mux::{sanitize_session_name, SessionInfo};
+use crate::mux::{workspace_session_name, SessionInfo};
 
 /// Per-row state. Drives both the visual marker in the TUI and the
 /// action Enter maps to.
@@ -87,7 +87,7 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
     // Tracked rows first. Each row looks up its live counterpart to
     // pick up the attached-client count; absence means NotStarted.
     for sess in &workspace.sessions {
-        let mpx_name = sanitize_session_name(&sess.name);
+        let mpx_name = workspace_session_name(&workspace.name, &sess.name);
         let (state, attached_clients) = live
             .iter()
             .find(|s| s.name == mpx_name)
@@ -115,7 +115,7 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
     let tracked_mpx_names: std::collections::HashSet<String> = workspace
         .sessions
         .iter()
-        .map(|s| sanitize_session_name(&s.name))
+        .map(|s| workspace_session_name(&workspace.name, &s.name))
         .collect();
     let mut untracked: Vec<&SessionInfo> = live
         .iter()
@@ -188,7 +188,23 @@ mod tests {
         }
     }
 
+    /// Build live session infos. Names are automatically prefixed
+    /// with "x-" to match the workspace-scoped mpx names that
+    /// build_rows now generates (workspace "x" + session name).
     fn live(names: &[&str]) -> Vec<SessionInfo> {
+        names
+            .iter()
+            .map(|n| SessionInfo {
+                name: format!("x-{n}"),
+                cwd: None,
+                attached: None,
+            })
+            .collect()
+    }
+
+    /// Live sessions with bare names (for untracked sessions that
+    /// aren't in any workspace and keep their original mpx name).
+    fn live_untracked(names: &[&str]) -> Vec<SessionInfo> {
         names
             .iter()
             .map(|n| SessionInfo {
@@ -221,12 +237,12 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SessionState::Live);
         assert_eq!(rows[0].display_name, "has spaces");
-        assert_eq!(rows[0].mpx_name, "has_spaces");
+        assert_eq!(rows[0].mpx_name, "x-has_spaces");
     }
 
     #[test]
     fn untracked_live_session_becomes_untracked_row() {
-        let rows = build_rows(&ws(vec![]), &live(&["random-tmux-session"]));
+        let rows = build_rows(&ws(vec![]), &live_untracked(&["random-tmux-session"]));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SessionState::Untracked);
         assert_eq!(rows[0].display_name, "random-tmux-session");
@@ -235,10 +251,11 @@ mod tests {
 
     #[test]
     fn tracked_rows_come_before_untracked() {
-        let rows = build_rows(
-            &ws(vec![("claude", "c"), ("tests", "t")]),
-            &live(&["claude", "stranger", "another"]),
-        );
+        // Mix workspace-prefixed ("x-claude" matches tracked) with
+        // bare names ("stranger", "another" = untracked).
+        let mut all_live = live(&["claude"]); // "x-claude"
+        all_live.extend(live_untracked(&["stranger", "another"]));
+        let rows = build_rows(&ws(vec![("claude", "c"), ("tests", "t")]), &all_live);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].display_name, "claude");
         assert_eq!(rows[0].state, SessionState::Live);
@@ -258,7 +275,7 @@ mod tests {
 
     #[test]
     fn untracked_rows_show_placeholder_for_unknown_command() {
-        let rows = build_rows(&ws(vec![]), &live(&["mystery"]));
+        let rows = build_rows(&ws(vec![]), &live_untracked(&["mystery"]));
         assert_eq!(rows[0].command_display, "(unknown)");
         assert_eq!(rows[0].cwd_display, "(unknown)");
     }
@@ -314,7 +331,7 @@ mod tests {
 
     #[test]
     fn untracked_row_always_has_no_kind() {
-        let rows = build_rows(&ws(vec![]), &live(&["mystery"]));
+        let rows = build_rows(&ws(vec![]), &live_untracked(&["mystery"]));
         assert_eq!(rows[0].kind, None);
     }
 }

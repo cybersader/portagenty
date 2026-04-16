@@ -22,6 +22,21 @@ pub fn sanitize_session_name(raw: &str) -> String {
     }
 }
 
+/// Produce a workspace-scoped mpx session name. Prevents collisions
+/// between workspaces that declare sessions with the same name
+/// (e.g. both have `"shell"`). The mpx sees `"cyberchaste-shell"`;
+/// the TUI display name stays unprefixed.
+pub fn workspace_session_name(workspace_name: &str, session_name: &str) -> String {
+    let prefix = sanitize_session_name(workspace_name);
+    let suffix = sanitize_session_name(session_name);
+    let combined = format!("{prefix}-{suffix}");
+    if combined.chars().count() > MAX_LEN {
+        combined.chars().take(MAX_LEN).collect()
+    } else {
+        combined
+    }
+}
+
 fn is_safe(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }

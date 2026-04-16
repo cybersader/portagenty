@@ -189,7 +189,7 @@ fn run_session_tui(
     Ok(match outcome {
         AppOutcome::Back => SessionRunOutcome::Back,
         AppOutcome::Quit => SessionRunOutcome::Quit,
-        AppOutcome::Launch(LaunchKind::Create { session }) => {
+        AppOutcome::Launch(LaunchKind::Create { session, mpx_name }) => {
             if let Some(path) = &workspace_file {
                 let _ = crate::state::record_launch(path, &session.name);
             }
@@ -197,7 +197,7 @@ fn run_session_tui(
             // pre-launch banner prints to the user's real shell.
             ratatui::restore();
             print_launch_banner(mpx_kind, &session.name);
-            SessionRunOutcome::Launched(mux.create_and_attach(&session, mode))
+            SessionRunOutcome::Launched(mux.create_and_attach(&session, &mpx_name, mode))
         }
         AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
             if let Some(path) = &workspace_file {

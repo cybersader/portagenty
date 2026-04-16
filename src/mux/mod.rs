@@ -10,7 +10,7 @@ pub mod session_info;
 pub mod tmux;
 pub mod zellij;
 
-pub use sanitize::sanitize_session_name;
+pub use sanitize::{sanitize_session_name, workspace_session_name};
 pub use session_info::SessionInfo;
 pub use tmux::TmuxAdapter;
 pub use zellij::ZellijAdapter;
@@ -63,10 +63,10 @@ pub trait Multiplexer {
     /// get bumped or left in place; see [`AttachMode`].
     fn attach(&self, name: &str, mode: AttachMode) -> Result<()>;
 
-    /// Create a session from `session` and attach. `mode` applies to
-    /// the attach step — a freshly-created session has no other
-    /// clients, so mode only matters when the session already exists.
-    fn create_and_attach(&self, session: &Session, mode: AttachMode) -> Result<()>;
+    /// Create a session from `session` and attach. `mpx_name` is the
+    /// workspace-scoped name the mpx should use (e.g. "cyberchaste-shell").
+    /// `mode` applies to the attach step.
+    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()>;
 
     /// Kill a session by sanitized name. No-op when the session does
     /// not exist.

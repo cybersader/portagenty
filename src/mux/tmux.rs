@@ -62,12 +62,16 @@ impl TmuxAdapter {
     /// create path without taking over the controlling TTY.
     pub fn create_detached(&self, session: &Session) -> Result<()> {
         let name = sanitize_session_name(&session.name);
-        if self.has_session(&name)? {
+        self.create_detached_with_name(session, &name)
+    }
+
+    fn create_detached_with_name(&self, session: &Session, name: &str) -> Result<()> {
+        if self.has_session(name)? {
             return Ok(());
         }
         ensure_cwd_exists(&session.cwd)?;
         let mut cmd = self.cmd();
-        cmd.arg("new-session").arg("-d").arg("-s").arg(&name);
+        cmd.arg("new-session").arg("-d").arg("-s").arg(name);
         // -e KEY=VAL flags: tmux applies these to the session's
         // environment, so the spawned shell + child processes see
         // them. Order is deterministic because session.env is BTreeMap.
@@ -184,10 +188,11 @@ impl Multiplexer for TmuxAdapter {
         Ok(())
     }
 
-    fn create_and_attach(&self, session: &Session, mode: AttachMode) -> Result<()> {
-        self.create_detached(session)?;
-        let name = sanitize_session_name(&session.name);
-        self.attach(&name, mode)
+    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()> {
+        // Use the caller-provided mpx_name (workspace-scoped) instead
+        // of computing from session.name (which would miss the prefix).
+        self.create_detached_with_name(session, mpx_name)?;
+        self.attach(mpx_name, mode)
     }
 
     fn kill(&self, name: &str) -> Result<()> {

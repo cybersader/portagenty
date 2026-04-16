@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Result};
 
 use crate::domain::Session;
-use crate::mux::{sanitize_session_name, AttachMode, Multiplexer, SessionInfo};
+use crate::mux::{AttachMode, Multiplexer, SessionInfo};
 
 /// zellij-backed [`Multiplexer`].
 #[derive(Debug, Clone, Default)]
@@ -340,10 +340,10 @@ impl Multiplexer for ZellijAdapter {
         Ok(())
     }
 
-    fn create_and_attach(&self, session: &Session, mode: AttachMode) -> Result<()> {
-        let name = sanitize_session_name(&session.name);
-        if self.has_session(&name)? {
-            return self.attach(&name, mode);
+    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()> {
+        let name = mpx_name;
+        if self.has_session(name)? {
+            return self.attach(name, mode);
         }
         if Self::is_inside_zellij() {
             bail!(
@@ -363,7 +363,7 @@ impl Multiplexer for ZellijAdapter {
                 .cmd()
                 .current_dir(&session.cwd)
                 .arg("attach")
-                .arg(&name)
+                .arg(name)
                 .arg("--create")
                 .status()
                 .map_err(|e| friendly_io_err("spawning zellij attach --create", e))?;
@@ -377,7 +377,7 @@ impl Multiplexer for ZellijAdapter {
         // inject `command`. Layout includes default_tab_template so
         // the status bar still renders; pane has close_on_exit so the
         // session cleans up naturally when the command finishes.
-        let layout = write_layout_file(session, &name)?;
+        let layout = write_layout_file(session, name)?;
 
         // `--layout` + `--session` is ambiguous in zellij (>=0.40): with
         // --session set, --layout tries to *add tabs to an existing
@@ -388,7 +388,7 @@ impl Multiplexer for ZellijAdapter {
         let status = self
             .cmd()
             .arg("--session")
-            .arg(&name)
+            .arg(name)
             .arg("--new-session-with-layout")
             .arg(&layout)
             .status()

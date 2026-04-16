@@ -13,7 +13,7 @@
 //!   spin-up in a single invocation.
 
 use crate::domain::{Multiplexer, Workspace};
-use crate::mux::sanitize_session_name;
+use crate::mux::workspace_session_name;
 
 /// Which artifact to render. The user picks via `--format`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +71,7 @@ pub fn render_tmux_script(workspace: &Workspace) -> String {
     }
 
     for sess in &workspace.sessions {
-        let name = sanitize_session_name(&sess.name);
+        let name = workspace_session_name(&workspace.name, &sess.name);
         out.push_str(&format!("# session: {}\n", sess.name));
         out.push_str(&format!(
             "tmux has-session -t {qname} 2>/dev/null || tmux new-session -d -s {qname}",
@@ -90,7 +90,7 @@ pub fn render_tmux_script(workspace: &Workspace) -> String {
         ));
     }
 
-    let first = sanitize_session_name(&workspace.sessions[0].name);
+    let first = workspace_session_name(&workspace.name, &workspace.sessions[0].name);
     out.push('\n');
     out.push_str(
         "# Attach to the first session (overrides any other client; matches `pa claim` semantics).\n",
@@ -255,8 +255,8 @@ mod tests {
         let out = render_tmux_script(&ws);
         let count = out.matches("tmux new-session").count();
         assert_eq!(count, 2, "expected 2 new-session lines:\n{out}");
-        assert!(out.contains("'alpha'"));
-        assert!(out.contains("'beta'"));
+        assert!(out.contains("'Demo-alpha'"));
+        assert!(out.contains("'Demo-beta'"));
         assert!(out.contains("'cmd-a'"));
         assert!(out.contains("'cmd-b'"));
     }
@@ -269,7 +269,7 @@ mod tests {
         ]);
         let out = render_tmux_script(&ws);
         assert!(
-            out.contains("tmux attach-session -d -t 'first'"),
+            out.contains("tmux attach-session -d -t 'Demo-first'"),
             "wrong attach line:\n{out}"
         );
     }
@@ -315,7 +315,7 @@ mod tests {
         let ws = ws_with(vec![sess("has spaces", "/a", "cmd")]);
         let out = render_tmux_script(&ws);
         assert!(
-            out.contains("'has_spaces'"),
+            out.contains("'Demo-has_spaces'"),
             "should use sanitized name:\n{out}"
         );
         // Original (un-sanitized) name still appears in the comment header.

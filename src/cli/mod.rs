@@ -385,7 +385,8 @@ pub fn launch(
     }
 
     let mux = build_mux(ws.multiplexer)?;
-    mux.create_and_attach(&sess, mode)
+    let mpx_name = crate::mux::workspace_session_name(&ws.name, &sess.name);
+    mux.create_and_attach(&sess, &mpx_name, mode)
         .with_context(|| format!("launching session {:?}", sess.name))
 }
 
