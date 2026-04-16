@@ -1473,7 +1473,7 @@ mod tests {
             input: input.to_string(),
             candidates: vec![
                 Candidate {
-                    path: PathBuf::from("/home/u/cyberchaste"),
+                    path: PathBuf::from("/home/u/my-project"),
                     source: Source::Recency,
                     score: 100,
                 },
@@ -1492,7 +1492,7 @@ mod tests {
             backends: BackendAvailability::default(),
             list_state: ListState::default(),
             raw_dirs: vec![
-                PathBuf::from("/home/u/cyberchaste"),
+                PathBuf::from("/home/u/my-project"),
                 PathBuf::from("/home/u/cybersader/portagenty"),
             ],
             bg_rx: None,

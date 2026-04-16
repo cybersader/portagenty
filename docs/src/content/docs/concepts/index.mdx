@@ -214,12 +214,12 @@ portrait. The footer's keybind hints shorten to fit
 ## Session-name namespacing
 
 Multiplexer session names are workspace-scoped: a session `"shell"`
-in workspace `"cyberchaste"` becomes `cyberchaste-shell` in the mpx.
+in workspace `"my-project"` becomes `my-project-shell` in the mpx.
 This prevents the collision where two workspaces both defining a
 `"shell"` session would silently share the same tmux/zellij session.
 
 The TUI display name stays unprefixed — you see `shell`, the mpx
-sees `cyberchaste-shell`. The mapping is handled by
+sees `my-project-shell`. The mapping is handled by
 `workspace_session_name()` in the sanitize module.
 
 ## Find-folder overlay

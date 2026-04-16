@@ -499,7 +499,7 @@ TUI. Both use the same `TreeBrowseState` and rendering code in
 Multiplexer session names are now workspace-scoped:
 `workspace_session_name(ws_name, session_name)` in
 `src/mux/sanitize.rs` produces `<workspace>-<session>` (e.g.
-`cyberchaste-shell`). This prevents the collision where two
+`my-project-shell`). This prevents the collision where two
 workspaces both defining a `"shell"` session would attach to the
 same mpx session.
 

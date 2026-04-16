@@ -64,7 +64,7 @@ fn confirm_modal_renders_at_termux_sizes() {
                 f,
                 f.area(),
                 "Delete session",
-                "Remove session 'claude' from workspace 'cyberchaste'? This edits the workspace TOML.",
+                "Remove session 'claude' from workspace 'my-project'? This edits the workspace TOML.",
             )
         })
         .unwrap();

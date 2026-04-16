@@ -455,21 +455,21 @@ mod tests {
     #[test]
     fn rank_drops_non_matches_and_orders_by_score() {
         let items = vec![
-            cand("/home/u/cyberchaste", Source::Walk),
+            cand("/home/u/alpha-project", Source::Walk),
             cand("/home/u/random/notebooks", Source::Walk),
-            cand("/home/u/cybersader/portagenty", Source::Walk),
+            cand("/home/u/alpha-tools/portagenty", Source::Walk),
         ];
-        let out = rank_and_truncate(items, "cyber", 10);
-        // 'cyber' should match cyberchaste and cybersader but not the
-        // notebooks dir.
+        let out = rank_and_truncate(items, "alpha", 10);
+        // 'alpha' should match alpha-project and alpha-tools but not
+        // the notebooks dir.
         let paths: Vec<String> = out.iter().map(|c| c.path.display().to_string()).collect();
         assert!(
-            paths.iter().any(|p| p.contains("cyberchaste")),
-            "missing cyberchaste in: {paths:?}"
+            paths.iter().any(|p| p.contains("alpha-project")),
+            "missing alpha-project in: {paths:?}"
         );
         assert!(
-            paths.iter().any(|p| p.contains("cybersader")),
-            "missing cybersader in: {paths:?}"
+            paths.iter().any(|p| p.contains("alpha-tools")),
+            "missing alpha-tools in: {paths:?}"
         );
         assert!(
             !paths.iter().any(|p| p.contains("notebooks")),

@@ -133,7 +133,7 @@ real projects:
   onboarding wizard, and the in-TUI find/scaffold flow all
   delegate to it.
 - **Session-name namespacing.** The sanitized mpx session name is
-  now `<workspace>-<session>` (e.g. `cyberchaste-shell` instead of
+  now `<workspace>-<session>` (e.g. `my-project-shell` instead of
   bare `shell`). Prevents cross-workspace collisions where two
   workspaces with a `"shell"` session would silently share the same
   mpx session. The TUI display name stays unprefixed.

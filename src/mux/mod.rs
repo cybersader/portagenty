@@ -64,7 +64,7 @@ pub trait Multiplexer {
     fn attach(&self, name: &str, mode: AttachMode) -> Result<()>;
 
     /// Create a session from `session` and attach. `mpx_name` is the
-    /// workspace-scoped name the mpx should use (e.g. "cyberchaste-shell").
+    /// workspace-scoped name the mpx should use (e.g. "myproject-shell").
     /// `mode` applies to the attach step.
     fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()>;
 
