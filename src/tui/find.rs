@@ -852,14 +852,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     let inner = outer.inner(region);
     frame.render_widget(outer, region);
 
-    // Inner layout: 2-line breadcrumb + input + candidate list + hint.
+    // Inner layout: breadcrumb + input + candidate list + 2-line footer.
+    // Two footer lines so all hotkeys are visible even on narrow
+    // Termux terminals. Line 1 = primary keys, line 2 = secondary.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // root breadcrumb (2 lines for wrapping)
+            Constraint::Length(2), // root breadcrumb
             Constraint::Length(1), // input
             Constraint::Min(1),    // candidate list
-            Constraint::Length(1),
+            Constraint::Length(1), // footer line 1
+            Constraint::Length(1), // footer line 2
         ])
         .split(inner);
 
@@ -937,10 +940,43 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                     Entry::new("↑/↓", "nav"),
                     Entry::new("Enter", "open"),
                     Entry::new("t", "tree"),
-                    Entry::new("Ctrl+F", "path"),
-                    Entry::new(">", "drill"),
-                    Entry::new("<", "up"),
                 ],
+            );
+            // Secondary line: less-critical keys.
+            let sep = Style::default().fg(Color::DarkGray);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ─── ", sep),
+                    Span::styled(
+                        "> ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("drill  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "< ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("up  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "Ctrl+F ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("path  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "Ctrl+R ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("reset", Style::default().add_modifier(Modifier::DIM)),
+                ])),
+                chunks[4],
             );
         }
         FindMode::Tree(tree) => {
@@ -962,11 +998,43 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                     Entry::new("Esc", "back"),
                     Entry::new("↑/↓", "nav"),
                     Entry::new("Enter", "open"),
-                    Entry::new(">", "expand"),
-                    Entry::new("<", "collapse"),
                     Entry::new("t", "search"),
-                    Entry::new("q", "quit"),
                 ],
+            );
+            let sep = Style::default().fg(Color::DarkGray);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ─── ", sep),
+                    Span::styled(
+                        "> ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("expand  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "< ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("collapse  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "Space ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("toggle  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "q ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("quit", Style::default().add_modifier(Modifier::DIM)),
+                ])),
+                chunks[4],
             );
         }
     }
