@@ -139,10 +139,11 @@ pub enum Command {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<PathBuf>,
     },
-    /// Change one field on an existing session without opening an
-    /// editor. Pass exactly one of --command / --cwd / --kind /
-    /// --rename; comments and formatting elsewhere in the file stay
-    /// untouched.
+    /// Change session fields without opening an editor. Pass at
+    /// most one of --command / --cwd / --kind / --rename per call;
+    /// --env KEY=VAL and --unset-env KEY are repeatable and stack
+    /// freely with each other and with one field flag. Comments
+    /// and formatting elsewhere in the file stay untouched.
     Edit {
         /// Name of the session to edit.
         name: String,
@@ -163,6 +164,16 @@ pub enum Command {
         /// workspace already has this name.
         #[arg(long = "rename")]
         rename: Option<String>,
+
+        /// Set or update an env var on the session. Format is
+        /// `KEY=VAL`. Repeatable. Combinable with other --env /
+        /// --unset-env flags or with one of the field flags above.
+        #[arg(long = "env")]
+        env: Vec<String>,
+
+        /// Remove an env var from the session by key. Repeatable.
+        #[arg(long = "unset-env")]
+        unset_env: Vec<String>,
 
         /// Explicit workspace file.
         #[arg(short = 'w', long = "workspace")]
@@ -691,18 +702,23 @@ pub(crate) fn remove_session_from_file(path: &std::path::Path, name: &str) -> Re
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn edit(
     name: &str,
     command: Option<&str>,
     cwd: Option<&str>,
     kind: Option<AddKindArg>,
     rename: Option<&str>,
+    env_set: &[String],
+    env_unset: &[String],
     workspace: Option<&PathBuf>,
 ) -> Result<()> {
-    // Require exactly one change — otherwise it's ambiguous what
-    // the user meant. Rather than apply all of a multi-flag set,
-    // error out with guidance.
-    let flag_count = [
+    // Of the field-replacement flags (command/cwd/kind/rename) at
+    // most one can apply per invocation — picking which TOML field
+    // got the user's intent shouldn't be a guessing game. env-set
+    // and env-unset are independent and stack freely with each
+    // other and with one field flag.
+    let field_flags = [
         command.is_some(),
         cwd.is_some(),
         kind.is_some(),
@@ -711,20 +727,66 @@ pub fn edit(
     .iter()
     .filter(|b| **b)
     .count();
-    if flag_count == 0 {
+    if field_flags > 1 {
         return Err(anyhow!(
-            "pa edit needs one of --command, --cwd, --kind, --rename"
+            "pa edit takes at most one of --command / --cwd / --kind / --rename per call \
+             (use additional --env / --unset-env alongside them as needed)"
         ));
     }
-    if flag_count > 1 {
+    if field_flags == 0 && env_set.is_empty() && env_unset.is_empty() {
         return Err(anyhow!(
-            "pa edit takes exactly one change at a time — pass only one of --command / --cwd / --kind / --rename"
+            "pa edit needs at least one of --command / --cwd / --kind / --rename / --env / --unset-env"
         ));
     }
 
+    // Validate KEY=VAL parsing up front so a malformed --env aborts
+    // before we touch the file.
+    let env_pairs: Vec<(String, String)> = env_set
+        .iter()
+        .map(|s| parse_env_kv(s))
+        .collect::<Result<_>>()?;
+
     let path = resolve_workspace_path(workspace)?;
+    let op = EditOp {
+        command: command.map(str::to_string),
+        cwd: cwd.map(str::to_string),
+        kind: kind.map(crate::domain::SessionKind::from),
+        rename: rename.map(str::to_string),
+        env_set: env_pairs,
+        env_unset: env_unset.to_vec(),
+    };
+
+    edit_session_in_file(&path, name, &op)?;
+
+    let out = io::stdout();
+    let mut out = out.lock();
+    writeln!(out, "edited session {name:?} in {}", path.display())?;
+    Ok(())
+}
+
+/// Bundle of changes to apply to a single session row in a workspace
+/// file. Pure data; no I/O. Used by both the CLI `pa edit` path and
+/// (forthcoming) the in-TUI `e` field-edit flow.
+#[derive(Debug, Clone, Default)]
+pub struct EditOp {
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub kind: Option<crate::domain::SessionKind>,
+    pub rename: Option<String>,
+    /// Env entries to set/overwrite. Order doesn't matter; the on-
+    /// disk env table is a TOML map.
+    pub env_set: Vec<(String, String)>,
+    /// Env keys to remove. Silent no-op for missing keys.
+    pub env_unset: Vec<String>,
+}
+
+/// Apply `op` to the named session inside the workspace file at
+/// `path`. Preserves comments + formatting via toml_edit; errors
+/// surface cleanly with the file path attached. Pub(crate) so the
+/// TUI's `e`-key flow can call without going through the CLI dispatch.
+pub(crate) fn edit_session_in_file(path: &std::path::Path, name: &str, op: &EditOp) -> Result<()> {
     let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let mut doc: toml_edit::DocumentMut = raw
         .parse()
@@ -751,8 +813,7 @@ pub fn edit(
         })
         .collect();
 
-    // Check the rename target doesn't collide with any other session.
-    if let Some(new_name) = rename {
+    if let Some(new_name) = &op.rename {
         if sibling_names.iter().any(|n| n == new_name) {
             return Err(anyhow!(
                 "another session is already named {new_name:?} in {}",
@@ -776,14 +837,14 @@ pub fn edit(
         })
         .ok_or_else(|| anyhow!("no session named {name:?} in {}", path.display()))?;
 
-    if let Some(new_cmd) = command {
-        table["command"] = toml_edit::value(new_cmd);
+    if let Some(new_cmd) = &op.command {
+        table["command"] = toml_edit::value(new_cmd.as_str());
     }
-    if let Some(new_cwd) = cwd {
-        table["cwd"] = toml_edit::value(new_cwd);
+    if let Some(new_cwd) = &op.cwd {
+        table["cwd"] = toml_edit::value(new_cwd.as_str());
     }
-    if let Some(k) = kind {
-        let kind_str = match crate::domain::SessionKind::from(k) {
+    if let Some(k) = op.kind {
+        let kind_str = match k {
             crate::domain::SessionKind::ClaudeCode => "claude-code",
             crate::domain::SessionKind::Opencode => "opencode",
             crate::domain::SessionKind::Editor => "editor",
@@ -793,17 +854,51 @@ pub fn edit(
         };
         table["kind"] = toml_edit::value(kind_str);
     }
-    if let Some(new_name) = rename {
-        table["name"] = toml_edit::value(new_name);
+    if let Some(new_name) = &op.rename {
+        table["name"] = toml_edit::value(new_name.as_str());
     }
 
-    std::fs::write(&path, doc.to_string())
-        .with_context(|| format!("writing {}", path.display()))?;
+    // env: applied AFTER the field changes so unset/set are
+    // visible in the same TOML write.
+    if !op.env_set.is_empty() || !op.env_unset.is_empty() {
+        // Ensure an `env` inline-or-table exists. Prefer regular
+        // table syntax for legibility on non-trivial env lists.
+        if !table.contains_key("env") {
+            table.insert("env", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let env_item = table
+            .get_mut("env")
+            .ok_or_else(|| anyhow!("env table missing after insert"))?;
+        let env_table = env_item
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("env field is not a table in {}", path.display()))?;
+        for k in &op.env_unset {
+            env_table.remove(k);
+        }
+        for (k, v) in &op.env_set {
+            env_table[k.as_str()] = toml_edit::value(v.as_str());
+        }
+        // If env is now empty, drop the key entirely so the file
+        // stays tidy.
+        if env_table.is_empty() {
+            table.remove("env");
+        }
+    }
 
-    let out = io::stdout();
-    let mut out = out.lock();
-    writeln!(out, "edited session {name:?} in {}", path.display())?;
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// Parse a `KEY=VAL` pair from a single CLI flag value. Errors when
+/// the `=` separator is missing or the key portion is empty.
+fn parse_env_kv(raw: &str) -> Result<(String, String)> {
+    let (k, v) = raw
+        .split_once('=')
+        .ok_or_else(|| anyhow!("expected KEY=VAL, got {raw:?}"))?;
+    if k.is_empty() {
+        return Err(anyhow!("env key cannot be empty in {raw:?}"));
+    }
+    Ok((k.to_string(), v.to_string()))
 }
 
 pub fn snippets(cmd: SnippetsCommand) -> Result<()> {

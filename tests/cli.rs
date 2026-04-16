@@ -572,11 +572,11 @@ fn edit_errors_without_any_change_flag() {
         .arg(&ws_path)
         .assert()
         .failure()
-        .stderr(contains("needs one of"));
+        .stderr(contains("needs at least one"));
 }
 
 #[test]
-fn edit_errors_with_multiple_change_flags() {
+fn edit_errors_with_multiple_field_change_flags() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
 
@@ -585,7 +585,82 @@ fn edit_errors_with_multiple_change_flags() {
         .arg(&ws_path)
         .assert()
         .failure()
-        .stderr(contains("exactly one change"));
+        .stderr(contains("at most one of"));
+}
+
+#[test]
+fn edit_sets_env_var_on_session() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    pa_cmd()
+        .args(["edit", "claude", "--env", "FOO=bar", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("edited session"));
+    let raw = std::fs::read_to_string(&ws_path).unwrap();
+    assert!(raw.contains("FOO"), "missing env key:\n{raw}");
+    assert!(raw.contains("bar"), "missing env val:\n{raw}");
+}
+
+#[test]
+fn edit_unsets_env_var_on_session() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+    // First set it.
+    pa_cmd()
+        .args(["edit", "claude", "--env", "REMOVE_ME=keep", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .success();
+    // Now remove it.
+    pa_cmd()
+        .args(["edit", "claude", "--unset-env", "REMOVE_ME", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .success();
+    let raw = std::fs::read_to_string(&ws_path).unwrap();
+    assert!(!raw.contains("REMOVE_ME"), "key not removed:\n{raw}");
+}
+
+#[test]
+fn edit_combines_field_change_with_env_change() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    pa_cmd()
+        .args([
+            "edit",
+            "claude",
+            "--command",
+            "newcmd",
+            "--env",
+            "X=1",
+            "-w",
+        ])
+        .arg(&ws_path)
+        .assert()
+        .success();
+    let raw = std::fs::read_to_string(&ws_path).unwrap();
+    assert!(raw.contains("newcmd"), "command not updated:\n{raw}");
+    assert!(
+        raw.contains('X') && raw.contains('1'),
+        "env not added:\n{raw}"
+    );
+}
+
+#[test]
+fn edit_rejects_malformed_env_pair() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    pa_cmd()
+        .args(["edit", "claude", "--env", "missing-equals", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .failure()
+        .stderr(contains("KEY=VAL"));
 }
 
 #[test]

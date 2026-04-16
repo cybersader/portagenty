@@ -150,13 +150,13 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(Line::raw(""));
             lines.push(heading(" Row + workspace actions"));
             lines.push(Line::raw(""));
+            lines.push(row("e", "edit session field (rename/cwd/cmd/kind/env)"));
             lines.push(row("d", "delete the session (edits TOML)"));
             lines.push(row("x", "kill the live mpx session"));
             lines.push(row("m", "switch workspace multiplexer (tmux ↔ zellij)"));
             lines.push(Line::raw(""));
             lines.push(heading(" Coming soon"));
             lines.push(Line::raw(""));
-            lines.push(row("e", "edit session fields in place"));
             lines.push(row("Space", "context menu for the row"));
         }
     }

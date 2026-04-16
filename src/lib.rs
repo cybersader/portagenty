@@ -62,6 +62,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             cwd,
             kind,
             rename,
+            env,
+            unset_env,
             workspace,
         }) => cli::edit(
             &name,
@@ -69,6 +71,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             cwd.as_deref(),
             kind,
             rename.as_deref(),
+            &env,
+            &unset_env,
             workspace.as_ref(),
         ),
     }

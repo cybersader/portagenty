@@ -77,6 +77,10 @@ pub struct App {
     /// status is `None`. Used by the run loop to age status messages
     /// out without requiring a keystroke.
     status_set_at: Option<std::time::Instant>,
+    /// In-TUI session edit overlay. While `Some`, key handling is
+    /// diverted to `crate::tui::edit::handle_key` and the row list
+    /// renders normally underneath. Mutually exclusive with `pending`.
+    editing: Option<crate::tui::edit::EditState>,
 }
 
 /// How long status messages stick around before auto-clearing.
@@ -137,6 +141,7 @@ impl App {
             pending: None,
             status: None,
             status_set_at: None,
+            editing: None,
         }
     }
 
@@ -288,6 +293,24 @@ impl App {
         });
     }
 
+    /// Open the in-TUI edit overlay for the highlighted session.
+    /// Untracked rows aren't editable (no workspace TOML entry to
+    /// mutate); same for the synthetic live-browse workspace.
+    fn open_edit_overlay(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.session.is_none() {
+            self.set_status("e: untracked rows aren't in the workspace TOML");
+            return;
+        }
+        if self.workspace.file_path.is_none() {
+            self.set_status("e: live-browse mode has no workspace file to edit");
+            return;
+        }
+        self.editing = Some(crate::tui::edit::EditState::PickField);
+    }
+
     /// Queue a switch-mpx confirm modal. Toggles tmux <-> zellij
     /// (the only two practical multiplexers); wezterm is a no-op
     /// with a status hint. Requires a workspace file on disk —
@@ -419,6 +442,60 @@ impl App {
         }
     }
 
+    /// Persist an edit op to the workspace TOML and reload the
+    /// in-memory workspace + row list. Closes the edit overlay on
+    /// success; leaves it open with a status hint on failure so the
+    /// user can fix and retry without losing context.
+    fn apply_edit_op(&mut self, op: crate::cli::EditOp) {
+        let Some(path) = self.workspace.file_path.clone() else {
+            self.set_status("edit failed: no workspace file on disk");
+            return;
+        };
+        let Some(target) = self.selected_row().and_then(|r| r.session.clone()) else {
+            self.set_status("edit failed: nothing selected");
+            return;
+        };
+        let target_name = target.name.clone();
+        match crate::cli::edit_session_in_file(&path, &target_name, &op) {
+            Ok(()) => {
+                // Reload the workspace from disk so name + cwd + env
+                // changes flow into the resolved domain types
+                // correctly (handles ~ / ${HOME} expansion etc.).
+                match crate::config::load(&crate::config::LoadOptions {
+                    workspace_path: Some(path),
+                    ..Default::default()
+                }) {
+                    Ok(reloaded) => {
+                        self.workspace = reloaded;
+                        let live = self.mux.list_sessions().unwrap_or_default();
+                        self.rows = crate::tui::view::build_rows(&self.workspace, &live);
+                        if !self.rows.is_empty() {
+                            let sel = self.list_state.selected().unwrap_or(0);
+                            self.list_state.select(Some(sel.min(self.rows.len() - 1)));
+                        }
+                        self.editing = None;
+                        self.set_status(format!("edited session {target_name:?}"));
+                    }
+                    Err(e) => {
+                        // The on-disk write succeeded but the
+                        // reload failed — file is inconsistent.
+                        // Surface the error and close the overlay
+                        // so the user can investigate.
+                        self.editing = None;
+                        self.set_status(format!("edit wrote ok, reload failed: {e:#}"));
+                    }
+                }
+            }
+            Err(e) => {
+                // Leave the overlay open so the user can correct
+                // their input and retry without re-typing from
+                // scratch — the state machine still has their last
+                // input string.
+                self.set_status(format!("edit failed: {e:#}"));
+            }
+        }
+    }
+
     /// Apply a single key press, returning whatever [`Action`] it
     /// produced. Split from `handle_event` so tests drive input
     /// synchronously without faking a crossterm event stream.
@@ -428,6 +505,28 @@ impl App {
         // than being hot-swapped for an underlying-screen keystroke).
         if self.help_open {
             self.help_open = false;
+            return Action::None;
+        }
+        // Edit overlay: divert keys to the edit module's state
+        // machine. Apply outcomes go through cli::edit_session_in_file
+        // (the same toml_edit-preserving helper the CLI uses) so
+        // there's only one place that mutates the workspace TOML.
+        if self.editing.is_some() {
+            // Take ownership of the state for handle_key; put it back
+            // unless the outcome closes the overlay.
+            let mut state = self.editing.take().expect("editing was Some");
+            let outcome = crate::tui::edit::handle_key(&mut state, code, mods);
+            match outcome {
+                crate::tui::edit::EditOutcome::Continue => {
+                    self.editing = Some(state);
+                }
+                crate::tui::edit::EditOutcome::Cancel => {
+                    self.set_status("edit cancelled");
+                }
+                crate::tui::edit::EditOutcome::Apply(op) => {
+                    self.apply_edit_op(op);
+                }
+            }
             return Action::None;
         }
         // Confirm modal: divert key handling until dismissed. y/Y
@@ -460,6 +559,10 @@ impl App {
             }
             (KeyCode::Char('m'), _) => {
                 self.open_switch_mpx_prompt();
+                Action::None
+            }
+            (KeyCode::Char('e'), _) => {
+                self.open_edit_overlay();
                 Action::None
             }
             (KeyCode::Char('q'), _) => {
@@ -618,6 +721,7 @@ impl App {
                     Entry::new("Esc", "back"),
                     Entry::new("Enter", "launch"),
                     Entry::new("j/k", "nav"),
+                    Entry::new("e", "edit"),
                     Entry::new("d", "delete"),
                     Entry::new("x", "kill"),
                     Entry::new("m", "switch mpx"),
@@ -630,6 +734,15 @@ impl App {
         if let Some(pending) = &self.pending {
             let (title, body) = confirm_copy(pending, &self.workspace.name);
             crate::tui::confirm::render(frame, area, &title, &body);
+        }
+
+        // Edit overlay also above content; help still wins above this.
+        if let Some(state) = &self.editing {
+            let session_name = self
+                .selected_row()
+                .map(|r| r.display_name.clone())
+                .unwrap_or_default();
+            crate::tui::edit::render(frame, area, &session_name, state);
         }
 
         // Help overlay renders last so it sits on top of everything.
