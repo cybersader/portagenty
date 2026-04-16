@@ -55,7 +55,12 @@ pub fn render_info(frame: &mut Frame<'_>, area: Rect, title: &str, body: Vec<Lin
     // don't get added to the user's clipboard selection.
     let max_line = body
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        })
         .max()
         .unwrap_or(0);
     // +2 for the L/R border + 2 for breathing room.

@@ -499,9 +499,23 @@ fn render(
         ]);
         frame.render_widget(Paragraph::new(line), chunks[3]);
     } else {
-        let footer = Paragraph::new(" j/k · Enter · d/D/r · ?: help · q: quit ")
-            .style(Style::default().add_modifier(Modifier::DIM));
-        frame.render_widget(footer, chunks[3]);
+        // Quit-first ordering keeps `q` visible at the narrowest
+        // widths; help next; then nav and row actions.
+        use crate::tui::footer::Entry;
+        crate::tui::footer::render(
+            frame,
+            chunks[3],
+            &[
+                Entry::new("q", "quit"),
+                Entry::new("?", "help"),
+                Entry::new("Enter", "open"),
+                Entry::new("j/k", "nav"),
+                Entry::new("n", "new"),
+                Entry::new("d", "unreg"),
+                Entry::new("D", "delete"),
+                Entry::new("r", "reveal"),
+            ],
+        );
     }
 
     if let Some(p) = pending {

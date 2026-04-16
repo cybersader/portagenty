@@ -531,10 +531,23 @@ impl App {
             ]);
             frame.render_widget(Paragraph::new(line), chunks[3]);
         } else {
-            let footer_text = footer_for_width(area.width);
-            let footer =
-                Paragraph::new(footer_text).style(Style::default().add_modifier(Modifier::DIM));
-            frame.render_widget(footer, chunks[3]);
+            // New responsive (key, label) footer. Quit-first so it
+            // survives at the narrowest widths; help next; then
+            // navigation; then row actions.
+            use crate::tui::footer::Entry;
+            crate::tui::footer::render(
+                frame,
+                chunks[3],
+                &[
+                    Entry::new("q", "quit"),
+                    Entry::new("?", "help"),
+                    Entry::new("Esc", "back"),
+                    Entry::new("Enter", "launch"),
+                    Entry::new("j/k", "nav"),
+                    Entry::new("d", "delete"),
+                    Entry::new("x", "kill"),
+                ],
+            );
         }
 
         // Confirm modal above content, below help (help wins if both
@@ -604,19 +617,6 @@ impl App {
             )
             .highlight_symbol("▶ ");
         frame.render_stateful_widget(list, area, &mut self.list_state);
-    }
-}
-
-/// Tiered footer text. Narrow terminals (phone-in-portrait over SSH
-/// from Termux) get a shorter hint so "quit" is always visible. See
-/// DESIGN.md §10 for the mobile constraints that drive this.
-fn footer_for_width(width: u16) -> &'static str {
-    if width >= 60 {
-        " j/k · Enter: launch · Esc: back · ?: help · q: quit "
-    } else if width >= 30 {
-        " j/k · ? help · q: quit "
-    } else {
-        " ? · q: quit "
     }
 }
 

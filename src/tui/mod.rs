@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod confirm;
+pub mod footer;
 pub mod help;
 pub mod picker;
 pub mod view;
