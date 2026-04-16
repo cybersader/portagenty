@@ -409,6 +409,59 @@ allows them but it's rarely what the user wants). Handled by:
   current session and the correct detach chord. Letting the TUI open
   and then erroring post-restore buries the error in shell scrollback.
 
+### Picker actions inventory
+
+The picker is the home screen, so it carries a richer key vocabulary
+than just navigation. As of the find-folder commit chain
+(`piped-sauteeing-breeze.md`), keys are:
+
+| Key | Action |
+|---|---|
+| `j` / `↓` / `k` / `↑` | move highlight (`g` / `G` jump to ends) |
+| `Enter` | open the highlighted workspace |
+| `n` | open the in-TUI find-folder + scaffold overlay |
+| `d` | unregister the highlighted workspace from the global index (file stays on disk) |
+| `D` | delete the workspace file *and* unregister (with confirm) |
+| `r` | reveal the workspace path in a sticky info modal that auto-copies to clipboard |
+| `?` | open the help overlay |
+| `q` / `Esc` | exit pa (Esc dismisses a status line first) |
+
+### Find-folder + scaffold flow (`n`)
+
+Triggered by `n` in the picker. Implementation in `src/tui/find.rs`
++ `src/find/`. Behavior:
+
+1. Overlay opens centered. Empty input shows recents + zoxide
+   candidates immediately (instant, no FS walk).
+2. Each typed character re-runs the tier orchestrator: recents +
+   zoxide + plocate/locate/Everything CLI + fd + stdlib walker.
+   Each tier silently skips if its underlying tool isn't installed.
+3. Results are deduped on canonical path, then ranked against the
+   query by `nucleo` (smart-case + smart-normalization). Top N
+   surface. Zero-score entries are dropped so the list always has
+   meaningful matches.
+4. `Enter` on a highlighted candidate classifies:
+   - Folder already contains a `*.portagenty.toml` → picker exits
+     with that workspace as the outcome (it'll open immediately).
+   - Folder has no workspace → confirm modal: "scaffold a new
+     workspace at <path>?" `y` calls `crate::scaffold::create_at`
+     with the dir's basename + machine-default mpx + no Claude
+     session, registers globally, and the picker exits with the
+     new workspace as the outcome.
+5. The new workspace's session TUI loads immediately (per the
+   user-locked decision: no extra "open it now?" prompt).
+
+Special query forms:
+- Empty → recents + zoxide only, no walks.
+- Starts with `/` or `~/` → walk-from-prefix mode (stdlib walker
+  only, scoped to the nearest existing ancestor).
+
+Search backend tiers, fastest-first, all silent-skip if absent:
+recency (state.toml) → zoxide → plocate / locate / Everything CLI →
+fd → stdlib walker. All shell-outs run with a 1-second hard
+timeout. No new C deps; only `nucleo-matcher` was added (pure Rust,
+~50 KB).
+
 ### What this rules out
 
 - A "persist the last workspace and auto-open it on bare `pa`" mode —
@@ -419,6 +472,9 @@ allows them but it's rarely what the user wants). Handled by:
 - Reaching for a daemon or cache to speed up repeated runs. Walk-up
   of a `*.portagenty.toml` is O(depth) filesystem reads; on any real
   system it's sub-millisecond. No invalidation problems to solve.
+- Building our own filesystem index. The find pipeline piggybacks
+  on plocate / Everything when present; we never spin up an indexer
+  process or write to one. Aligns with §5's anti-daemon stance.
 
 ## 13. Explicitly out of scope
 

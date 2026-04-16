@@ -105,6 +105,33 @@ real projects:
   prints `pa → <mpx> session "<name>"  ·  detach: <chord>  ·
   re-attach: pa claim <name>` so the user sees the exit path on
   their actual shell.
+- **In-TUI find-folder + scaffold (`n` in picker).** Press `n`
+  in the workspace picker to open a search overlay. Tiered
+  candidate sources: recents (LRU from state.toml), zoxide
+  (frecency, if installed), plocate / locate / Everything CLI
+  (pre-built indexes), fd (live walk respecting .gitignore),
+  stdlib walker (always-available fallback, depth-capped, with
+  a hardcoded ignore list for .git / node_modules / target /
+  __pycache__ / .venv / dist / build). Results merged + deduped
+  on canonical path, then ranked by `nucleo` (Helix's pure-Rust
+  fuzzy matcher). Enter on a candidate either opens an existing
+  workspace there or pops a confirm to scaffold one — on
+  confirm, `crate::scaffold::create_at` writes the TOML, registers
+  globally, and the picker exits with the new workspace as its
+  outcome so the session TUI opens immediately.
+- **Responsive (key, label) footer.** Each TUI screen builds a
+  prioritized list of `(key, label)` pairs; the renderer drops
+  least-important entries first to fit the width, then drops
+  labels for keys-only mode if needed. Mobile (<30 col) Termux
+  always sees `?` and `q` plus their labels.
+- **Picker row actions.** `d` unregister, `D` delete file with
+  confirm, `r` reveal path in a sticky info modal with auto
+  copy-to-clipboard.
+- **Workspace scaffolder extracted.** `crate::scaffold::create_at`
+  is the single source of truth for filename sanitization, TOML
+  body rendering, and global registration. `pa init`, the
+  onboarding wizard, and the in-TUI find/scaffold flow all
+  delegate to it.
 
 ### Still to ship (rough priority order)
 
@@ -143,8 +170,11 @@ real projects:
 10b. **Session schema extensions, part 2.** Pre/post commands +
     profile references. Schema scaffolding from part 1 (env)
     extends naturally.
-11. **`fd` / Everything CLI search integration.** Opportunistic
-    fast discovery where available.
+11. ~~**`fd` / Everything CLI search integration.**~~ **Shipped.**
+    Landed as part of the in-TUI find-folder flow's tiered backend
+    (see Shipped section above). Tier order: recents → zoxide →
+    plocate/locate/Everything → fd → stdlib walker. Each tier is
+    silently skipped when its tool isn't on PATH.
 12. **Termux polish pass.** Over-SSH verification + any rough
     edges found in real use. Core keybindings are already
     Termux-safe by default (`DESIGN.md` §10).
