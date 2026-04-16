@@ -308,15 +308,30 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             }
             SearchOutcome::Continue
         }
+        // `<` navigates UP: pivots the root to the PARENT of the
+        // highlighted entry (not the root's parent). Ranger-style
+        // "go up from where I'm looking" — if you drilled into the
+        // wrong folder with `>`, one `<` gets you back to its
+        // parent's siblings. Falls back to root's parent if nothing
+        // is highlighted.
         (KeyCode::Char('<'), _) => {
-            if let Some(root) = state.opts.roots.first().cloned() {
-                if let Some(parent) = root.parent() {
-                    if parent != root {
-                        state.opts.roots = vec![parent.to_path_buf()];
-                        state.input.clear();
-                        state.restart_walk();
-                    }
-                }
+            let target = state
+                .highlighted()
+                .and_then(|c| c.path.parent())
+                .map(|p| p.to_path_buf())
+                .or_else(|| {
+                    state
+                        .opts
+                        .roots
+                        .first()
+                        .and_then(|r| r.parent())
+                        .filter(|p| *p != state.opts.roots[0].as_path())
+                        .map(|p| p.to_path_buf())
+                });
+            if let Some(t) = target {
+                state.opts.roots = vec![t];
+                state.input.clear();
+                state.restart_walk();
             }
             SearchOutcome::Continue
         }
