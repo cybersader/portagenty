@@ -306,6 +306,19 @@ pub fn render_tree(frame: &mut Frame<'_>, area: Rect, state: &mut TreeBrowseStat
             } else {
                 "├─"
             };
+            // Subfolder count suffix — dim, from the cache. Only
+            // shown for dirs that have been loaded (expanded at
+            // least once). Unexplored dirs show nothing.
+            let count_suffix = if row.is_dir {
+                let key = row.path.display().to_string();
+                state
+                    .children_cache
+                    .get(&key)
+                    .map(|c| format!("  ({})", c.len()))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             ListItem::new(Line::from(vec![
                 Span::raw(format!("  {indent}{connector}")),
                 Span::styled(
@@ -316,6 +329,7 @@ pub fn render_tree(frame: &mut Frame<'_>, area: Rect, state: &mut TreeBrowseStat
                         Style::default()
                     },
                 ),
+                Span::styled(count_suffix, Style::default().add_modifier(Modifier::DIM)),
             ]))
         })
         .collect();
