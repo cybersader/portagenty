@@ -88,15 +88,16 @@ impl ZellijAdapter {
             bail!("zellij attach --create-background failed for session {name:?}");
         }
 
-        // Wait for the session to appear in list-sessions. 20 × 50ms
-        // = 1s max; most runs return on the first check.
-        for _ in 0..20 {
+        // Wait for the session to appear in list-sessions. 40 × 50ms
+        // = 2s max; most runs return on the first check. CI runners
+        // occasionally need more than 1s.
+        for _ in 0..40 {
             if self.has_session(name)? {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        bail!("zellij session {name:?} was created but did not appear in list within 1s")
+        bail!("zellij session {name:?} was created but did not appear in list within 2s")
     }
 
     /// Best-effort "are other clients attached to this session?"
