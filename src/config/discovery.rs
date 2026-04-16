@@ -76,7 +76,15 @@ pub fn project_file_in_dir(dir: &Path) -> Option<PathBuf> {
 /// Resolved path to `$XDG_CONFIG_HOME/portagenty/config.toml` (or the
 /// equivalent on macOS / Windows). Does not check existence — the caller
 /// decides whether missing-global-config is an error or a silent default.
+///
+/// Checks `XDG_CONFIG_HOME` first on all platforms so that tests can
+/// sandbox the config dir by setting the env var. The `directories`
+/// crate ignores `XDG_CONFIG_HOME` on macOS (preferring
+/// `~/Library/Application Support`), which breaks test isolation.
 pub fn global_config_path() -> Result<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(xdg).join("portagenty").join("config.toml"));
+    }
     let dirs = ProjectDirs::from("", "", "portagenty")
         .ok_or_else(|| anyhow!("unable to resolve user config directory"))?;
     Ok(dirs.config_dir().join("config.toml"))

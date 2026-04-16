@@ -84,11 +84,18 @@ fn create_background_then_list_shows_session() {
     a.create_background(&name).expect("create_background");
     guard.track(&name);
 
-    let list = a.list_sessions().expect("list");
-    assert!(
-        list.iter().any(|s| s.name == name),
-        "expected {name:?} in list: {list:?}"
-    );
+    // Zellij's session registration is asynchronous — poll briefly
+    // before giving up so CI runners with slow I/O don't flake.
+    let mut found = false;
+    for _ in 0..10 {
+        let list = a.list_sessions().expect("list");
+        if list.iter().any(|s| s.name == name) {
+            found = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(found, "expected {name:?} in list after 2s of polling");
 }
 
 #[test]
