@@ -26,6 +26,27 @@ use ratatui::{
 
 use crate::find::{BackendAvailability, Candidate, FindOpts, Source};
 
+/// Mode toggle inside the find overlay.
+#[derive(Debug)]
+pub enum FindMode {
+    /// Fuzzy search with nucleo ranking (default).
+    Search,
+    /// File explorer tree rooted at current search root.
+    Tree(Box<TreeBrowseState>),
+}
+
+/// State for the file-explorer tree mode.
+#[derive(Debug)]
+pub struct TreeBrowseState {
+    /// tui-tree-widget's internal state (open nodes + selection).
+    pub tree_state: tui_tree_widget::TreeState<String>,
+    /// Lazily-loaded directory children, keyed by path string.
+    /// Only populated when the user expands a node.
+    pub children_cache: std::collections::HashMap<String, Vec<PathBuf>>,
+    /// The root directory the tree is showing.
+    pub root: PathBuf,
+}
+
 /// What the picker should do after a key press inside the search
 /// overlay. Mirrors the picker's normal action vocabulary so the
 /// outer event loop can dispatch without a second match.
@@ -347,6 +368,7 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             None => SearchOutcome::Continue,
             Some(c) => classify_pick(&c.path),
         },
+        // `>` drill into highlighted folder.
         (KeyCode::Char('>'), _) => {
             if let Some(c) = state.highlighted() {
                 state.opts.roots = vec![c.path.clone()];
@@ -395,6 +417,37 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         (KeyCode::Char('f'), m) if m.contains(KeyModifiers::CONTROL) => {
             if let Some(c) = state.highlighted() {
                 state.fullscreen_path = Some(build_fullscreen_path(&c.path));
+            }
+            SearchOutcome::Continue
+        }
+        // Alt+J: drill in (same as >). Easier on Termux.
+        (KeyCode::Char('j'), m) if m.contains(KeyModifiers::ALT) => {
+            if let Some(c) = state.highlighted() {
+                state.opts.roots = vec![c.path.clone()];
+                state.input.clear();
+                state.restart_walk();
+            }
+            SearchOutcome::Continue
+        }
+        // Alt+K: go up (same as <). Easier on Termux.
+        (KeyCode::Char('k'), m) if m.contains(KeyModifiers::ALT) => {
+            let target = state
+                .highlighted()
+                .and_then(|c| c.path.parent())
+                .map(|p| p.to_path_buf())
+                .or_else(|| {
+                    state
+                        .opts
+                        .roots
+                        .first()
+                        .and_then(|r| r.parent())
+                        .filter(|p| *p != state.opts.roots[0].as_path())
+                        .map(|p| p.to_path_buf())
+                });
+            if let Some(t) = target {
+                state.opts.roots = vec![t];
+                state.input.clear();
+                state.restart_walk();
             }
             SearchOutcome::Continue
         }
@@ -549,7 +602,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
 
     // Bottom hint.
     let hint = Paragraph::new(
-        " Enter open · > drill · < up · Ctrl+F path · Ctrl+R reset · Esc cancel · ↑/↓ nav ",
+        " Enter · >/Alt+J drill · </Alt+K up · Ctrl+F path · Ctrl+R reset · Esc · ↑/↓ ",
     )
     .style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(hint, chunks[3]);

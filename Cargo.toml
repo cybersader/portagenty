@@ -38,6 +38,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # candidate folders against the user's query. Tiny — keeps the
 # single-static-binary contract intact.
 nucleo-matcher = "0.3"
+# Tree widget for the file explorer mode in the find overlay.
+# MIT, pure Rust, ~732 SLoC, 480k+ downloads.
+tui-tree-widget = "0.24"
 
 [dev-dependencies]
 insta = "1.41"
