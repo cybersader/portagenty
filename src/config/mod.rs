@@ -269,3 +269,135 @@ fn load_per_project_files(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod default_mpx_tests {
+    //! Round-trip + read tests for the global default-multiplexer
+    //! helpers. Each test sandboxes XDG_CONFIG_HOME to a tempdir so
+    //! the real user's config doesn't get touched. The tests are
+    //! marked serial because they mutate process-wide env vars.
+    use super::*;
+    use crate::domain::Multiplexer;
+    use serial_test::serial;
+
+    /// Pin XDG_CONFIG_HOME to a fresh tempdir for the duration of
+    /// the test; restore the previous value on Drop. Mirrors the
+    /// pattern in `src/scaffold.rs`'s test module.
+    struct TempXdg {
+        _dir: assert_fs::TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+    impl TempXdg {
+        fn new() -> Self {
+            let dir = assert_fs::TempDir::new().unwrap();
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            Self {
+                _dir: dir,
+                previous,
+            }
+        }
+    }
+    impl Drop for TempXdg {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(p) => std::env::set_var("XDG_CONFIG_HOME", p),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn current_default_returns_none_when_no_global_config() {
+        let _xdg = TempXdg::new();
+        assert_eq!(current_default_multiplexer().unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn current_default_reads_zellij_back_after_set() {
+        let _xdg = TempXdg::new();
+        set_global_default_multiplexer(Multiplexer::Zellij).unwrap();
+        assert_eq!(
+            current_default_multiplexer().unwrap(),
+            Some(Multiplexer::Zellij)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn current_default_reads_tmux_back_after_set() {
+        let _xdg = TempXdg::new();
+        set_global_default_multiplexer(Multiplexer::Tmux).unwrap();
+        assert_eq!(
+            current_default_multiplexer().unwrap(),
+            Some(Multiplexer::Tmux)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn set_default_overwrites_previous_value() {
+        let _xdg = TempXdg::new();
+        set_global_default_multiplexer(Multiplexer::Tmux).unwrap();
+        set_global_default_multiplexer(Multiplexer::Zellij).unwrap();
+        assert_eq!(
+            current_default_multiplexer().unwrap(),
+            Some(Multiplexer::Zellij)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn set_default_preserves_other_global_fields() {
+        // Pre-seed the config with a [[workspace]] entry, then
+        // verify set_global_default_multiplexer doesn't blow it
+        // away — the toml_edit-based writer is supposed to preserve
+        // unrelated content.
+        let xdg = TempXdg::new();
+        let cfg_dir = xdg._dir.path().join("portagenty");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg_file = cfg_dir.join("config.toml");
+        std::fs::write(
+            &cfg_file,
+            "default-multiplexer = \"tmux\"\n\
+             \n\
+             [[workspace]]\n\
+             path = \"/some/ws.portagenty.toml\"\n",
+        )
+        .unwrap();
+
+        set_global_default_multiplexer(Multiplexer::Zellij).unwrap();
+
+        let raw = std::fs::read_to_string(&cfg_file).unwrap();
+        assert!(
+            raw.contains("default-multiplexer = \"zellij\""),
+            "default not updated: {raw}"
+        );
+        assert!(
+            raw.contains("path = \"/some/ws.portagenty.toml\""),
+            "workspace entry was lost: {raw}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn current_default_parses_zellij_from_kebab_case_field() {
+        // Smoke test the wire format users actually see in their
+        // config.toml — `default-multiplexer = "zellij"`. Catches a
+        // regression where serde rename_all stops applying.
+        let xdg = TempXdg::new();
+        let cfg_dir = xdg._dir.path().join("portagenty");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "default-multiplexer = \"zellij\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            current_default_multiplexer().unwrap(),
+            Some(Multiplexer::Zellij)
+        );
+    }
+}

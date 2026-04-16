@@ -482,9 +482,19 @@ pub fn init(name: Option<String>, mpx: Option<InitMpxArg>, force: bool) -> Resul
             .unwrap_or("workspace")
             .to_string(),
     };
+    // Resolution order: explicit --mpx wins, then the machine's
+    // pinned default from $XDG_CONFIG_HOME/portagenty/config.toml,
+    // then tmux as the last-resort fallback (matches the v1
+    // reference adapter). The previous logic ignored the global
+    // default — surprising for users who set zellij via the
+    // onboarding wizard and then ran `pa init`.
     let mpx = match mpx {
         Some(InitMpxArg::Zellij) => MpxEnum::Zellij,
-        Some(InitMpxArg::Tmux) | None => MpxEnum::Tmux,
+        Some(InitMpxArg::Tmux) => MpxEnum::Tmux,
+        None => crate::config::current_default_multiplexer()
+            .ok()
+            .flatten()
+            .unwrap_or(MpxEnum::Tmux),
     };
 
     let outcome = create_at(&cwd, &workspace_name, mpx, false, force)?;
