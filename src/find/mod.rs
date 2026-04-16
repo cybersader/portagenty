@@ -389,7 +389,7 @@ fn rank_and_truncate(items: Vec<Candidate>, query: &str, limit: usize) -> Vec<Ca
     }
     // Drop zero-score entries that don't match the query at all.
     deduped.retain(|c| c.score > 0);
-    deduped.sort_by(|a, b| b.score.cmp(&a.score));
+    deduped.sort_by_key(|c| std::cmp::Reverse(c.score));
     deduped.truncate(limit);
     deduped
 }

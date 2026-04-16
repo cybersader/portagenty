@@ -575,7 +575,7 @@ impl SearchState {
                     });
                 }
             }
-            scored.sort_by(|a, b| b.score.cmp(&a.score));
+            scored.sort_by_key(|c| std::cmp::Reverse(c.score));
             scored.truncate(self.opts.limit);
             self.candidates = scored;
         }
