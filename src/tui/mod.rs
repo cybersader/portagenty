@@ -67,7 +67,16 @@ pub fn run() -> Result<()> {
     loop {
         let ws = if first_iteration {
             first_iteration = false;
-            load(&LoadOptions::default()).ok()
+            let loaded = load(&LoadOptions::default()).ok();
+            // Auto-re-register: if walk-up found a workspace that
+            // isn't in the global registry (e.g. the user moved the
+            // folder), register it so the picker sees it next time.
+            if let Some(ref w) = loaded {
+                if let Some(ref path) = w.file_path {
+                    let _ = crate::config::register_global_workspace(path);
+                }
+            }
+            loaded
         } else {
             None // Back was pressed — always show picker from here on
         };
