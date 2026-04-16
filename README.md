@@ -2,7 +2,7 @@
 
 A portable, terminal-native launcher for agent workspaces. Written in Rust. Binary name: `pa`.
 
-> Status: **v1.x feature-complete and usable daily.** Core flows ship end-to-end: walk up to find a workspace, render the session list, pick one, attach — in **tmux or zellij**. Most v1.x extras shipped: zellij adapter, untracked session adoption, `pa claim` cross-device takeover, `kind:` session hints, per-session env, declarative `pa export`, onboarding wizard, bundled bash snippets, full no-editor session management (`pa init / add / rm / edit`), workspace picker home screen with recency sort, Android-back navigation, `pa launch --resume` for Claude Code. Still roadmapped: Tags/Groups perspectives, `pa up` eager-launch, datetime column in the session explorer. WezTerm intentionally deferred — see [ROADMAP.md](./ROADMAP.md) for rationale. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive. Docs site: <https://cybersader.github.io/portagenty/>. Local + Tailscale preview also supported (see below).
+> Status: **v1.x feature-complete and usable daily.** Core flows ship end-to-end: walk up to find a workspace, render the session list, pick one, attach — in **tmux or zellij**. v1.x extras shipped: zellij adapter, untracked session adoption, `pa claim` cross-device takeover, `kind:` session hints, per-session env, declarative `pa export`, onboarding wizard, bundled bash snippets, full no-editor session management (`pa init / add / rm / edit`), workspace picker home screen with recency sort, Android-back navigation, `pa launch --resume` for Claude Code, in-TUI find-folder + scaffold with nucleo fuzzy ranking, tree browser for filesystem exploration, workspace-scoped session names (no more cross-workspace collisions), in-TUI session editing (name/cwd/command/kind/env), CWD browse via find overlay, responsive 2-line footer on all screens, arrow keys + Alt+J/K navigation, help overlay, auto-re-register on walk-up (folder move resilience). Still roadmapped: Tags/Groups perspectives, `pa up` eager-launch, datetime column in the session explorer. WezTerm intentionally deferred — see [ROADMAP.md](./ROADMAP.md) for rationale. See [DESIGN.md](./DESIGN.md) for the architectural deep-dive. Docs site: <https://cybersader.github.io/portagenty/>. Local + Tailscale preview also supported (see below).
 
 ## Install
 
@@ -106,7 +106,7 @@ portagenty is the replacement launcher and the missing workspace layer — the t
 
 - Not a VS Code extension. Not a browser app. Not a daemon with a web dashboard.
 - Not a new agent framework. It launches existing agents; it does not replace them.
-- Not a scaffolder. Creating new projects is a separate tool's job.
+- Not a scaffolder. The in-TUI `n` key scaffolds a workspace TOML, but project-level scaffolding (skills, hooks, KB) is a separate tool's job.
 - Not an Obsidian plugin or note tool.
 - Not tied to one multiplexer. tmux, zellij, and WezTerm are all first-class.
 
@@ -151,7 +151,7 @@ The filesystem is storage. portagenty is the index and launcher on top.
 
 ## Non-goals for v1 code
 
-- **No scaffolding.** Creating projects is out of scope; that's `setup.sh` (in agentic-workflow) or a future purpose-built tool.
+- **No project scaffolding.** Workspace scaffolding is built in (`pa init`, onboarding wizard, in-TUI `n` key), but project-level scaffolding (skills, hooks, KB) is a separate tool's job.
 - **No remote-machine awareness.** portagenty runs on the machine you're on. It doesn't ping other machines. SSH into them and run `pa` there.
 - **No agent-API wrapping.** Claude Code / OpenCode are external processes. portagenty launches them; it does not embed or proxy their APIs.
 - **No SQLite or embedded DB.** State is in TOML files plus live polling. If that ever becomes a bottleneck we'll revisit — not before.

@@ -132,6 +132,42 @@ real projects:
   body rendering, and global registration. `pa init`, the
   onboarding wizard, and the in-TUI find/scaffold flow all
   delegate to it.
+- **Session-name namespacing.** The sanitized mpx session name is
+  now `<workspace>-<session>` (e.g. `cyberchaste-shell` instead of
+  bare `shell`). Prevents cross-workspace collisions where two
+  workspaces with a `"shell"` session would silently share the same
+  mpx session. The TUI display name stays unprefixed.
+- **CWD edit via find/tree overlay.** The `e → c` (edit cwd) flow
+  in the session TUI opens the same find/tree browser used by the
+  `n` (new workspace) flow, starting at the session's current cwd.
+  On selection the new path is written back to the TOML file.
+  Replaces the old raw-text-input stub.
+- **Tree browser.** `t` inside the find overlay opens a tree view
+  rooted at the highlighted candidate (or the current search root).
+  `Enter` / `→` expand a directory, `←` / `Backspace` collapse.
+  Lazy `read_dir` on expand, depth-limited. Shift+Enter selects
+  the highlighted directory as the result. Breadcrumb shown with
+  marquee animation when the path exceeds available width.
+- **In-TUI session editing (`e` key).** Five-stage state machine:
+  pick-field → type-value / pick-kind / env-action → env-key →
+  env-val. Covers name, cwd, command, kind, and env vars.
+  Comment-preserving writes via toml_edit. CWD editing delegates
+  to the find/tree overlay for a visual browse.
+- **Help overlay (`?`).** Full-screen categorized keybind reference
+  for picker, session list, and find/tree modes. Includes row-
+  marker legend, kind-glyph legend, and title-bar legend.
+- **Arrow keys + Alt+J/K navigation.** `→` / `←` and `Alt+J` /
+  `Alt+K` mirror `j` / `k` / `Enter` / `Esc` for Termux mobile
+  users where letter keys require extra taps.
+- **Responsive 2-line footer.** All TUI screens (picker, session
+  list, find overlay) show a priority-ordered 2-line footer that
+  drops least-important entries first at narrow widths, then drops
+  labels for keys-only mode. Mobile (<30 col) always sees `?` and
+  `q` plus their labels.
+- **Auto-re-register on walk-up.** When walk-up finds a workspace
+  file that isn't in the global registry (e.g. the user moved the
+  folder), it's silently re-registered so the picker sees it next
+  time. Makes folder moves transparent without manual config fixes.
 
 ### Still to ship (rough priority order)
 
@@ -254,55 +290,6 @@ real projects:
     architecture change based on real usage. **(D)** can ship
     alongside (A) as an ergonomic bonus. **(C)** is deferred
     unless demand justifies the complexity.
-
-14. **Session-name namespacing (collision bug).** All workspaces
-    scaffold sessions with generic names like `"shell"` and
-    `"claude"`. The multiplexer doesn't namespace them — `zellij
-    attach --create shell` attaches to whichever `shell` session
-    exists, regardless of which workspace created it. If you have
-    cyberchaste and dataflowy both with a `"shell"` session, opening
-    cyberchaste's shell might land you in dataflowy's session (or
-    vice versa) because the mpx sees them as the same name.
-
-    **The problem**: `mux::sanitize_session_name` produces the mpx
-    session name from the session's declared `name` field. Two
-    workspaces with `name = "shell"` produce the same mpx name
-    `"shell"`. There's no workspace prefix, no hash suffix, no
-    disambiguation.
-
-    **Fix options**:
-
-    **(A) Prefix with workspace name.** Sanitized mpx name becomes
-    `<workspace>-<session>`, e.g. `cyberchaste-shell`,
-    `dataflowy-shell`. Simple, readable in `tmux list-sessions` /
-    `zellij list-sessions`. Breaks existing sessions (they'd need
-    to be killed and recreated). The TUI's session-list display
-    name stays unprefixed (user sees "shell", mpx sees
-    "cyberchaste-shell").
-
-    **(B) Hash suffix.** Append a short hash of the workspace file
-    path to the session name: `shell-a3f2`. Less readable but
-    guarantees uniqueness even across workspaces with the same name.
-
-    **(C) Workspace-scoped mpx sessions.** Use tmux's `-L` /
-    zellij's `--session` to scope sessions per workspace. Each
-    workspace gets its own tmux socket / zellij session group.
-    Clean isolation but makes `pa list` and untracked adoption
-    more complex (need to probe multiple sockets).
-
-    **Recommended**: **(A)** — simple, solves 99% of collisions,
-    human-readable. Migrate existing sessions by killing and
-    re-creating on first launch after the change.
-
-15. **CWD edit should use the find/tree browser.** The `e → c`
-    (edit cwd) flow currently asks for a raw text path via a tiny
-    input box. This is confusing — editing a cwd is fundamentally
-    "point me at a folder," which is what the find overlay and tree
-    browser were built for. The edit-cwd flow should open the same
-    find/tree interface, with the current cwd as the starting root,
-    and on selection write the chosen path back to the session's
-    `cwd` field. Same UX as the `n` (new workspace) flow but
-    targeting an existing session's cwd instead of scaffolding.
 
 ---
 

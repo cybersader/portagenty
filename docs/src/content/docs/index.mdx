@@ -14,7 +14,36 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid, Code } from "@astrojs/starlight/components";
+import { Card, CardGrid, Code, Tabs, TabItem, Aside, Steps } from "@astrojs/starlight/components";
+
+```
+                        ┌──────────────────────────────────┐
+                        │          portagenty (pa)         │
+                        │   portable agent workspace TUI   │
+                        └──────────┬───────────────────────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              ▼                    ▼                     ▼
+     ┌────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+     │  Workspace      │  │  Workspace      │  │  Live sessions  │
+     │  cyberchaste    │  │  dataflowy      │  │  (untracked)    │
+     └───────┬────────┘  └───────┬─────────┘  └───────┬─────────┘
+             │                   │                     │
+        ┌────┴────┐         ┌────┴────┐               │
+        ▼         ▼         ▼         ▼               ▼
+    ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐     ┌───────────┐
+    │claude │ │ shell │ │ dev   │ │ tests │     │ mystery   │
+    │  [C]  │ │       │ │  [D]  │ │       │     │   [?]     │
+    └───┬───┘ └───┬───┘ └───┬───┘ └───┬───┘     └─────┬─────┘
+        └─────────┴─────────┴─────────┴───────────────┘
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+               ┌─────────┐       ┌──────────┐
+               │  tmux   │       │  zellij  │
+               │ adapter │       │ adapter  │
+               └─────────┘       └──────────┘
+```
 
 ## Why
 
@@ -72,25 +101,162 @@ running; only the terminal attached to them changes.
     zellij KDL layout. Commit it; teammates launch without needing
     `pa` installed.
   </Card>
+  <Card title="Find folder + scaffold" icon="magnifier">
+    Press `n` in the workspace picker to fuzzy-search your filesystem
+    for project folders. Tiered backends (recency, zoxide, plocate,
+    fd, stdlib walker) ranked by nucleo. Pick a folder and `pa`
+    scaffolds a workspace TOML on the spot.
+  </Card>
+  <Card title="Tree browser" icon="seti:folder">
+    Press `t` inside the find overlay to switch to a filesystem tree
+    view. Expand/collapse directories, navigate with arrow keys or
+    vim bindings, select a folder with Shift+Enter. Used for both new
+    workspace creation and CWD editing.
+  </Card>
+  <Card title="In-TUI session editing" icon="pencil">
+    Press `e` on any session row to edit name, cwd, command, kind, or
+    env vars without leaving the TUI. CWD editing opens the same
+    find/tree browser. All changes are comment-preserving writes to
+    your TOML file.
+  </Card>
 </CardGrid>
+
+## How it works
+
+```
+  ┌──────────┐  SSH   ┌──────────┐  SSH   ┌──────────┐
+  │  Phone   │───────▶│  Desktop │◀───────│  Laptop  │
+  │ (Termux) │        │ (server) │        │          │
+  └──────────┘        └─────┬────┘        └──────────┘
+                            │
+                     ┌──────┴──────┐
+                     │ tmux/zellij │  sessions persist
+                     │   sessions  │  across all devices
+                     ├─────────────┤
+                     │ ● claude    │  ← pa claim (takeover)
+                     │ ● dev       │  ← pa launch dev
+                     │ ○ tests     │  ← not started yet
+                     └─────────────┘
+```
+
+<Aside type="tip">
+Sessions live in the multiplexer, not in `pa`. When you close your
+SSH connection, they keep running. `pa claim` from any device
+re-attaches and reshapes the terminal to the new screen size.
+</Aside>
 
 ## See it in action
 
-```sh
-# Phone-over-SSH bootstrap, no editor required.
-ssh desktop
-cd ~/code/new-project
-pa init                                             # one starter session
-pa add claude -c "claude --resume" --kind claude-code
-pa add dev    -c "bun run dev"     --kind dev-server
+<Tabs>
+  <TabItem label="Phone bootstrap">
+    ```sh
+    # SSH into your desktop from your phone (Termux)
+    ssh desktop
+    cd ~/code/new-project
 
-# Launch.
-pa            # TUI, pick one, Enter
-pa claim      # or: cross-device takeover on the first session
+    # Scaffold a workspace — no editor required
+    pa init
+    pa add claude -c "claude --resume" --kind claude-code
+    pa add dev    -c "bun run dev"     --kind dev-server
 
-# Later, from the desktop, take it back:
-pa claim
+    # Launch the TUI, pick a session, Enter
+    pa
+    ```
+  </TabItem>
+  <TabItem label="Cross-device takeover">
+    ```sh
+    # On your phone — start a Claude Code session
+    pa launch claude
+
+    # Later, on your laptop — take it over
+    pa claim claude
+    # Session reshapes to laptop's screen size instantly
+
+    # Even later, back on phone
+    pa claim claude
+    # Back to phone-sized terminal, context intact
+    ```
+  </TabItem>
+  <TabItem label="TUI workflow">
+    ```sh
+    # Open the TUI from anywhere
+    pa
+
+    # Workspace picker (home screen)
+    #   ↑/↓  navigate    Enter  open workspace
+    #   n    find folder + scaffold new workspace
+    #   ?    help
+
+    # Session list
+    #   Enter  attach/create session
+    #   e      edit session fields
+    #   d      delete session     x  kill live session
+    #   Esc    back to picker     q  quit
+    ```
+  </TabItem>
+</Tabs>
+
+### The navigation model
+
 ```
+  ┌─────────────────────────────────────────────┐
+  │            Workspace Picker                  │
+  │  (home screen — Esc always returns here)     │
+  │                                              │
+  │   ▸ cyberchaste          2h ago              │
+  │     dataflowy            yesterday           │
+  │     live sessions on this machine            │
+  │                                              │
+  │  n: find   d: unregister   ?: help   q: quit │
+  └────────────────────┬────────────────────────-┘
+                       │ Enter
+                       ▼
+  ┌─────────────────────────────────────────────┐
+  │          Session List  [zellij]              │
+  │                                              │
+  │   ● claude  [C]         live · 1 client      │
+  │   ○ shell               idle                 │
+  │   ○ dev     [D]         idle                 │
+  │   ? mystery             untracked            │
+  │                                              │
+  │  e: edit   d: delete   x: kill   Esc: back   │
+  └────────────────────┬────────────────────────-┘
+                       │ Enter
+                       ▼
+  ┌─────────────────────────────────────────────┐
+  │   pa → zellij session "claude"               │
+  │         detach: Ctrl+O then d                │
+  │         re-attach: pa claim claude            │
+  └──────────────────────────────────────────────┘
+```
+
+## Architecture
+
+<Aside type="note" title="Three-tier config">
+portagenty merges configuration from three layers. Any tier can
+register projects and sessions; the workspace layer is the primary
+authoring surface.
+</Aside>
+
+```
+  Priority        Tier                      Location
+  ─────────────────────────────────────────────────────────────
+  highest    ┌─────────────┐     *.portagenty.toml (committable)
+             │  Workspace  │     sessions, projects, mpx choice
+             └──────┬──────┘
+                    │ merges with
+             ┌──────┴──────┐     portagenty.toml at project root
+  medium     │ Per-project │     sessions defined by the repo
+             └──────┬──────┘
+                    │ merges with
+             ┌──────┴──────┐     $XDG_CONFIG_HOME/portagenty/
+  lowest     │   Global    │     default mpx, workspace registry
+             └─────────────┘
+```
+
+The workspace file is designed to commit — no absolute paths, no
+machine-specific state, no secrets. Volatile state (recency, last-
+attached timestamps) lives separately in `$XDG_STATE_HOME`.
 
 ## Status
 
@@ -101,8 +267,12 @@ pick one, attach — in tmux or zellij.
 Most v1.x items have shipped: zellij adapter, untracked adoption,
 `pa claim` cross-device takeover, `kind:` hints, per-session env
 vars, declarative export, first-run wizard, bundled snippets,
-full no-editor session management (`pa init` / `add` / `rm` /
-`edit`). Tags + custom-groups views and a `pa up` eager-launch are
+full no-editor session management, workspace picker home screen,
+in-TUI find-folder + scaffold with nucleo fuzzy ranking, tree
+browser, workspace-scoped session names, in-TUI session editing,
+CWD browse via find overlay, responsive 2-line footer, arrow keys
++ Alt+J/K navigation, help overlay, and auto-re-register on
+walk-up. Tags + custom-groups views and `pa up` eager-launch are
 still on the [roadmap](https://github.com/cybersader/portagenty/blob/main/ROADMAP.md).
 
 WezTerm is **intentionally not supported** — its mux is built around

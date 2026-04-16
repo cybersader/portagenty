@@ -185,10 +185,10 @@ v1 shipped the tmux adapter as the reference baseline. v1.x added zellij. WezTer
 - v1.x adapter runs imperative where possible (`zellij attach`, `zellij action new-tab`, `zellij action new-pane`). For workspaces where the user wants "all at once," `pa export` produces a KDL layout they can open normally.
 - Works better with OpenCode than tmux does, per the agentic-workflow README.
 
-**WezTerm** — added in v1.x, with honest caveats.
-
-- WezTerm has a built-in mux server reachable via `wezterm cli`. The only modern, cross-platform, native-on-Windows mpx with persistent panes.
-- **Known limitations**: its session-attach story is weaker than tmux's. Detaching and reattaching from arbitrary clients is rougher; some flows that feel seamless in tmux require explicit spawn/list plumbing in WezTerm. Users should expect WezTerm to be tier-1 in coverage, not tier-1 in polish. This will be called out in the TUI when WezTerm is the active adapter.
+**WezTerm** — **intentionally not supported** (see §1 Vocabulary
+and ROADMAP v1.x). The `Multiplexer::Wezterm` enum variant exists
+so workspace files don't fail-parse, but `build_mux` returns a
+clear "use tmux or zellij" message.
 
 **Mpx choice resolution**:
 
@@ -342,9 +342,12 @@ requirement.
   via `config::register_global_workspace`. Idempotent: re-runs and
   duplicate paths are no-ops. Preserves the rest of the config via
   `toml_edit`.
-- **Never edited silently outside those paths.** Running `pa` or
-  `pa launch` never mutates the registry. State drift only happens
-  when the user explicitly scaffolds.
+- **Auto-re-registered on walk-up.** If walk-up finds a workspace
+  file whose path isn't already in the registry, it's silently
+  appended so the picker sees it next time. This handles folder
+  moves transparently.
+- **Never edited silently outside scaffold + walk-up paths.** `pa`
+  `launch` and other subcommands never mutate the registry.
 - **Stale-tolerant.** `config::list_registered_workspaces` filters
   entries whose `path` doesn't resolve to an existing file. The TUI
   never shows dead rows; the config file may retain them until the
@@ -461,6 +464,63 @@ recency (state.toml) → zoxide → plocate / locate / Everything CLI →
 fd → stdlib walker. All shell-outs run with a 1-second hard
 timeout. No new C deps; only `nucleo-matcher` was added (pure Rust,
 ~50 KB).
+
+### Tree browser (`t`)
+
+From inside the find overlay, pressing `t` (or entering with an
+empty query and pressing `t`) switches to **tree-browse mode**: a
+filesystem tree view rooted at the highlighted candidate's directory
+(or the find overlay's current search root if nothing is highlighted).
+
+- **Lazy expansion**: children are loaded via `read_dir` only when
+  a directory is expanded. The result is cached in a `HashMap` so
+  re-collapsing and re-expanding is instant.
+- **Navigation**: `j`/`k`/`↑`/`↓` move the highlight. `Enter`/`→`
+  expand a collapsed directory (or select a file/leaf). `←`/
+  `Backspace` collapse the current directory (or move up to parent).
+  `Shift+Enter` selects the highlighted directory as the flow's
+  result. `Esc` returns to the search overlay.
+- **Breadcrumb**: a two-line header shows the current root as a
+  marquee (letter-by-letter scroll when the path exceeds available
+  width) on the first line and the highlighted leaf name on the
+  second.
+- **Depth cap**: tree expansion is limited to prevent runaway reads
+  on deep hierarchies. The walker uses the same `IGNORE_NAMES`
+  filter as the stdlib find backend (`.git`, `node_modules`,
+  `target`, `__pycache__`, `.venv`, `dist`, `build`).
+
+The tree browser is shared by two flows: (1) the `n` new-workspace
+scaffold in the picker, and (2) the `e → c` CWD-edit in the session
+TUI. Both use the same `TreeBrowseState` and rendering code in
+`src/tui/find.rs`.
+
+### Session-name namespacing
+
+Multiplexer session names are now workspace-scoped:
+`workspace_session_name(ws_name, session_name)` in
+`src/mux/sanitize.rs` produces `<workspace>-<session>` (e.g.
+`cyberchaste-shell`). This prevents the collision where two
+workspaces both defining a `"shell"` session would attach to the
+same mpx session.
+
+- The TUI display name remains unprefixed (user sees `"shell"`).
+- `mpx_name` on each `SessionRow` carries the prefixed form for
+  `attach` / `create_and_attach` calls.
+- Existing sessions under the old bare names are not auto-migrated;
+  they appear as "untracked" and can be killed/re-created.
+
+### Auto-re-register on walk-up
+
+When walk-up discovery finds a workspace file whose absolute path
+is not in the global `[[workspace]]` registry, the entry-point code
+calls `config::register_global_workspace(path)` before continuing
+into the session TUI. This is a silent, idempotent append — it
+never removes or reorders existing entries.
+
+Use case: the user moves a project folder (or renames a parent
+directory). The walk-up still finds the TOML (it walks from `$PWD`),
+but the picker wouldn't list it because the old path is stale.
+Auto-re-register closes the gap transparently.
 
 ### What this rules out
 

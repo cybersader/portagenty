@@ -8,6 +8,26 @@ The full architectural deep-dive lives in
 in the repo. This page is the short version — one-line definitions
 for everything you'll see in the TUI and the TOML.
 
+```
+  Concepts at a glance
+  ────────────────────────────────────────────────
+  Workspace  ──▶  named view over projects + sessions
+       │              (committable TOML file)
+       ├── Session ──▶  name + cwd + command + kind + env
+       │                   │
+       │              ┌────┴────┐
+       │              ▼         ▼
+       │          ● Live    ○ Idle    ? Untracked
+       │
+       └── Project ──▶  a directory on disk
+                          (referenced, never moved)
+
+  Multiplexer (tmux / zellij)
+       │
+       └── owns terminal panes, keeps them alive
+           pa drives it — never replaces it
+```
+
 ## Project
 
 A directory on disk with code or content you work on. Registered
@@ -42,13 +62,35 @@ Shown in the TUI as colored markers next to each row:
 Untracked = the tmux/zellij session you started manually last week
 that `pa` can see via `list-sessions` and let you re-attach to.
 
+```
+  Session lifecycle
+  ─────────────────────────────────────────────
+  ○ Idle (in TOML, not running)
+     │
+     │  Enter → create_and_attach
+     ▼
+  ● Live (running in mpx)
+     │
+     │  x → kill         Enter → attach
+     ▼                      │
+  ○ Idle (stopped)          ▼
+                     attached to terminal
+
+  ? Untracked (running in mpx, not in TOML)
+     │
+     │  Enter → attach
+     ▼
+  attached to terminal
+```
+
 ## Kind hint
 
 Optional `kind:` field on a session: `claude-code`, `opencode`,
-`editor`, `dev-server`, `shell`, or `other`. Purely display in v1.x —
-the TUI shows a one-letter colored glyph (C / O / E / D) next to the
-state marker. Smart-resume (e.g. `claude --continue`) is not wired
-to the kind in v1.x; you can express that in `command` directly.
+`editor`, `dev-server`, `shell`, or `other`. The TUI shows a
+one-letter colored glyph (C / O / E / D) next to the state marker.
+For `kind = "claude-code"`, `pa launch --resume` and
+`pa claim --resume` append `--continue` before launch so Claude
+picks up its prior conversation. Other kinds get a one-line hint.
 
 ## Multiplexer / adapter
 
@@ -82,6 +124,16 @@ Sessions + project registrations can be declared at:
 
 Merge rule on session-name collision: **workspace > per-project >
 global**. Closer to the user's current intent wins.
+
+```
+  Merge precedence (on collision)
+  ─────────────────────────────────
+  Workspace     ←── wins (closest to intent)
+     │
+  Per-project   ←── middle
+     │
+  Global        ←── lowest priority
+```
 
 ## State store
 
@@ -139,6 +191,71 @@ on line 2 — so the essentials stay readable on a phone keyboard in
 portrait. The footer's keybind hints shorten to fit
 (`Esc: back · q: quit` at the narrowest). See
 [Termux](../../getting-started/termux/) for the full mobile story.
+
+## Session-name namespacing
+
+Multiplexer session names are workspace-scoped: a session `"shell"`
+in workspace `"cyberchaste"` becomes `cyberchaste-shell` in the mpx.
+This prevents the collision where two workspaces both defining a
+`"shell"` session would silently share the same tmux/zellij session.
+
+The TUI display name stays unprefixed — you see `shell`, the mpx
+sees `cyberchaste-shell`. The mapping is handled by
+`workspace_session_name()` in the sanitize module.
+
+## Find-folder overlay
+
+Press `n` in the workspace picker to open a centered search overlay.
+Type to fuzzy-search your filesystem for project folders. Tiered
+backends fire in order:
+
+1. **Recency** — recent launches from `state.toml` (instant).
+2. **Zoxide** — frecency scores, if installed.
+3. **plocate / locate / Everything CLI** — pre-built indexes.
+4. **fd** — live walk respecting `.gitignore`.
+5. **Stdlib walker** — always-available fallback (depth-capped,
+   ignores `.git`, `node_modules`, `target`, etc.).
+
+Each tier is silently skipped when its tool isn't installed. Results
+are deduped and ranked by **nucleo** (Helix's pure-Rust fuzzy
+matcher). Enter on a candidate either opens an existing workspace
+there or scaffolds a new one with a confirm prompt.
+
+```
+  Find pipeline (fastest → broadest)
+  ─────────────────────────────────────────────
+  ① Recency (state.toml)     instant, ~10 paths
+  ② Zoxide (frecency)        instant, ~50 paths
+  ③ plocate / locate / Everything   pre-built index
+  ④ fd (.gitignore-aware)    live walk, fast
+  ⑤ stdlib walker            always available, depth-capped
+         │
+         ▼
+  dedup on canonical path → nucleo fuzzy rank → top N
+```
+
+## Tree browser
+
+Press `t` inside the find overlay to switch to a filesystem tree
+view. Directories expand on Enter (lazy `read_dir`, cached), and
+collapse on `←`/Backspace. Shift+Enter selects the highlighted
+directory. A marquee breadcrumb shows the current path. Used by both
+the `n` (new workspace) flow and the `e → c` (edit cwd) flow.
+
+## In-TUI session editing
+
+Press `e` on any tracked session row to edit it without leaving the
+TUI. A five-stage state machine walks you through: pick a field
+(name, cwd, command, kind, env) → type a new value or pick from a
+list. CWD editing opens the find/tree overlay for visual browse.
+All writes are comment-preserving via `toml_edit`.
+
+## Auto-re-register on walk-up
+
+When `pa` walks up from `$PWD` and finds a workspace file that isn't
+in the global `[[workspace]]` registry, it silently appends the new
+path. This makes folder moves transparent: you don't need to
+manually re-register a workspace after moving its parent directory.
 
 ## Pre-launch banner
 

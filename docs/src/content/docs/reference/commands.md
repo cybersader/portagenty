@@ -18,16 +18,63 @@ Opens the TUI. No flags today beyond whatever clap adds.
 pa
 ```
 
-Key bindings inside the TUI:
+### Workspace picker (home screen)
+
+Shown when `pa` runs outside any walkable workspace, or after
+pressing `Esc` from the session list.
 
 | Key | Action |
 |---|---|
-| `j` / `↓` | Next session |
-| `k` / `↑` | Previous session |
+| `j` / `↓` | Next workspace |
+| `k` / `↑` | Previous workspace |
+| `g` / `Home` | First workspace |
+| `G` / `End` | Last workspace |
+| `Enter` / `→` | Open the highlighted workspace |
+| `n` | Find a folder + scaffold a new workspace |
+| `d` | Unregister workspace from global index (file stays on disk) |
+| `D` | Delete workspace file and unregister (with confirm) |
+| `r` | Reveal workspace path (auto-copies to clipboard) |
+| `?` | Help overlay |
+| `q` / `Esc` | Exit `pa` |
+
+### Session list
+
+| Key | Action |
+|---|---|
+| `j` / `↓` / `Alt+J` | Next session |
+| `k` / `↑` / `Alt+K` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` | Attach-or-create the highlighted session (takeover) |
-| `q` / `Esc` / `Ctrl+C` | Quit |
+| `Enter` / `→` | Attach-or-create the highlighted session (takeover) |
+| `e` | Edit session (name / cwd / command / kind / env) |
+| `d` | Delete session from workspace TOML (with confirm) |
+| `x` | Kill a live mpx session (with confirm) |
+| `m` | Switch workspace multiplexer (tmux ↔ zellij) |
+| `?` | Help overlay |
+| `Esc` / `←` | Back to workspace picker |
+| `q` / `Ctrl+C` | Exit `pa` directly |
+
+### Find overlay (triggered by `n` in picker or `e → c` in session list)
+
+| Key | Action |
+|---|---|
+| Type characters | Fuzzy-search folders (nucleo ranking) |
+| `↑` / `↓` | Move highlight through results |
+| `Enter` | Select folder (scaffold or open existing workspace) |
+| `t` | Switch to tree-browse mode |
+| `Ctrl+F` | Fullscreen path display |
+| `Esc` | Close the find overlay |
+
+### Tree browser (triggered by `t` inside find overlay)
+
+| Key | Action |
+|---|---|
+| `j` / `↓` | Next row |
+| `k` / `↑` | Previous row |
+| `Enter` / `→` | Expand directory (or select leaf) |
+| `←` / `Backspace` | Collapse directory (or go to parent) |
+| `Shift+Enter` | Select the highlighted directory as result |
+| `Esc` | Back to search mode |
 
 ## `pa launch <session>`
 
@@ -105,7 +152,7 @@ SSH: you don't have to hand-edit TOML before `pa` works.
 | Flag | Default | What |
 |---|---|---|
 | `name` (positional) | current-directory name | Workspace display name; filename stem is a sanitized version |
-| `--mpx tmux\|zellij` | tmux | Which multiplexer to pin |
+| `--mpx tmux\|zellij` | global default, else tmux | Which multiplexer to pin |
 | `--force` | off | Overwrite an existing `<name>.portagenty.toml` |
 
 ```sh
@@ -167,6 +214,8 @@ with guidance.
 | `--cwd <path>` | Replace the cwd |
 | `--kind <...>` | Replace the kind hint |
 | `--rename <new-name>` | Rename (errors on collision with an existing session) |
+| `--env KEY=VAL` | Set an env var (repeatable) |
+| `--unset-env KEY` | Remove an env var (repeatable) |
 | `-w`, `--workspace <path>` | Explicit workspace file (walk-up otherwise) |
 
 ```sh
@@ -174,6 +223,8 @@ pa edit claude --command "claude --resume"
 pa edit dev --cwd ./new-app
 pa edit my-session --kind claude-code
 pa edit old-name --rename new-name
+pa edit claude --env ANTHROPIC_MODEL=opus --env DEBUG=1
+pa edit claude --unset-env DEBUG
 ```
 
 Same comment-preserving behavior as `pa rm`: only the target field
