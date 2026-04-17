@@ -85,6 +85,26 @@ pub struct App {
     /// When Some, the find overlay is open for cwd selection.
     /// Tuple: (session_name being edited, search state).
     browsing_cwd: Option<(String, crate::tui::find::SearchState)>,
+    /// When Some, the "add new session" modal is showing. Two-stage:
+    /// first name, then command. Enter advances or commits; Esc
+    /// cancels.
+    adding_session: Option<AddSessionState>,
+}
+
+/// Two-stage state for the "add new session" modal.
+#[derive(Debug, Clone)]
+struct AddSessionState {
+    stage: AddStage,
+    name: String,
+    command: String,
+    /// Transient error from the last failed commit (e.g. duplicate).
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddStage {
+    Name,
+    Command,
 }
 
 /// How long status messages stick around before auto-clearing.
@@ -147,6 +167,7 @@ impl App {
             status_set_at: None,
             editing: None,
             browsing_cwd: None,
+            adding_session: None,
         }
     }
 
@@ -303,6 +324,145 @@ impl App {
     /// Open the in-TUI edit overlay for the highlighted session.
     /// Untracked rows aren't editable (no workspace TOML entry to
     /// mutate); same for the synthetic live-browse workspace.
+    /// Handle a key press while the add-session modal is open. Stage
+    /// 1 = name, stage 2 = command. Enter advances name → command,
+    /// then commits. Esc cancels. Standard input-editing keys apply.
+    fn handle_add_session_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let Some(mut st) = self.adding_session.take() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.set_status("add cancelled");
+                // modal closes (already took the Option).
+            }
+            KeyCode::Enter => match st.stage {
+                AddStage::Name => {
+                    if st.name.trim().is_empty() {
+                        st.error = Some("name can't be empty".into());
+                        self.adding_session = Some(st);
+                    } else {
+                        st.stage = AddStage::Command;
+                        st.error = None;
+                        self.adding_session = Some(st);
+                    }
+                }
+                AddStage::Command => {
+                    if st.command.trim().is_empty() {
+                        st.error = Some("command can't be empty".into());
+                        self.adding_session = Some(st);
+                    } else if let Some(ws_path) = self.workspace.file_path.clone() {
+                        match crate::cli::add(
+                            st.name.trim(),
+                            st.command.trim(),
+                            None,
+                            None,
+                            Some(&ws_path),
+                        ) {
+                            Ok(()) => {
+                                let name = st.name.clone();
+                                self.set_status(format!("added session {name:?}"));
+                                self.reload_workspace();
+                                // modal closes.
+                            }
+                            Err(e) => {
+                                st.error = Some(format!("{e:#}"));
+                                self.adding_session = Some(st);
+                            }
+                        }
+                    } else {
+                        self.set_status("can't add to live-browse workspace");
+                    }
+                }
+            },
+            KeyCode::Tab => {
+                // Tab from Name → Command (if name non-empty). Lets
+                // users fill both fields without pressing Enter twice.
+                if st.stage == AddStage::Name && !st.name.trim().is_empty() {
+                    st.stage = AddStage::Command;
+                    st.error = None;
+                }
+                self.adding_session = Some(st);
+            }
+            KeyCode::BackTab => {
+                // Shift+Tab: go back to the previous stage.
+                if st.stage == AddStage::Command {
+                    st.stage = AddStage::Name;
+                }
+                self.adding_session = Some(st);
+            }
+            KeyCode::Backspace => {
+                let buf = match st.stage {
+                    AddStage::Name => &mut st.name,
+                    AddStage::Command => &mut st.command,
+                };
+                buf.pop();
+                self.adding_session = Some(st);
+            }
+            KeyCode::Char('h') if mods.contains(KeyModifiers::CONTROL) => {
+                let buf = match st.stage {
+                    AddStage::Name => &mut st.name,
+                    AddStage::Command => &mut st.command,
+                };
+                buf.pop();
+                self.adding_session = Some(st);
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                let buf = match st.stage {
+                    AddStage::Name => &mut st.name,
+                    AddStage::Command => &mut st.command,
+                };
+                buf.clear();
+                self.adding_session = Some(st);
+            }
+            KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
+                let buf = match st.stage {
+                    AddStage::Name => &mut st.name,
+                    AddStage::Command => &mut st.command,
+                };
+                while buf.ends_with(' ') {
+                    buf.pop();
+                }
+                while buf.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                    buf.pop();
+                }
+                self.adding_session = Some(st);
+            }
+            KeyCode::Char(_) if mods.contains(KeyModifiers::CONTROL) => {
+                // Eat stray Ctrl+<letter> so it doesn't hit the input.
+                self.adding_session = Some(st);
+            }
+            KeyCode::Char(ch) => {
+                let buf = match st.stage {
+                    AddStage::Name => &mut st.name,
+                    AddStage::Command => &mut st.command,
+                };
+                buf.push(ch);
+                self.adding_session = Some(st);
+            }
+            _ => {
+                self.adding_session = Some(st);
+            }
+        }
+    }
+
+    /// Reload the workspace from disk and rebuild the row list. Used
+    /// after a successful add to reflect the new session in the TUI
+    /// without requiring an Esc + re-entry.
+    fn reload_workspace(&mut self) {
+        if let Some(ws_path) = self.workspace.file_path.clone() {
+            let opts = crate::config::LoadOptions {
+                workspace_path: Some(ws_path),
+                ..Default::default()
+            };
+            if let Ok(ws) = crate::config::load(&opts) {
+                self.workspace = ws;
+                let live = self.mux.list_sessions().unwrap_or_default();
+                self.rows = crate::tui::view::build_rows(&self.workspace, &live);
+            }
+        }
+    }
+
     fn open_edit_overlay(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -514,6 +674,13 @@ impl App {
             self.help_open = false;
             return Action::None;
         }
+        // Add-session modal: two-stage input (name → command). Enter
+        // advances / commits, Esc cancels, Backspace & Ctrl+H delete,
+        // Ctrl+U clears, Ctrl+<letter> is silently eaten.
+        if self.adding_session.is_some() {
+            self.handle_add_session_key(code, mods);
+            return Action::None;
+        }
         // CWD browse overlay: find overlay open for folder selection.
         if self.browsing_cwd.is_some() {
             let (ref session_name, ref mut search) = self.browsing_cwd.as_mut().unwrap();
@@ -634,6 +801,14 @@ impl App {
                 self.help_open = true;
                 Action::None
             }
+            // Ctrl+D half-page jump — must come BEFORE bare `d`
+            // (delete) since `_` matches any modifier.
+            (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
+                for _ in 0..5 {
+                    self.select_next();
+                }
+                Action::None
+            }
             (KeyCode::Char('d'), _) => {
                 self.open_delete_prompt();
                 Action::None
@@ -648,6 +823,18 @@ impl App {
             }
             (KeyCode::Char('e'), _) => {
                 self.open_edit_overlay();
+                Action::None
+            }
+            // `a` opens the "add new session" modal (two-stage name
+            // → command input). Writes via cli::add_session_to_file,
+            // same path the CLI uses.
+            (KeyCode::Char('a'), _) => {
+                self.adding_session = Some(AddSessionState {
+                    stage: AddStage::Name,
+                    name: String::new(),
+                    command: String::new(),
+                    error: None,
+                });
                 Action::None
             }
             // `q` in the session list closes this view and goes back
@@ -688,13 +875,7 @@ impl App {
                 self.select_last();
                 Action::None
             }
-            // Ctrl+D / Ctrl+U: half-page jumps (vim-style).
-            (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
-                for _ in 0..5 {
-                    self.select_next();
-                }
-                Action::None
-            }
+            // Ctrl+U: half-page up (vim-style). Ctrl+D is earlier.
             (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
                 for _ in 0..5 {
                     self.select_prev();
@@ -843,6 +1024,13 @@ impl App {
                 Paragraph::new(Line::from(vec![
                     Span::styled(" ─── ", sep),
                     Span::styled(
+                        "a ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("add  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
                         "e ",
                         Style::default()
                             .fg(Color::Cyan)
@@ -894,6 +1082,11 @@ impl App {
         // CWD browse overlay — same find overlay as the picker's `n`.
         if let Some((_, ref mut search)) = self.browsing_cwd {
             crate::tui::find::render(frame, area, search);
+        }
+
+        // Add-session modal: above content, under help.
+        if let Some(st) = &self.adding_session {
+            render_add_session_modal(frame, area, st);
         }
 
         // Help overlay renders last so it sits on top of everything.
@@ -1109,6 +1302,91 @@ fn row_list_item(
         ));
     }
     ListItem::new(Line::from(spans))
+}
+
+/// Centered two-field input modal for adding a new session. Stage
+/// 1 = name, stage 2 = command. Active field shows a bold prompt;
+/// the inactive one is dim. Error (if any) renders in red between
+/// the fields and the help line.
+fn render_add_session_modal(frame: &mut Frame<'_>, area: Rect, st: &AddSessionState) {
+    use ratatui::widgets::{Block, Borders, Clear};
+    let w = area.width;
+    let h = area.height;
+    let overlay_w = w.saturating_sub(4).clamp(40, 72);
+    let overlay_h: u16 = if st.error.is_some() { 10 } else { 9 };
+    let overlay_h = overlay_h.min(h.saturating_sub(2));
+    let x = area.x + (w.saturating_sub(overlay_w)) / 2;
+    let y = area.y + (h.saturating_sub(overlay_h)) / 2;
+    let region = Rect {
+        x,
+        y,
+        width: overlay_w,
+        height: overlay_h,
+    };
+    frame.render_widget(Clear, region);
+
+    let block = Block::default()
+        .title(" Add session ")
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let caret = Span::styled(
+        "_",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::SLOW_BLINK),
+    );
+    let active = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    let (name_style, cmd_style) = match st.stage {
+        AddStage::Name => (active, dim),
+        AddStage::Command => (dim, active),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  name:    ", name_style),
+            Span::styled(st.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            if st.stage == AddStage::Name {
+                caret.clone()
+            } else {
+                Span::raw("")
+            },
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  command: ", cmd_style),
+            Span::styled(st.command.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            if st.stage == AddStage::Command {
+                caret.clone()
+            } else {
+                Span::raw("")
+            },
+        ]),
+    ];
+
+    if let Some(err) = &st.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(err.to_string(), Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Tab next · Enter confirm · Esc cancel",
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+
+    frame.render_widget(Paragraph::new(lines).block(block), region);
 }
 
 /// Title + body strings for a pending confirm modal. Kept next to
@@ -1955,5 +2233,160 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------
+    // Add-session modal tests.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn add_session_a_key_opens_modal() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        assert!(app.adding_session.is_none());
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(app.adding_session.is_some());
+        let st = app.adding_session.as_ref().unwrap();
+        assert_eq!(st.stage, AddStage::Name);
+        assert_eq!(st.name, "");
+    }
+
+    #[test]
+    fn add_session_typing_builds_name_then_command() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        for ch in ['d', 'e', 'v'] {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert_eq!(app.adding_session.as_ref().unwrap().name, "dev");
+        // Enter advances to command stage.
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.adding_session.as_ref().unwrap().stage, AddStage::Command);
+        for ch in ['b', 'u', 'n'] {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert_eq!(app.adding_session.as_ref().unwrap().command, "bun");
+    }
+
+    #[test]
+    fn add_session_esc_cancels() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.adding_session.is_none());
+    }
+
+    #[test]
+    fn add_session_tab_advances_stage_when_name_nonempty() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.adding_session.as_ref().unwrap().stage, AddStage::Command);
+    }
+
+    #[test]
+    fn add_session_enter_on_empty_name_shows_error() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let st = app.adding_session.as_ref().unwrap();
+        assert_eq!(st.stage, AddStage::Name);
+        assert!(st.error.is_some());
+    }
+
+    #[test]
+    fn add_session_ctrl_h_deletes_char() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        for ch in ['a', 'b', 'c'] {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.handle_key(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        assert_eq!(app.adding_session.as_ref().unwrap().name, "ab");
+    }
+
+    #[test]
+    fn add_session_commits_to_disk_and_reloads() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let ws_path = tmp.path().join("test.portagenty.toml");
+        std::fs::write(
+            &ws_path,
+            "name = \"test\"\nmultiplexer = \"tmux\"\n\n\
+             [[session]]\nname = \"existing\"\ncwd = \".\"\ncommand = \"bash\"\n",
+        )
+        .unwrap();
+        let ws = crate::config::load(&crate::config::LoadOptions {
+            workspace_path: Some(ws_path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        // Reload hits mux.list_sessions(); set expectation to return
+        // empty so the reload doesn't panic.
+        let mut mock = MockMultiplexer::new();
+        mock.expect_list_sessions().returning(|| Ok(vec![]));
+        let mut app = App::new(ws, Box::new(mock), vec![]);
+
+        // Open modal, type "newsess", Enter, type "echo hi", Enter.
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        for ch in "newsess".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        for ch in "echo hi".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        // Modal should be closed and the file should contain the new
+        // session.
+        assert!(app.adding_session.is_none());
+        let raw = std::fs::read_to_string(&ws_path).unwrap();
+        assert!(raw.contains("\"newsess\""), "written file:\n{raw}");
+        assert!(raw.contains("\"echo hi\""), "written file:\n{raw}");
+        // Workspace should have been reloaded — rows now include "newsess".
+        assert!(
+            app.rows.iter().any(|r| r.display_name == "newsess"),
+            "newsess not in rows after add"
+        );
+    }
+
+    #[test]
+    fn add_session_rejects_duplicate_name() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let ws_path = tmp.path().join("t.portagenty.toml");
+        std::fs::write(
+            &ws_path,
+            "name = \"t\"\nmultiplexer = \"tmux\"\n\n\
+             [[session]]\nname = \"shell\"\ncwd = \".\"\ncommand = \"bash\"\n",
+        )
+        .unwrap();
+        let ws = crate::config::load(&crate::config::LoadOptions {
+            workspace_path: Some(ws_path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+
+        // Try to add a session named "shell" (already exists).
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        for ch in "shell".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        for ch in "bash".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        // Modal should still be open (commit failed), error present.
+        let st = app.adding_session.as_ref().expect("modal should stay open");
+        assert!(st.error.is_some(), "expected error on duplicate");
     }
 }

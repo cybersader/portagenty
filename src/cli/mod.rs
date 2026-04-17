@@ -21,6 +21,13 @@ use crate::mux::{AttachMode, Multiplexer, TmuxAdapter, ZellijAdapter};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// Optional path to a directory or `*.portagenty.toml` file. When
+    /// given without a subcommand, opens that workspace's TUI directly
+    /// — no need to `cd` there first. Accepts either a workspace file
+    /// or a directory (walks up from the directory).
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]

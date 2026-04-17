@@ -44,6 +44,17 @@ fn help_flag_mentions_workspaces() {
 }
 
 #[test]
+fn bare_pa_with_nonexistent_path_errors_cleanly() {
+    // `pa /nope/path/that/does/not/exist` should fail with a clear
+    // message instead of silently falling back to walk-up.
+    pa_cmd()
+        .args(["/nope-xyz-does-not-exist-hopefully"])
+        .assert()
+        .failure()
+        .stderr(contains("doesn't exist"));
+}
+
+#[test]
 fn launch_errors_when_no_workspace_found() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let empty = tmp.child("empty");

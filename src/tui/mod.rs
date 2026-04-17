@@ -21,7 +21,11 @@ use crate::mux::TmuxAdapter;
 /// Entry point for the bare `pa` invocation. Loads the current
 /// workspace + live mpx sessions, runs the TUI, and — if the user
 /// picked a row — restores the terminal and hands off to the mpx.
-pub fn run() -> Result<()> {
+///
+/// `explicit_path` — when Some, opens the workspace at that path
+/// directly, bypassing walk-up. Accepts either a `*.portagenty.toml`
+/// file or a directory (walks up from the directory if it's a dir).
+pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
     // See DESIGN.md §12 for the full entry-point contract. Key
     // invariant: the workspace picker is the *home screen*. Esc from
     // the session TUI always returns here, regardless of whether the
@@ -29,10 +33,35 @@ pub fn run() -> Result<()> {
     // itself. There is exactly one back-stack; pa is never ambiguous
     // about "what does Esc do."
 
+    // Resolve the explicit path (if any) into LoadOptions once up
+    // front — used for both the onboarding guard below and the main
+    // first-iteration load. A path pointing at a directory triggers
+    // walk-up-from-there; a file is used directly. A missing or
+    // broken path errors cleanly instead of silently falling back
+    // to walk-up from $PWD.
+    let explicit_opts = match explicit_path {
+        Some(p) if p.is_file() => Some(LoadOptions {
+            workspace_path: Some(p.to_path_buf()),
+            ..Default::default()
+        }),
+        Some(p) if p.is_dir() => Some(LoadOptions {
+            cwd: Some(p.to_path_buf()),
+            ..Default::default()
+        }),
+        Some(p) => {
+            return Err(anyhow::anyhow!(
+                "path {} doesn't exist (or isn't a file / directory)",
+                p.display()
+            ));
+        }
+        None => None,
+    };
+    let load_opts = || explicit_opts.clone().unwrap_or_default();
+
     // First-run wizard short-circuits before the TUI loop, since
     // showing the picker with zero workspaces on a brand-new machine
     // would just bounce straight to onboarding anyway.
-    if load(&LoadOptions::default()).is_err()
+    if load(&load_opts()).is_err()
         && crate::onboarding::is_interactive()
         && !crate::onboarding::has_onboarded()
     {
@@ -49,7 +78,7 @@ pub fn run() -> Result<()> {
     // Non-interactive (piped, CI, cron) with no walkable workspace
     // and no onboarding: nothing useful to show, exit cleanly with
     // the original error.
-    if !crate::onboarding::is_interactive() && load(&LoadOptions::default()).is_err() {
+    if !crate::onboarding::is_interactive() && load(&load_opts()).is_err() {
         return Err(anyhow::anyhow!(
             "no *.portagenty.toml found walking up from {}",
             std::env::current_dir()
@@ -67,7 +96,7 @@ pub fn run() -> Result<()> {
     loop {
         let ws = if first_iteration {
             first_iteration = false;
-            let loaded = load(&LoadOptions::default()).ok();
+            let loaded = load(&load_opts()).ok();
             // Auto-re-register: if walk-up found a workspace that
             // isn't in the global registry (e.g. the user moved the
             // folder), register it so the picker sees it next time.

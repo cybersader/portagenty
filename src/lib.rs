@@ -24,7 +24,7 @@ use cli::{Cli, Command};
 /// parsed CLI into either the TUI (default) or a one-shot subcommand.
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        None => tui::run(),
+        None => tui::run(cli.path.as_deref()),
         Some(Command::Launch {
             session,
             workspace,
