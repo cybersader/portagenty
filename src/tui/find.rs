@@ -789,6 +789,25 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             state.rerank();
             SearchOutcome::Continue
         }
+        // Ctrl+H aliases Backspace — many terminals send Ctrl+H when
+        // Ctrl+Backspace is pressed. Without this, Ctrl+Bksp pushes a
+        // literal 'h' into the input.
+        (KeyCode::Char('h'), m) if m.contains(KeyModifiers::CONTROL) => {
+            state.input.pop();
+            state.rerank();
+            SearchOutcome::Continue
+        }
+        // Ctrl+W: delete previous word.
+        (KeyCode::Char('w'), m) if m.contains(KeyModifiers::CONTROL) => {
+            while state.input.ends_with(' ') {
+                state.input.pop();
+            }
+            while state.input.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                state.input.pop();
+            }
+            state.rerank();
+            SearchOutcome::Continue
+        }
         (KeyCode::Up, _) => {
             move_selection(state, -1);
             SearchOutcome::Continue

@@ -204,8 +204,32 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                         input.pop();
                         pending = Some(PickerPending::Rename { path, input });
                     }
+                    // Ctrl+H aliases Backspace — most terminals send
+                    // Ctrl+H when Ctrl+Backspace is pressed, and ASCII
+                    // 8 is historically both. Without this, Ctrl+Bksp
+                    // inserted a literal 'h' instead of deleting.
+                    KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        input.pop();
+                        pending = Some(PickerPending::Rename { path, input });
+                    }
+                    // Ctrl+W: delete previous word (readline-style).
+                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Strip trailing spaces then the next word.
+                        while input.ends_with(' ') {
+                            input.pop();
+                        }
+                        while input.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                            input.pop();
+                        }
+                        pending = Some(PickerPending::Rename { path, input });
+                    }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         input.clear();
+                        pending = Some(PickerPending::Rename { path, input });
+                    }
+                    // Ignore any other Ctrl+<letter> combos so they
+                    // don't get pushed into the input as raw chars.
+                    KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         pending = Some(PickerPending::Rename { path, input });
                     }
                     KeyCode::Char(ch) => {
@@ -539,11 +563,18 @@ fn render(
     let row_width = chunks[2].width as usize;
     let mut items: Vec<ListItem> = Vec::with_capacity(workspaces.len() + 1);
     for path in workspaces {
-        let label = path
+        // Prefer the TOML's `name` field (user-authored display name)
+        // over the filename stem. Falls back to the filename if the
+        // file is missing, unparseable, or has no `name` set.
+        let toml_name = read_workspace_name(path);
+        let fallback = path
             .file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| s.strip_suffix(".portagenty"))
-            .unwrap_or_else(|| path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
+            .unwrap_or_else(|| path.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+            .to_string();
+        let label_owned = toml_name.unwrap_or(fallback);
+        let label = label_owned.as_str();
         let dir = path
             .parent()
             .map(|p| compact_path(&p.display().to_string()))
