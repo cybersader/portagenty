@@ -801,17 +801,23 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             state.restart_walk();
             SearchOutcome::Continue
         }
-        // Ctrl+T: toggle to tree browser mode. If the user typed an
-        // absolute path, root the tree there. Otherwise use the
-        // current search root — but prefer the current working dir
-        // over a WSL home full of dotfiles.
+        // Ctrl+T: toggle to tree browser mode.
+        // - If the user drilled via > / < (opts.roots has exactly 1
+        //   entry), root the tree at that drilled folder.
+        // - If the user typed an absolute path, root the tree there.
+        // - Otherwise (fresh overlay or global mode with multiple
+        //   roots), root at the current working directory.
         (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
             let trimmed = state.input.trim();
             let root = if trimmed.starts_with('/') || trimmed.starts_with("~/") {
                 let abs = crate::find::expand_tilde(trimmed);
                 crate::find::first_existing_ancestor(&abs)
                     .unwrap_or_else(|| PathBuf::from("/"))
+            } else if state.opts.roots.len() == 1 {
+                // Drilled state — use the current search root.
+                state.opts.roots[0].clone()
             } else {
+                // Fresh overlay or global — use cwd.
                 std::env::current_dir().unwrap_or_else(|_| {
                     state
                         .opts
