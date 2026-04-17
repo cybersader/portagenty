@@ -758,15 +758,26 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             state.restart_walk();
             SearchOutcome::Continue
         }
-        // Ctrl+T: toggle to tree browser mode rooted at current search
-        // root. Uses Ctrl so bare `t` goes to the search input.
+        // Ctrl+T: toggle to tree browser mode. If the user typed an
+        // absolute path, root the tree there. Otherwise use the
+        // current search root — but prefer the current working dir
+        // over a WSL home full of dotfiles.
         (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
-            let root = state
-                .opts
-                .roots
-                .first()
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from("."));
+            let trimmed = state.input.trim();
+            let root = if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+                let abs = crate::find::expand_tilde(trimmed);
+                crate::find::first_existing_ancestor(&abs)
+                    .unwrap_or_else(|| PathBuf::from("/"))
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| {
+                    state
+                        .opts
+                        .roots
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                })
+            };
             state.mode = FindMode::Tree(Box::new(TreeBrowseState::new(root)));
             SearchOutcome::Continue
         }
@@ -813,19 +824,22 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         }
         (KeyCode::Char(ch), _) => {
             state.input.push(ch);
-            // Absolute-path prefix mode: when the input looks like an
-            // absolute path, re-root the walker to the nearest existing
-            // ancestor so the user can browse arbitrary mount points
-            // (e.g. "/mnt/d"). Restart only when the root actually
-            // changes to avoid re-walking on every keystroke.
+            // Absolute-path prefix mode: when the input IS an existing
+            // directory, re-root the walker there. We check the exact
+            // typed path (not its ancestor) so typing `/` doesn't
+            // trigger a walk of the entire filesystem — only a
+            // complete, existing path like `/mnt/d` or `/mnt/d/` does.
             let trimmed = state.input.trim();
             if trimmed.starts_with('/') || trimmed.starts_with("~/") {
                 let abs = crate::find::expand_tilde(trimmed);
-                let new_root = crate::find::first_existing_ancestor(&abs);
-                let current_root = state.opts.roots.first().cloned();
-                if new_root != current_root && new_root.is_some() {
-                    state.opts.roots = vec![new_root.unwrap()];
-                    state.restart_walk();
+                if abs.is_dir() {
+                    let current_root = state.opts.roots.first().cloned();
+                    if Some(&abs) != current_root.as_ref() {
+                        state.opts.roots = vec![abs];
+                        state.restart_walk();
+                    } else {
+                        state.rerank();
+                    }
                 } else {
                     state.rerank();
                 }
