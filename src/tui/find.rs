@@ -406,6 +406,9 @@ pub struct SearchState {
     /// construction time. When the query is empty, only these are
     /// shown — walker results are hidden until the user types.
     recency_count: usize,
+    /// Whether we're in global search mode (all mount points) vs
+    /// project-roots mode. Toggled by Ctrl+R.
+    pub global_mode: bool,
     /// Receiver end of the channel the background walker sends
     /// `Vec<PathBuf>` batches into. Drained on each render cycle.
     bg_rx: Option<mpsc::Receiver<Vec<PathBuf>>>,
@@ -475,6 +478,7 @@ impl Default for SearchState {
             list_state: ListState::default(),
             raw_dirs,
             recency_count,
+            global_mode: false,
             bg_rx,
             scanning: true,
             anim_tick: 0,
@@ -752,8 +756,17 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             }
             SearchOutcome::Continue
         }
+        // Ctrl+R: toggle between project-roots search and global
+        // search. Global mode walks from `/` (or `/mnt` on WSL) so
+        // the user can find folders on any mount point without typing
+        // an absolute path.
         (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
-            state.opts.roots = crate::find::default_roots();
+            state.global_mode = !state.global_mode;
+            state.opts.roots = if state.global_mode {
+                global_search_roots()
+            } else {
+                crate::find::default_roots()
+            };
             state.input.clear();
             state.restart_walk();
             SearchOutcome::Continue
@@ -824,28 +837,7 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         }
         (KeyCode::Char(ch), _) => {
             state.input.push(ch);
-            // Absolute-path prefix mode: when the input IS an existing
-            // directory, re-root the walker there. We check the exact
-            // typed path (not its ancestor) so typing `/` doesn't
-            // trigger a walk of the entire filesystem — only a
-            // complete, existing path like `/mnt/d` or `/mnt/d/` does.
-            let trimmed = state.input.trim();
-            if trimmed.starts_with('/') || trimmed.starts_with("~/") {
-                let abs = crate::find::expand_tilde(trimmed);
-                if abs.is_dir() {
-                    let current_root = state.opts.roots.first().cloned();
-                    if Some(&abs) != current_root.as_ref() {
-                        state.opts.roots = vec![abs];
-                        state.restart_walk();
-                    } else {
-                        state.rerank();
-                    }
-                } else {
-                    state.rerank();
-                }
-            } else {
-                state.rerank();
-            }
+            state.rerank();
             SearchOutcome::Continue
         }
         _ => SearchOutcome::Continue,
@@ -938,10 +930,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     // (barbershop ticker) so the user sees every part of the path
     // rotate through the visible window.
     let inner_w = inner.width as usize;
+    let mode_tag = if state.global_mode { "global" } else { "recents" };
+    let bc_label = format!("{mode_tag} · {}", state.backends.one_liner());
     let breadcrumb = render_marquee_breadcrumb(
         &state.opts.roots,
         inner_w,
-        &state.backends.one_liner(),
+        &bc_label,
         state.anim_offset,
     );
     frame.render_widget(Paragraph::new(breadcrumb), chunks[0]);
@@ -980,9 +974,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 let msg = if state.scanning {
                     "  scanning filesystem… results will appear as they're found"
                 } else if state.input.is_empty() {
-                    "  (no recents yet — type to search, or t for tree browser)"
+                    "  (no recents yet — type to search, Ctrl+T for tree, Ctrl+R for global)"
                 } else {
-                    "  no matches — try > to drill, < to go up, or ^T for tree"
+                    "  no matches — try Ctrl+R for global search, or Ctrl+T for tree"
                 };
                 let empty = Paragraph::new(msg).style(Style::default().add_modifier(Modifier::DIM));
                 frame.render_widget(empty, chunks[2]);
@@ -1041,7 +1035,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("reset", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        if state.global_mode { "local" } else { "global" },
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
                 ])),
                 chunks[4],
             );
@@ -1472,6 +1469,35 @@ fn is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
     })
 }
 
+/// Roots for global search mode. On WSL, returns the individual
+/// `/mnt/<drive>` entries so the walker covers all Windows drives
+/// plus the native Linux root. On regular Linux/macOS, returns `/`.
+fn global_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if crate::find::is_wsl() {
+        // Add each /mnt/<letter> drive mount individually.
+        if let Ok(entries) = std::fs::read_dir("/mnt") {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    roots.push(p);
+                }
+            }
+        }
+        // Also include native Linux home.
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            if home.is_dir() && !roots.iter().any(|r| home.starts_with(r)) {
+                roots.push(home);
+            }
+        }
+    }
+    if roots.is_empty() {
+        roots.push(PathBuf::from("/"));
+    }
+    roots
+}
+
 fn compact_home(p: &str) -> String {
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
@@ -1540,6 +1566,7 @@ mod tests {
                 PathBuf::from("/home/u/cybersader/portagenty"),
             ],
             recency_count: 2,
+            global_mode: false,
             bg_rx: None,
             scanning: false,
             anim_tick: 0,
