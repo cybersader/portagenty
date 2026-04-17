@@ -14,7 +14,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     prelude::*,
-    widgets::{List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     DefaultTerminal,
 };
 
@@ -71,6 +71,9 @@ enum PickerPending {
     /// Triggered from the find overlay's Enter on a no-workspace
     /// folder. On confirm: scaffold + open the new workspace.
     ScaffoldAt(PathBuf),
+    /// Rename the workspace's display name. Holds the file path and
+    /// the user's in-progress input. Enter commits, Esc cancels.
+    Rename { path: PathBuf, input: String },
 }
 
 /// Sticky info modal contents. Distinct from `PickerPending` because
@@ -184,6 +187,38 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
         // outcome so the outer driver opens its session TUI right
         // away (per DESIGN §12: "scaffold + open immediately").
         if let Some(action) = pending.take() {
+            // Rename has its own input flow — divert keys into the
+            // input field instead of routing through the y/N confirm.
+            if let PickerPending::Rename { path, mut input } = action {
+                match key.code {
+                    KeyCode::Esc => {
+                        status.set("rename cancelled".into());
+                    }
+                    KeyCode::Enter => {
+                        match crate::workspace_edit::set_name(&path, &input) {
+                            Ok(_) => status.set(format!("renamed to {input:?}")),
+                            Err(e) => status.set(format!("rename failed: {e:#}")),
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                        pending = Some(PickerPending::Rename { path, input });
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        input.clear();
+                        pending = Some(PickerPending::Rename { path, input });
+                    }
+                    KeyCode::Char(ch) => {
+                        input.push(ch);
+                        pending = Some(PickerPending::Rename { path, input });
+                    }
+                    _ => {
+                        pending = Some(PickerPending::Rename { path, input });
+                    }
+                }
+                continue;
+            }
+
             match crate::tui::confirm::classify(key.code) {
                 crate::tui::confirm::ConfirmKey::Confirm => {
                     if let PickerPending::ScaffoldAt(dir) = &action {
@@ -269,6 +304,19 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             }
             (KeyCode::Char('e'), _) => {
                 status.set("e: in-TUI workspace editing is coming soon".into());
+            }
+            (KeyCode::Char('R'), _) => {
+                if let Some(path) = selected_workspace(&workspaces, &state) {
+                    // Seed input with current display name so the user
+                    // can tweak instead of retyping from scratch.
+                    let current_name = read_workspace_name(&path).unwrap_or_default();
+                    pending = Some(PickerPending::Rename {
+                        path,
+                        input: current_name,
+                    });
+                } else {
+                    status.set("R: live-sessions row isn't a workspace".into());
+                }
             }
             (KeyCode::Enter, _) => {
                 let sel = state.selected().unwrap_or(0);
@@ -411,7 +459,18 @@ fn perform_picker_action(
         // success we exit the picker entirely, returning the new
         // workspace as the outcome. Reaching this arm is a bug.
         PickerPending::ScaffoldAt(_) => "scaffold path took the wrong branch (bug)".into(),
+        // Rename has its own input-divert flow in the main loop, so
+        // this arm is also unreachable in practice.
+        PickerPending::Rename { .. } => "rename path took the wrong branch (bug)".into(),
     }
+}
+
+/// Read the `name = "..."` field from a workspace TOML. Returns
+/// `None` on any failure (missing file, parse error, missing field).
+fn read_workspace_name(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let doc: toml_edit::DocumentMut = raw.parse().ok()?;
+    doc.get("name")?.as_str().map(|s| s.to_string())
 }
 
 /// Run the scaffold at `dir` for a fresh workspace. The display
@@ -629,15 +688,29 @@ fn render(
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("reveal", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled("reveal  ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    "R ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("rename", Style::default().add_modifier(Modifier::DIM)),
             ])),
             chunks[4],
         );
     }
 
     if let Some(p) = pending {
-        let (title, body) = picker_confirm_copy(p);
-        crate::tui::confirm::render(frame, area, &title, &body);
+        match p {
+            PickerPending::Rename { path, input } => {
+                render_rename_modal(frame, area, path, input);
+            }
+            _ => {
+                let (title, body) = picker_confirm_copy(p);
+                crate::tui::confirm::render(frame, area, &title, &body);
+            }
+        }
     }
 
     if let Some(modal) = info {
@@ -692,6 +765,9 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
                 ),
             )
         }
+        // Rename is drawn by its own modal; never routed through the
+        // y/N confirm path. Keep the arm for exhaustiveness.
+        PickerPending::Rename { .. } => (String::new(), String::new()),
     }
 }
 
@@ -729,4 +805,77 @@ fn compact_path(p: &str) -> String {
         }
     }
     p.to_string()
+}
+
+
+/// Centered input modal for renaming a workspace. Mirrors the
+/// confirm-modal layout but with a text input line instead of a y/N
+/// prompt. Caller handles the key routing (Enter = commit, Esc =
+/// cancel); this just draws.
+fn render_rename_modal(frame: &mut Frame<'_>, area: Rect, path: &std::path::Path, input: &str) {
+    let w = area.width;
+    let h = area.height;
+    let overlay_w = (w.saturating_sub(4)).clamp(40, 72);
+    let overlay_h: u16 = 7;
+    let overlay_h = overlay_h.min(h.saturating_sub(2));
+    let x = area.x + (w.saturating_sub(overlay_w)) / 2;
+    let y = area.y + (h.saturating_sub(overlay_h)) / 2;
+    let region = Rect {
+        x,
+        y,
+        width: overlay_w,
+        height: overlay_h,
+    };
+    frame.render_widget(Clear, region);
+
+    let file_label = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workspace");
+
+    let block = Block::default()
+        .title(" Rename workspace ")
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("  file: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                file_label.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  name: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                input.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "_",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter to save · Esc to cancel · Ctrl+U clears",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+
+    frame.render_widget(Paragraph::new(lines).block(block), region);
 }

@@ -215,6 +215,28 @@ impl TreeBrowseState {
         }
     }
 
+    /// Re-root the tree at the current root's parent. Used by `..`
+    /// / Backspace in tree mode so the user can browse up without
+    /// exiting to search mode first. Resets expansion state.
+    fn pop_root(&mut self) {
+        if let Some(parent) = self.root.parent() {
+            let new_root = parent.to_path_buf();
+            if new_root != self.root {
+                self.root = new_root;
+                self.expanded.clear();
+                self.children_cache.clear();
+                self.load_children(&self.root.clone());
+                self.rebuild_rows();
+                self.selected = 0;
+                self.list_state.select(if self.rows.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+            }
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         let n = self.rows.len();
         if n == 0 {
@@ -254,6 +276,12 @@ pub fn handle_tree_key(
             SearchOutcome::Continue
         }
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::Cancel,
+        // Ctrl+T in tree mode → toggle back to search mode (same as
+        // Esc, but symmetrical with Ctrl+T entering tree mode from
+        // search).
+        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
+            SearchOutcome::BackToSearch
+        }
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
             state.move_selection(1);
             SearchOutcome::Continue
@@ -272,6 +300,13 @@ pub fn handle_tree_key(
         }
         (KeyCode::Char(' '), _) => {
             state.toggle_expand();
+            SearchOutcome::Continue
+        }
+        // Backspace → go up: re-root the tree at the current root's
+        // parent. Lets the user escape a too-narrow starting point
+        // without dropping back to search mode first.
+        (KeyCode::Backspace, _) => {
+            state.pop_root();
             SearchOutcome::Continue
         }
         (KeyCode::Enter, _) => {
@@ -826,23 +861,27 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             state.restart_walk();
             SearchOutcome::Continue
         }
-        // Ctrl+T: toggle to tree browser mode.
-        // - If the user drilled via > / < (opts.roots has exactly 1
-        //   entry), root the tree at that drilled folder.
-        // - If the user typed an absolute path, root the tree there.
-        // - Otherwise (fresh overlay or global mode with multiple
-        //   roots), root at the current working directory.
+        // Ctrl+T: toggle to tree browser mode. Priority:
+        // 1. Highlighted search result → tree at that folder
+        //    (what the user is looking at right now).
+        // 2. User typed an absolute path → tree at that path.
+        // 3. Drilled state (single root) → tree at the root.
+        // 4. Otherwise → tree at cwd.
         (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
             let trimmed = state.input.trim();
-            let root = if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+            let root = if let Some(c) = state.highlighted() {
+                if c.path.is_dir() {
+                    c.path.clone()
+                } else {
+                    c.path.parent().map(|p| p.to_path_buf()).unwrap_or(c.path.clone())
+                }
+            } else if trimmed.starts_with('/') || trimmed.starts_with("~/") {
                 let abs = crate::find::expand_tilde(trimmed);
                 crate::find::first_existing_ancestor(&abs)
                     .unwrap_or_else(|| PathBuf::from("/"))
             } else if state.opts.roots.len() == 1 {
-                // Drilled state — use the current search root.
                 state.opts.roots[0].clone()
             } else {
-                // Fresh overlay or global — use cwd.
                 std::env::current_dir().unwrap_or_else(|_| {
                     state
                         .opts
@@ -1151,6 +1190,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("toggle  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "Bksp ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("up  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
                         "q ",
                         Style::default()
