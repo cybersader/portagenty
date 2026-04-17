@@ -402,6 +402,10 @@ pub struct SearchState {
     /// walker. Grows as the walker sends results over the channel.
     /// On keystroke we rank this set — no re-walk.
     raw_dirs: Vec<PathBuf>,
+    /// How many entries in `raw_dirs` came from recency + zoxide at
+    /// construction time. When the query is empty, only these are
+    /// shown — walker results are hidden until the user types.
+    recency_count: usize,
     /// Receiver end of the channel the background walker sends
     /// `Vec<PathBuf>` batches into. Drained on each render cycle.
     bg_rx: Option<mpsc::Receiver<Vec<PathBuf>>>,
@@ -459,6 +463,7 @@ impl Default for SearchState {
             raw_dirs.push(p);
         }
 
+        let recency_count = raw_dirs.len();
         let bg_rx = Some(spawn_bg_walk(opts.clone()));
 
         let mut s = Self {
@@ -469,6 +474,7 @@ impl Default for SearchState {
             backends,
             list_state: ListState::default(),
             raw_dirs,
+            recency_count,
             bg_rx,
             scanning: true,
             anim_tick: 0,
@@ -538,15 +544,20 @@ impl SearchState {
     fn rerank(&mut self) {
         let trimmed = self.input.trim();
         if trimmed.is_empty() {
+            // Empty query: only show recency + zoxide candidates (the
+            // first `recency_count` entries). Walker results are hidden
+            // until the user types something so the list doesn't fill
+            // with noise like venvs and snap packages.
             let mut seen = std::collections::HashSet::new();
             self.candidates = self
                 .raw_dirs
                 .iter()
+                .take(self.recency_count)
                 .filter(|p| seen.insert(p.to_string_lossy().into_owned()))
                 .take(self.opts.limit)
                 .map(|p| Candidate {
                     path: p.clone(),
-                    source: Source::Walk,
+                    source: Source::Recency,
                     score: 0,
                 })
                 .collect();
@@ -1496,6 +1507,7 @@ mod tests {
                 PathBuf::from("/home/u/my-project"),
                 PathBuf::from("/home/u/cybersader/portagenty"),
             ],
+            recency_count: 2,
             bg_rx: None,
             scanning: false,
             anim_tick: 0,
