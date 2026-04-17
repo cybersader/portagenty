@@ -996,13 +996,16 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         return SearchOutcome::Continue;
     }
 
-    // Tree mode: dispatch to tree handler. `t` toggles back.
+    // Tree mode: dispatch to tree handler.
     if let FindMode::Tree(ref mut tree) = state.mode {
-        if matches!(code, KeyCode::Char('t')) && mods.is_empty() {
-            state.mode = FindMode::Search;
-            return SearchOutcome::Continue;
+        // If the new-folder modal is open, send EVERY key to the tree
+        // handler so none of the outer interceptors (Ctrl+F, etc.)
+        // fire — the user is typing a folder name, not triggering
+        // tree actions.
+        if tree.creating_folder.is_some() {
+            return handle_tree_key(tree, code, mods);
         }
-        // Ctrl+F works in tree mode too.
+        // Ctrl+F works in tree mode too (fullscreen path modal).
         if matches!(code, KeyCode::Char('f')) && mods.contains(KeyModifiers::CONTROL) {
             if let Some(row) = tree.selected_row() {
                 state.fullscreen_path = Some(build_fullscreen_path(&row.path));
@@ -2175,6 +2178,34 @@ mod tree_tests {
         handle_tree_key(&mut tree, KeyCode::Char('.'), KeyModifiers::NONE);
 
         assert_eq!(tree.root, subdir);
+    }
+
+    #[test]
+    fn tree_new_folder_t_key_types_into_input_not_exits_tree() {
+        // Regression: the outer dispatcher used to intercept bare `t`
+        // and exit tree mode, which hijacked typing `t` into the
+        // new-folder name input.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let mut state = super::SearchState::default();
+        state.mode = super::FindMode::Tree(Box::new(TreeBrowseState::new(
+            tmp.path().to_path_buf(),
+        )));
+        // Enter the new-folder modal.
+        let _ = super::handle_key(&mut state, KeyCode::Char('n'), KeyModifiers::NONE);
+        // Type "test".
+        for ch in ['t', 'e', 's', 't'] {
+            super::handle_key(&mut state, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+
+        // Mode should still be Tree.
+        assert!(
+            matches!(state.mode, super::FindMode::Tree(_)),
+            "expected to still be in tree mode"
+        );
+        // Input should have "test".
+        if let super::FindMode::Tree(ref tree) = state.mode {
+            assert_eq!(tree.creating_folder.as_deref(), Some("test"));
+        }
     }
 
     #[test]
