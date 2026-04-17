@@ -96,7 +96,7 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("G / End", "last"));
             lines.push(row("Ctrl+D / Ctrl+U", "half-page down / up"));
             lines.push(row("PgDn / PgUp", "10-row jumps"));
-            lines.push(row("l / → / Enter", "open highlighted workspace"));
+            lines.push(row("l / → / Enter", "open the highlighted workspace"));
             lines.push(row("Esc / q", "exit pa"));
             lines.push(row("Ctrl+C", "exit pa"));
             lines.push(row("?", "toggle this help"));
