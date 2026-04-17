@@ -833,8 +833,9 @@ impl App {
                     Entry::new("q", "quit"),
                     Entry::new("?", "help"),
                     Entry::new("Esc", "back"),
-                    Entry::new("Enter", "launch"),
-                    Entry::new("↑/↓", "nav"),
+                    Entry::new("Enter/l", "launch"),
+                    Entry::new("j/k", "nav"),
+                    Entry::new("g/G", "top/btm"),
                 ],
             );
             let sep = Style::default().fg(Color::DarkGray);

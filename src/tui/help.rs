@@ -88,36 +88,37 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
 
     match ctx {
         HelpContext::Picker => {
-            lines.push(heading(" Workspace picker — keys"));
+            lines.push(heading(" Workspace picker — navigation"));
             lines.push(Line::raw(""));
-            lines.push(row("j / ↓", "next workspace"));
-            lines.push(row("k / ↑", "previous workspace"));
+            lines.push(row("j / ↓", "down"));
+            lines.push(row("k / ↑", "up"));
             lines.push(row("g / Home", "first"));
             lines.push(row("G / End", "last"));
-            lines.push(row("Enter", "open the highlighted workspace"));
+            lines.push(row("Ctrl+D / Ctrl+U", "half-page down / up"));
+            lines.push(row("PgDn / PgUp", "10-row jumps"));
+            lines.push(row("l / → / Enter", "open highlighted workspace"));
             lines.push(row("Esc / q", "exit pa"));
             lines.push(row("Ctrl+C", "exit pa"));
             lines.push(row("?", "toggle this help"));
             lines.push(Line::raw(""));
             lines.push(heading(" Workspace actions"));
             lines.push(Line::raw(""));
-            lines.push(row("d", "unregister from the global index (file stays)"));
-            lines.push(row("D", "delete the workspace file (destructive)"));
-            lines.push(row("r", "reveal: print the file path"));
-            lines.push(Line::raw(""));
-            lines.push(heading(" Workspace actions (coming soon)"));
-            lines.push(Line::raw(""));
-            lines.push(row("n", "scaffold a new workspace via wizard"));
-            lines.push(row("e", "rename / change default multiplexer"));
+            lines.push(row("n", "find folder + scaffold new workspace"));
+            lines.push(row("R", "rename workspace (edits TOML name)"));
+            lines.push(row("d", "unregister from global index (file stays)"));
+            lines.push(row("D", "delete workspace file (destructive)"));
+            lines.push(row("r", "reveal: show file path in modal"));
         }
         HelpContext::SessionList => {
-            lines.push(heading(" Session list — keys"));
+            lines.push(heading(" Session list — navigation"));
             lines.push(Line::raw(""));
-            lines.push(row("j / ↓", "next session"));
-            lines.push(row("k / ↑", "previous session"));
+            lines.push(row("j / ↓", "down"));
+            lines.push(row("k / ↑", "up"));
             lines.push(row("g / Home", "first"));
             lines.push(row("G / End", "last"));
-            lines.push(row("Enter", "attach (or create-and-attach)"));
+            lines.push(row("Ctrl+D / Ctrl+U", "half-page down / up"));
+            lines.push(row("PgDn / PgUp", "10-row jumps"));
+            lines.push(row("l / → / Enter", "attach (or create-and-attach)"));
             lines.push(row("Esc", "back to picker (home screen)"));
             lines.push(row("q / Ctrl+C", "exit pa"));
             lines.push(row("?", "toggle this help"));

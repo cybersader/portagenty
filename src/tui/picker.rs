@@ -713,8 +713,9 @@ fn render(
             &[
                 Entry::new("q", "quit"),
                 Entry::new("?", "help"),
-                Entry::new("Enter", "open"),
-                Entry::new("↑/↓", "nav"),
+                Entry::new("Enter/l", "open"),
+                Entry::new("j/k", "nav"),
+                Entry::new("g/G", "top/btm"),
             ],
         );
         let sep = Style::default().fg(Color::DarkGray);
