@@ -169,6 +169,13 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                         s.mode = crate::tui::find::FindMode::Search;
                     }
                 }
+                SearchOutcome::SearchFromHere(dir) => {
+                    // Tree mode `/` → back to search with new root.
+                    if let Some(s) = search.as_mut() {
+                        s.mode = crate::tui::find::FindMode::Search;
+                        s.set_root(dir);
+                    }
+                }
             }
             continue;
         }

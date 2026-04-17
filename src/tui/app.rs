@@ -533,9 +533,20 @@ impl App {
             let sn = session_name.clone();
             match result {
                 SearchOutcome::Continue => {}
-                SearchOutcome::Cancel | SearchOutcome::BackToSearch => {
+                SearchOutcome::Cancel => {
                     self.browsing_cwd = None;
                     self.set_status("cwd browse cancelled");
+                }
+                SearchOutcome::BackToSearch => {
+                    if let Some((_, s)) = self.browsing_cwd.as_mut() {
+                        s.mode = crate::tui::find::FindMode::Search;
+                    }
+                }
+                SearchOutcome::SearchFromHere(dir) => {
+                    if let Some((_, s)) = self.browsing_cwd.as_mut() {
+                        s.mode = crate::tui::find::FindMode::Search;
+                        s.set_root(dir);
+                    }
                 }
                 SearchOutcome::OpenHelp => {
                     self.help_open = true;

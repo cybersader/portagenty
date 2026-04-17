@@ -240,6 +240,19 @@ pub fn handle_tree_key(
         (KeyCode::Esc, _) => SearchOutcome::BackToSearch,
         (KeyCode::Char('q'), _) => SearchOutcome::Cancel,
         (KeyCode::Char('?'), _) => SearchOutcome::OpenHelp,
+        // `/` → search from here: jump to search mode with the
+        // highlighted folder as the new search root.
+        (KeyCode::Char('/'), _) => {
+            if let Some(row) = state.selected_row() {
+                let dir = if row.path.is_dir() {
+                    row.path.clone()
+                } else {
+                    row.path.parent().map(|p| p.to_path_buf()).unwrap_or(row.path.clone())
+                };
+                return SearchOutcome::SearchFromHere(dir);
+            }
+            SearchOutcome::Continue
+        }
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::Cancel,
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
             state.move_selection(1);
@@ -374,6 +387,9 @@ pub enum SearchOutcome {
     /// User pressed Esc in tree mode — switch back to search mode
     /// instead of closing the entire overlay (Android-back pattern).
     BackToSearch,
+    /// User pressed `/` in tree mode — switch back to search mode
+    /// with the given path as the new search root.
+    SearchFromHere(PathBuf),
 }
 
 /// Mutable state for the search overlay. Lives inside
@@ -492,6 +508,15 @@ impl Default for SearchState {
 }
 
 impl SearchState {
+    /// Re-root the search to a new directory. Used by tree mode's
+    /// "search from here" (`/`) action. Clears the input and restarts
+    /// the walker so results are scoped to the new root.
+    pub fn set_root(&mut self, dir: PathBuf) {
+        self.opts.roots = vec![dir];
+        self.input.clear();
+        self.restart_walk();
+    }
+
     /// Drain any new results from the background walker and re-rank
     /// if the set changed. Called from the picker's poll loop on
     /// each 250ms tick — keeps the TUI responsive while directories
@@ -1098,7 +1123,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                     Entry::new("Esc", "back"),
                     Entry::new("↑/↓", "nav"),
                     Entry::new("Enter", "open"),
-                    Entry::new("Esc", "search"),
+                    Entry::new("/", "search here"),
                 ],
             );
             let sep = Style::default().fg(Color::DarkGray);
