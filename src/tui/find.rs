@@ -215,6 +215,34 @@ impl TreeBrowseState {
         }
     }
 
+    /// Re-root the tree at the highlighted folder. Used by `>` in
+    /// tree mode so the user can drill all the way in (not just
+    /// expand inline). Resets expansion state. If the highlighted row
+    /// is a file, drills into its parent dir.
+    fn drill_into_selected(&mut self) {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
+            return;
+        };
+        let new_root = if row.is_dir {
+            row.path.clone()
+        } else {
+            row.path.parent().map(|p| p.to_path_buf()).unwrap_or(row.path.clone())
+        };
+        if new_root != self.root {
+            self.root = new_root;
+            self.expanded.clear();
+            self.children_cache.clear();
+            self.load_children(&self.root.clone());
+            self.rebuild_rows();
+            self.selected = 0;
+            self.list_state.select(if self.rows.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+        }
+    }
+
     /// Re-root the tree at the current root's parent. Used by `..`
     /// / Backspace in tree mode so the user can browse up without
     /// exiting to search mode first. Resets expansion state.
@@ -290,7 +318,15 @@ pub fn handle_tree_key(
             state.move_selection(-1);
             SearchOutcome::Continue
         }
-        (KeyCode::Char('>'), _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
+        // `.` → drill: re-root the tree at the highlighted folder.
+        // Single key, easy on Termux — `>` would work conceptually
+        // but requires Shift which is painful on mobile.
+        (KeyCode::Char('.'), _) => {
+            state.drill_into_selected();
+            SearchOutcome::Continue
+        }
+        // `l` / → → expand inline (keep current root, show children).
+        (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
             state.expand_selected();
             SearchOutcome::Continue
         }
@@ -1049,10 +1085,27 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     // (barbershop ticker) so the user sees every part of the path
     // rotate through the visible window.
     let inner_w = inner.width as usize;
-    let mode_tag = if state.global_mode { "global" } else { "recents" };
+    // In tree mode, the breadcrumb should reflect the tree's current
+    // root (which changes as the user drills via `.` or Backspace),
+    // not the search state's roots. In search mode, use the search
+    // roots as before.
+    let bc_roots: Vec<PathBuf> = match &state.mode {
+        FindMode::Tree(tree) => vec![tree.root.clone()],
+        FindMode::Search => state.opts.roots.clone(),
+    };
+    let mode_tag = match &state.mode {
+        FindMode::Tree(_) => "tree",
+        FindMode::Search => {
+            if state.global_mode {
+                "global"
+            } else {
+                "recents"
+            }
+        }
+    };
     let bc_label = format!("{mode_tag} · {}", state.backends.one_liner());
     let breadcrumb = render_marquee_breadcrumb(
-        &state.opts.roots,
+        &bc_roots,
         inner_w,
         &bc_label,
         state.anim_offset,
@@ -1209,6 +1262,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("toggle  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        ". ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("drill  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
                         "Bksp ",
                         Style::default()
