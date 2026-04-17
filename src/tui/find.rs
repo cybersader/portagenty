@@ -583,13 +583,25 @@ impl SearchState {
             );
             let mut scored: Vec<Candidate> = Vec::with_capacity(self.raw_dirs.len());
             let mut seen = std::collections::HashSet::new();
+            // Match against the leaf directory name so "MEDIA" finds
+            // folders named MEDIA, not every path that happens to
+            // contain scattered letters M-E-D-I-A in the full path.
+            // If the query contains `/`, match against the full path
+            // instead (the user is doing a path-based search).
+            let match_leaf = !trimmed.contains('/');
             for p in &self.raw_dirs {
                 if !seen.insert(p.to_string_lossy().into_owned()) {
                     continue;
                 }
-                let haystack = p.to_string_lossy();
+                let haystack_str = if match_leaf {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                } else {
+                    p.to_string_lossy().into_owned()
+                };
                 let mut buf: Vec<char> = Vec::new();
-                let utf32 = nucleo_matcher::Utf32Str::new(&haystack, &mut buf);
+                let utf32 = nucleo_matcher::Utf32Str::new(&haystack_str, &mut buf);
                 if let Some(score) = pattern.score(utf32, &mut matcher) {
                     scored.push(Candidate {
                         path: p.clone(),
