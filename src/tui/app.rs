@@ -687,6 +687,34 @@ impl App {
                 self.select_last();
                 Action::None
             }
+            // Ctrl+D / Ctrl+U: half-page jumps (vim-style).
+            (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
+                for _ in 0..5 {
+                    self.select_next();
+                }
+                Action::None
+            }
+            (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
+                for _ in 0..5 {
+                    self.select_prev();
+                }
+                Action::None
+            }
+            // PageDown / PageUp.
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    self.select_next();
+                }
+                Action::None
+            }
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    self.select_prev();
+                }
+                Action::None
+            }
+            // `l` / Right → launch selected (vim-style drill-in).
+            (KeyCode::Char('l'), _) | (KeyCode::Right, _) => Action::LaunchSelected,
             _ => Action::None,
         }
     }

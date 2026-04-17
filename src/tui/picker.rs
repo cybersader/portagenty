@@ -297,6 +297,35 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
                 state.select(Some(total - 1));
             }
+            // Ctrl+D / Ctrl+U: half-page jumps (vim-style).
+            (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
+                let sel = state.selected().unwrap_or(0);
+                let page = (total / 2).max(1);
+                state.select(Some((sel + page).min(total - 1)));
+            }
+            (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
+                let sel = state.selected().unwrap_or(0);
+                let page = (total / 2).max(1);
+                state.select(Some(sel.saturating_sub(page)));
+            }
+            // PageDown / PageUp: full-page jumps.
+            (KeyCode::PageDown, _) => {
+                let sel = state.selected().unwrap_or(0);
+                state.select(Some((sel + 10).min(total - 1)));
+            }
+            (KeyCode::PageUp, _) => {
+                let sel = state.selected().unwrap_or(0);
+                state.select(Some(sel.saturating_sub(10)));
+            }
+            // `l` / Right → open highlighted workspace (vim-style
+            // "move right into the thing you're looking at").
+            (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+                let sel = state.selected().unwrap_or(0);
+                if sel == workspaces.len() {
+                    return Ok(PickerOutcome::LiveBrowse);
+                }
+                return Ok(PickerOutcome::Workspace(workspaces[sel].clone()));
+            }
             (KeyCode::Char('d'), _) => {
                 if let Some(path) = selected_workspace(&workspaces, &state) {
                     pending = Some(PickerPending::Unregister(path));
