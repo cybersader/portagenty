@@ -1205,10 +1205,18 @@ fn render_marquee_breadcrumb(
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
 
-    let path_str = roots
-        .first()
-        .map(|p| compact_home(&p.display().to_string()))
-        .unwrap_or_else(|| "(no root)".into());
+    let path_str = if roots.len() <= 1 {
+        roots
+            .first()
+            .map(|p| compact_home(&p.display().to_string()))
+            .unwrap_or_else(|| "(no root)".into())
+    } else {
+        roots
+            .iter()
+            .map(|p| compact_home(&p.display().to_string()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
     let prefix = "  📂 ";
     let full = format!("{prefix}{path_str}");
