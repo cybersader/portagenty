@@ -142,7 +142,7 @@ real projects:
   `n` (new workspace) flow, starting at the session's current cwd.
   On selection the new path is written back to the TOML file.
   Replaces the old raw-text-input stub.
-- **Tree browser.** `t` inside the find overlay opens a tree view
+- **Tree browser.** `Ctrl+T` inside the find overlay opens a tree view
   rooted at the highlighted candidate (or the current search root).
   `Enter` / `→` expand a directory, `←` / `Backspace` collapse.
   Lazy `read_dir` on expand, depth-limited. Shift+Enter selects

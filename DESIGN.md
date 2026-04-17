@@ -507,7 +507,7 @@ fd → stdlib walker. All shell-outs run with a 1-second hard
 timeout. No new C deps; only `nucleo-matcher` was added (pure Rust,
 ~50 KB).
 
-### Tree browser (`t`)
+### Tree browser (`Ctrl+T`)
 
 From inside the find overlay, pressing `t` (or entering with an
 empty query and pressing `t`) switches to **tree-browse mode**: a

@@ -747,8 +747,9 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             state.restart_walk();
             SearchOutcome::Continue
         }
-        // `t`: toggle to tree browser mode rooted at current search root.
-        (KeyCode::Char('t'), _) => {
+        // Ctrl+T: toggle to tree browser mode rooted at current search
+        // root. Uses Ctrl so bare `t` goes to the search input.
+        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
             let root = state
                 .opts
                 .roots
@@ -938,7 +939,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 } else if state.input.is_empty() {
                     "  (no recents yet — type to search, or t for tree browser)"
                 } else {
-                    "  no matches — try > to drill, < to go up, or t for tree"
+                    "  no matches — try > to drill, < to go up, or ^T for tree"
                 };
                 let empty = Paragraph::new(msg).style(Style::default().add_modifier(Modifier::DIM));
                 frame.render_widget(empty, chunks[2]);
@@ -962,7 +963,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                     Entry::new("Esc", "back"),
                     Entry::new("↑/↓", "nav"),
                     Entry::new("Enter", "open"),
-                    Entry::new("t", "tree"),
+                    Entry::new("^T", "tree"),
                 ],
             );
             // Secondary line: less-critical keys.
@@ -1021,7 +1022,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                     Entry::new("Esc", "back"),
                     Entry::new("↑/↓", "nav"),
                     Entry::new("Enter", "open"),
-                    Entry::new("t", "search"),
+                    Entry::new("Esc", "search"),
                 ],
             );
             let sep = Style::default().fg(Color::DarkGray);

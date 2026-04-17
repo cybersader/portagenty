@@ -61,11 +61,11 @@ pressing `Esc` from the session list.
 | Type characters | Fuzzy-search folders (nucleo ranking) |
 | `↑` / `↓` | Move highlight through results |
 | `Enter` | Select folder (scaffold or open existing workspace) |
-| `t` | Switch to tree-browse mode |
+| `Ctrl+T` | Switch to tree-browse mode |
 | `Ctrl+F` | Fullscreen path display |
 | `Esc` | Close the find overlay |
 
-### Tree browser (triggered by `t` inside find overlay)
+### Tree browser (triggered by `Ctrl+T` inside find overlay)
 
 | Key | Action |
 |---|---|
