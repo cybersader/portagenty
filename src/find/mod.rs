@@ -395,7 +395,7 @@ fn rank_and_truncate(items: Vec<Candidate>, query: &str, limit: usize) -> Vec<Ca
 }
 
 /// Expand a leading `~/` to `$HOME`. No-op for paths without it.
-fn expand_tilde(s: &str) -> PathBuf {
+pub fn expand_tilde(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(rest);
@@ -407,7 +407,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 /// Walk parent directories until we find one that exists. Used for
 /// the absolute-path-prefix mode so we can search inside the
 /// nearest real ancestor of a path the user is still typing.
-fn first_existing_ancestor(p: &Path) -> Option<PathBuf> {
+pub fn first_existing_ancestor(p: &Path) -> Option<PathBuf> {
     let mut cur: Option<&Path> = Some(p);
     while let Some(c) = cur {
         if c.is_dir() {

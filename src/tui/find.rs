@@ -813,7 +813,25 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         }
         (KeyCode::Char(ch), _) => {
             state.input.push(ch);
-            state.rerank();
+            // Absolute-path prefix mode: when the input looks like an
+            // absolute path, re-root the walker to the nearest existing
+            // ancestor so the user can browse arbitrary mount points
+            // (e.g. "/mnt/d"). Restart only when the root actually
+            // changes to avoid re-walking on every keystroke.
+            let trimmed = state.input.trim();
+            if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+                let abs = crate::find::expand_tilde(trimmed);
+                let new_root = crate::find::first_existing_ancestor(&abs);
+                let current_root = state.opts.roots.first().cloned();
+                if new_root != current_root && new_root.is_some() {
+                    state.opts.roots = vec![new_root.unwrap()];
+                    state.restart_walk();
+                } else {
+                    state.rerank();
+                }
+            } else {
+                state.rerank();
+            }
             SearchOutcome::Continue
         }
         _ => SearchOutcome::Continue,
@@ -974,7 +992,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                     Entry::new("Esc", "back"),
                     Entry::new("↑/↓", "nav"),
                     Entry::new("Enter", "open"),
-                    Entry::new("^T", "tree"),
+                    Entry::new("Ctrl+T", "tree"),
                 ],
             );
             // Secondary line: less-critical keys.
