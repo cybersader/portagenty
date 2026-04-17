@@ -650,10 +650,11 @@ impl App {
                 self.open_edit_overlay();
                 Action::None
             }
-            (KeyCode::Char('q'), _) => {
-                self.should_quit = true;
-                Action::Quit
-            }
+            // `q` in the session list closes this view and goes back
+            // to the workspace picker (home screen). `Ctrl+Q` matches
+            // for symmetry. `Ctrl+C` still hard-quits the app for the
+            // "I really want out" case.
+            (KeyCode::Char('q'), _) => Action::Back,
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
                 Action::Quit
@@ -830,9 +831,8 @@ impl App {
                 frame,
                 chunks[3],
                 &[
-                    Entry::new("q", "quit"),
+                    Entry::new("Esc/q", "back"),
                     Entry::new("?", "help"),
-                    Entry::new("Esc", "back"),
                     Entry::new("Enter/l", "launch"),
                     Entry::new("j/k", "nav"),
                     Entry::new("g/G", "top/btm"),
@@ -1346,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_footer_with_quit_hint() {
+    fn renders_footer_with_back_hint() {
         let ws = sample_workspace("X", 0);
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         // Height needs to be big enough for title + col_header + list + 2 footer lines.
@@ -1361,7 +1361,9 @@ mod tests {
             .map(|x| buffer[(x, 5)].symbol().chars().next().unwrap_or(' '))
             .collect();
         let both = format!("{row4} {row5}");
-        assert!(both.contains("quit"), "got: {both:?}");
+        // Footer used to say "quit"; after the q-goes-back change it
+        // says "back" (Esc/q back to picker). Ctrl+C still hard-quits.
+        assert!(both.contains("back"), "got: {both:?}");
     }
 
     #[test]
@@ -1551,17 +1553,18 @@ mod tests {
     }
 
     #[test]
-    fn quit_keys_return_quit_action() {
-        // q and Ctrl+C still quit; Esc is now Back (handled by outer
-        // driver — see tui::run). Tested separately below.
-        for key in [
-            (KeyCode::Char('q'), KeyModifiers::NONE),
-            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+    fn quit_keys_return_expected_actions() {
+        // q / Ctrl+Q → Back (close session view, return to picker).
+        // Ctrl+C → hard Quit (exit pa entirely).
+        for (key, expected) in [
+            ((KeyCode::Char('q'), KeyModifiers::NONE), Action::Back),
+            ((KeyCode::Char('q'), KeyModifiers::CONTROL), Action::Back),
+            ((KeyCode::Char('c'), KeyModifiers::CONTROL), Action::Quit),
         ] {
             let ws = sample_workspace("x", 2);
             let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
             let action = app.handle_key(key.0, key.1);
-            assert_eq!(action, Action::Quit, "key {key:?} should return Quit");
+            assert_eq!(action, expected, "key {key:?} should return {expected:?}");
         }
     }
 
@@ -1619,13 +1622,15 @@ mod tests {
             header.contains("mobile"),
             "header missing at {w}x{h}: {header:?}"
         );
-        // Footer spans the last 2 rows. "quit" is on one of them.
+        // Footer spans the last 2 rows. `back` (Esc/q) is on one of
+        // them — `quit` got renamed to `back` when q became the
+        // return-to-picker key.
         let footer1 = line_at(&terminal, h - 2);
         let footer2 = line_at(&terminal, h - 1);
         let both = format!("{footer1} {footer2}");
         assert!(
-            both.to_lowercase().contains("quit"),
-            "footer missing quit at {w}x{h}: {both:?}"
+            both.to_lowercase().contains("back"),
+            "footer missing back at {w}x{h}: {both:?}"
         );
         // Selected row (index 0 by default) has the highlight marker
         // somewhere in the body region (rows 1..h-1).

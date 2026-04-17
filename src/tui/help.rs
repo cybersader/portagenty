@@ -119,8 +119,8 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("Ctrl+D / Ctrl+U", "half-page down / up"));
             lines.push(row("PgDn / PgUp", "10-row jumps"));
             lines.push(row("l / → / Enter", "attach (or create-and-attach)"));
-            lines.push(row("Esc", "back to picker (home screen)"));
-            lines.push(row("q / Ctrl+C", "exit pa"));
+            lines.push(row("Esc / q / Ctrl+Q", "back to picker (home screen)"));
+            lines.push(row("Ctrl+C", "exit pa"));
             lines.push(row("?", "toggle this help"));
             lines.push(Line::raw(""));
             lines.push(heading(" Row markers"));
