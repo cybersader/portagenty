@@ -546,6 +546,14 @@ impl SearchState {
     /// on DrvFs was the old freeze; 5ms × 2500 paths = 12s blocked).
     /// Dedup uses the raw path string instead.
     fn rerank(&mut self) {
+        // Stash the currently highlighted path so we can restore the
+        // selection after rebuilding the candidate list. Without this,
+        // every background-walker batch resets the cursor to index 0.
+        let prev_selected_path = self
+            .candidates
+            .get(self.selected)
+            .map(|c| c.path.clone());
+
         let trimmed = self.input.trim();
         if trimmed.is_empty() {
             // Empty query: only show recency + zoxide candidates (the
@@ -594,12 +602,22 @@ impl SearchState {
             scored.truncate(self.opts.limit);
             self.candidates = scored;
         }
-        self.selected = 0;
-        self.list_state.select(if self.candidates.is_empty() {
-            None
+        // Restore selection: find the old path in the new list.
+        // If gone, clamp to the same index or the end of the list.
+        if self.candidates.is_empty() {
+            self.selected = 0;
+            self.list_state.select(None);
+        } else if let Some(ref prev) = prev_selected_path {
+            if let Some(idx) = self.candidates.iter().position(|c| c.path == *prev) {
+                self.selected = idx;
+            } else {
+                self.selected = self.selected.min(self.candidates.len() - 1);
+            }
+            self.list_state.select(Some(self.selected));
         } else {
-            Some(0)
-        });
+            self.selected = 0;
+            self.list_state.select(Some(0));
+        }
     }
 
     /// Trigger a fresh background walk (used by > / < / Ctrl+R).
