@@ -27,6 +27,9 @@ pub enum PickerOutcome {
     LiveBrowse,
     /// User bailed (q / Esc). Caller should exit cleanly.
     Quit,
+    /// User pressed `o` in the find overlay — exit pa and spawn a
+    /// plain shell at the given directory. No mpx, no session.
+    OpenShellAt(PathBuf),
 }
 
 /// How long status messages stick around before auto-clearing.
@@ -84,6 +87,9 @@ struct InfoModal {
     title: String,
     /// Pre-rendered lines so callers can decide colors.
     lines: Vec<Line<'static>>,
+    /// If set, the modal is tied to this workspace file. Used for
+    /// in-modal actions like `o` → open shell at the workspace's dir.
+    workspace_path: Option<PathBuf>,
 }
 
 /// Run the picker inside an already-initialized ratatui terminal.
@@ -142,9 +148,17 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             help_open = false;
             continue;
         }
-        // Info modal: any key closes it. No passthrough — accidental
-        // Enter shouldn't open the highlighted workspace.
-        if info.is_some() {
+        // Info modal: most keys dismiss. `o` (if the modal is tied
+        // to a workspace path) opens a plain shell at that dir —
+        // natural next step after "reveal shows me where it is."
+        if let Some(m) = info.as_ref() {
+            if matches!(key.code, KeyCode::Char('o')) {
+                if let Some(ws_path) = m.workspace_path.as_ref() {
+                    if let Some(dir) = ws_path.parent().map(|d| d.to_path_buf()) {
+                        return Ok(PickerOutcome::OpenShellAt(dir));
+                    }
+                }
+            }
             info = None;
             continue;
         }
@@ -178,6 +192,10 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                         s.mode = crate::tui::find::FindMode::Search;
                         s.set_root(dir);
                     }
+                }
+                SearchOutcome::OpenShellAt(dir) => {
+                    // Tree mode `o` → exit picker, caller spawns shell.
+                    return Ok(PickerOutcome::OpenShellAt(dir));
                 }
             }
             continue;
@@ -440,13 +458,28 @@ fn build_reveal_modal(path: &std::path::Path) -> InfoModal {
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            "Any key closes (Esc / q / Enter).",
+            "o ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "open a plain shell here (exits pa).",
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "Any other key closes (Esc / q / Enter).",
             Style::default().add_modifier(Modifier::DIM),
         ),
     ]));
     InfoModal {
         title: "Workspace path".into(),
         lines,
+        workspace_path: Some(path.to_path_buf()),
     }
 }
 

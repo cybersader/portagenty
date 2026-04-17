@@ -107,7 +107,7 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("R", "rename workspace (edits TOML name)"));
             lines.push(row("d", "unregister from global index (file stays)"));
             lines.push(row("D", "delete workspace file (destructive)"));
-            lines.push(row("r", "reveal: show file path in modal"));
+            lines.push(row("r", "reveal: show file path + option to open a shell there"));
         }
         HelpContext::SessionList => {
             lines.push(heading(" Session list — navigation"));
@@ -152,6 +152,7 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(heading(" Row + workspace actions"));
             lines.push(Line::raw(""));
             lines.push(row("a", "add a new session to the workspace"));
+            lines.push(row("o", "open a plain shell at the workspace dir (exits pa)"));
             lines.push(row("e", "edit session field (rename/cwd/cmd/kind/env)"));
             lines.push(row("d", "delete the session (edits TOML)"));
             lines.push(row("x", "kill the live mpx session"));

@@ -408,6 +408,19 @@ pub fn handle_tree_key(
             }
             SearchOutcome::Continue
         }
+        // `o` → open in terminal: exit pa and drop into a shell at
+        // the highlighted folder (or tree root if nothing is selected
+        // or highlighted is a file).
+        (KeyCode::Char('o'), _) => {
+            let dir = state.selected_row().map(|r| {
+                if r.path.is_dir() {
+                    r.path.clone()
+                } else {
+                    r.path.parent().map(|p| p.to_path_buf()).unwrap_or(r.path.clone())
+                }
+            }).unwrap_or_else(|| state.root.clone());
+            SearchOutcome::OpenShellAt(dir)
+        }
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::Cancel,
         // Ctrl+T in tree mode → toggle back to search mode (same as
         // Esc, but symmetrical with Ctrl+T entering tree mode from
@@ -663,6 +676,10 @@ pub enum SearchOutcome {
     /// User pressed `/` in tree mode — switch back to search mode
     /// with the given path as the new search root.
     SearchFromHere(PathBuf),
+    /// User pressed `o` — exit pa entirely and drop into a shell at
+    /// the given directory. No session scaffolded, no mpx involved.
+    /// Like "Open in Terminal" from a file manager.
+    OpenShellAt(PathBuf),
 }
 
 /// Mutable state for the search overlay. Lives inside
@@ -1495,6 +1512,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                     ),
                     Span::styled("new  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
+                        "o ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("shell  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
                         "q ",
                         Style::default()
                             .fg(Color::Cyan)
@@ -2205,6 +2229,40 @@ mod tree_tests {
         // Input should have "test".
         if let super::FindMode::Tree(ref tree) = state.mode {
             assert_eq!(tree.creating_folder.as_deref(), Some("test"));
+        }
+    }
+
+    #[test]
+    fn tree_o_returns_open_shell_at_highlighted_dir() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        tmp.child("inner").create_dir_all().unwrap();
+        let mut tree = TreeBrowseState::new(tmp.path().to_path_buf());
+        let inner = tmp.path().join("inner");
+        tree.selected = tree
+            .rows
+            .iter()
+            .position(|r| r.path == inner)
+            .expect("inner row");
+        tree.list_state.select(Some(tree.selected));
+
+        let out = handle_tree_key(&mut tree, KeyCode::Char('o'), KeyModifiers::NONE);
+        match out {
+            SearchOutcome::OpenShellAt(dir) => assert_eq!(dir, inner),
+            other => panic!("expected OpenShellAt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tree_o_falls_back_to_root_when_no_selection() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let mut tree = TreeBrowseState::new(tmp.path().to_path_buf());
+        tree.rows.clear();
+        tree.list_state.select(None);
+
+        let out = handle_tree_key(&mut tree, KeyCode::Char('o'), KeyModifiers::NONE);
+        match out {
+            SearchOutcome::OpenShellAt(dir) => assert_eq!(dir, tmp.path()),
+            other => panic!("expected OpenShellAt, got {other:?}"),
         }
     }
 

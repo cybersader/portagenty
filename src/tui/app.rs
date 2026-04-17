@@ -37,6 +37,10 @@ pub enum AppOutcome {
     /// - otherwise (walk-up path) treat the same as Quit.
     Back,
     Launch(LaunchKind),
+    /// User pressed `o` — exit pa entirely and spawn a plain shell
+    /// at the given directory. No mpx, no session, no state. Like
+    /// "Open in Terminal" from a file manager.
+    OpenShellAt(std::path::PathBuf),
 }
 
 /// Internal action dispatch. Returned from [`App::handle_key`] so the
@@ -50,6 +54,9 @@ pub enum Action {
     /// (or quit if the picker wasn't in the chain).
     Back,
     LaunchSelected,
+    /// `o` pressed — ask the outer driver to exit pa and spawn a
+    /// plain shell at the workspace's directory.
+    OpenShellAtWorkspaceDir,
 }
 
 /// Top-level TUI state. Holds everything the event loop needs; no
@@ -275,6 +282,23 @@ impl App {
                 };
                 Some(AppOutcome::Launch(kind))
             }),
+            Action::OpenShellAtWorkspaceDir => {
+                // The workspace's "natural cwd" is the directory that
+                // contains its *.portagenty.toml file. Fall back to
+                // the first session's cwd or HOME if unavailable.
+                let dir = self
+                    .workspace
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .or_else(|| self.workspace.sessions.first().map(|s| s.cwd.clone()))
+                    .unwrap_or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    });
+                Some(AppOutcome::OpenShellAt(dir))
+            }
         }
     }
 
@@ -715,6 +739,18 @@ impl App {
                         s.set_root(dir);
                     }
                 }
+                SearchOutcome::OpenShellAt(_) => {
+                    // Shell-out from the cwd-browse overlay is
+                    // ambiguous — we're mid-edit of a session field.
+                    // Bounce back to search mode and show a hint.
+                    if let Some((_, s)) = self.browsing_cwd.as_mut() {
+                        s.mode = crate::tui::find::FindMode::Search;
+                    }
+                    self.set_status(
+                        "o: use this from the session list (closes pa); \
+                         here it cancels the cwd edit instead",
+                    );
+                }
                 SearchOutcome::OpenHelp => {
                     self.help_open = true;
                 }
@@ -837,6 +873,9 @@ impl App {
                 });
                 Action::None
             }
+            // `o` → open the workspace's dir in a plain terminal,
+            // outside of pa. No mpx, no session — just `cd <dir> && $SHELL`.
+            (KeyCode::Char('o'), _) => Action::OpenShellAtWorkspaceDir,
             // `q` in the session list closes this view and goes back
             // to the workspace picker (home screen). `Ctrl+Q` matches
             // for symmetry. `Ctrl+C` still hard-quits the app for the
@@ -1030,6 +1069,13 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("add  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "o ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("shell  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
                         "e ",
                         Style::default()
@@ -2355,6 +2401,34 @@ mod tests {
             app.rows.iter().any(|r| r.display_name == "newsess"),
             "newsess not in rows after add"
         );
+    }
+
+    #[test]
+    fn o_key_returns_open_shell_action() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let action = app.handle_key(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(action, Action::OpenShellAtWorkspaceDir);
+    }
+
+    #[test]
+    fn open_shell_outcome_uses_workspace_file_dir() {
+        let ws = Workspace {
+            name: "x".into(),
+            id: None,
+            file_path: Some(PathBuf::from("/home/u/code/proj/x.portagenty.toml")),
+            multiplexer: MpxEnum::Tmux,
+            projects: vec![],
+            sessions: vec![],
+        };
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let outcome = app.reduce_action(Action::OpenShellAtWorkspaceDir);
+        match outcome {
+            Some(AppOutcome::OpenShellAt(dir)) => {
+                assert_eq!(dir, PathBuf::from("/home/u/code/proj"));
+            }
+            other => panic!("expected OpenShellAt outcome, got {other:?}"),
+        }
     }
 
     #[test]

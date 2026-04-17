@@ -13,7 +13,7 @@ pub mod view;
 pub use app::{Action, App, AppOutcome, LaunchKind};
 pub use view::{build_rows, SessionRow, SessionState};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::{load, LoadOptions};
 use crate::mux::TmuxAdapter;
@@ -113,8 +113,12 @@ pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
         let ws = match ws {
             Some(w) => w,
             None => match show_picker(&mut terminal) {
-                Ok(Some(w)) => w,
-                Ok(None) => {
+                Ok(PickResult::Workspace(w)) => w,
+                Ok(PickResult::OpenShellAt(dir)) => {
+                    ratatui::restore();
+                    return spawn_shell_at(&dir);
+                }
+                Ok(PickResult::Quit) => {
                     ratatui::restore();
                     return Ok(());
                 }
@@ -135,6 +139,10 @@ pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
                 ratatui::restore();
                 return finalize_launch(r);
             }
+            Ok(SessionRunOutcome::OpenShell(dir)) => {
+                ratatui::restore();
+                return spawn_shell_at(&dir);
+            }
             Err(e) => {
                 ratatui::restore();
                 return Err(e);
@@ -143,11 +151,47 @@ pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
     }
 }
 
-/// Run the workspace picker and return the selected workspace, or
-/// `None` if the user quit. `Err` only for unexpected IO errors.
+/// Spawn the user's login shell at `dir` and wait for it to exit.
+/// No mpx, no session — just `cd <dir> && exec $SHELL`. Used by the
+/// `o` key in the session TUI and tree mode for "Open in Terminal"
+/// behavior. Returns the shell's exit status as a Result; we
+/// propagate failure up but exit 0 on a clean shell exit.
+fn spawn_shell_at(dir: &std::path::Path) -> Result<()> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    eprintln!();
+    eprintln!("  pa → shell at {}", dir.display());
+    eprintln!("        exit the shell to return to your original terminal.");
+    eprintln!();
+    let status = std::process::Command::new(&shell)
+        .current_dir(dir)
+        .status()
+        .with_context(|| format!("spawning shell {shell:?} at {}", dir.display()))?;
+    if !status.success() {
+        // Don't treat a non-zero shell exit as a pa error — the user
+        // might have intentionally exited with a status code.
+        tracing::debug!(
+            target = "portagenty::tui",
+            status = ?status,
+            "shell exited non-zero"
+        );
+    }
+    Ok(())
+}
+
+/// What the picker returned: a workspace to enter, a shell-out
+/// request, or a quit. `None` (quit) is returned as `Quit` so
+/// the call site can distinguish it from OpenShell cleanly.
+enum PickResult {
+    Workspace(crate::domain::Workspace),
+    OpenShellAt(std::path::PathBuf),
+    Quit,
+}
+
+/// Run the workspace picker and return the user's choice.
+/// `Err` only for unexpected IO errors.
 fn show_picker(
     terminal: &mut ratatui::DefaultTerminal,
-) -> Result<Option<crate::domain::Workspace>> {
+) -> Result<PickResult> {
     let mut registered = crate::config::list_registered_workspaces().unwrap_or_default();
     // Recency sort: workspaces with a recorded launch come first,
     // most-recent at the top; workspaces never launched fall to the
@@ -164,15 +208,18 @@ fn show_picker(
         }
     });
     match picker::run(terminal, &registered)? {
-        picker::PickerOutcome::Quit => Ok(None),
-        picker::PickerOutcome::LiveBrowse => Ok(Some(synthetic_browse_workspace()?)),
+        picker::PickerOutcome::Quit => Ok(PickResult::Quit),
+        picker::PickerOutcome::LiveBrowse => {
+            Ok(PickResult::Workspace(synthetic_browse_workspace()?))
+        }
         picker::PickerOutcome::Workspace(path) => {
             let opts = LoadOptions {
                 workspace_path: Some(path),
                 ..Default::default()
             };
-            Ok(Some(load(&opts)?))
+            Ok(PickResult::Workspace(load(&opts)?))
         }
+        picker::PickerOutcome::OpenShellAt(dir) => Ok(PickResult::OpenShellAt(dir)),
     }
 }
 
@@ -184,6 +231,9 @@ enum SessionRunOutcome {
     Quit,
     /// User picked a session; deferred launch result for the caller.
     Launched(Result<()>),
+    /// User pressed `o` — spawn a plain shell at this directory and
+    /// exit pa when the shell exits.
+    OpenShell(std::path::PathBuf),
 }
 
 /// Runs the session-list TUI against an already-initialized terminal.
@@ -245,6 +295,7 @@ fn run_session_tui(
             print_launch_banner(mpx_kind, &mpx_name);
             SessionRunOutcome::Launched(mux.attach(&mpx_name, mode))
         }
+        AppOutcome::OpenShellAt(dir) => SessionRunOutcome::OpenShell(dir),
     })
 }
 
