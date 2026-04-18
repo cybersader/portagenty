@@ -502,11 +502,15 @@ pub fn render_tree(frame: &mut Frame<'_>, area: Rect, state: &mut TreeBrowseStat
         .iter()
         .map(|row| {
             let indent = "  ".repeat(row.depth);
+            // Simple ASCII-safe expand marker instead of emoji folder
+            // icons. User folders with emoji prefixes (like
+            // "📁 01 - Projects") were colliding with the render's
+            // own "📁 " prefix, doubling the icon visually.
             let icon = if row.is_dir {
                 if row.is_expanded {
-                    "📂 "
+                    "▾ "
                 } else {
-                    "📁 "
+                    "▸ "
                 }
             } else {
                 "  "
