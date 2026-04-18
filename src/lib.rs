@@ -12,6 +12,7 @@ pub mod export;
 pub mod find;
 pub mod mux;
 pub mod onboarding;
+pub mod protocol;
 pub mod scaffold;
 pub mod snippets;
 pub mod state;
@@ -75,5 +76,14 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             &unset_env,
             workspace.as_ref(),
         ),
+        Some(Command::Open { url }) => cli::open_url(&url),
+        Some(Command::Protocol(cmd)) => match cmd {
+            cli::ProtocolCommand::Terminals => cli::protocol_terminals(),
+            cli::ProtocolCommand::Show { terminal } => cli::protocol_show(terminal.as_deref()),
+            cli::ProtocolCommand::Install { terminal } => {
+                cli::protocol_install(terminal.as_deref())
+            }
+            cli::ProtocolCommand::Uninstall => cli::protocol_uninstall(),
+        },
     }
 }

@@ -219,6 +219,46 @@ pub enum Command {
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
     },
+    /// Open a `pa://...` URL. This is the target of the OS-level URL
+    /// scheme handler (see `pa protocol`). The URL dispatches to the
+    /// matching pa action — `pa://open/<path>` opens a workspace TUI,
+    /// `pa://shell/<path>` drops to a plain shell, etc.
+    Open {
+        /// The full `pa://...` URL, as delivered by the OS handler.
+        url: String,
+    },
+    /// Manage the OS-level `pa://` URL scheme registration.
+    #[command(subcommand)]
+    Protocol(ProtocolCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProtocolCommand {
+    /// List terminal emulators detected on this machine. The first
+    /// entry is what `install` / `show` will pick if --terminal is
+    /// not given.
+    Terminals,
+    /// Print the OS-appropriate registration snippet (a .desktop
+    /// block, Windows .reg, or guidance) without writing anything.
+    /// Copy-paste to apply manually if you'd rather.
+    Show {
+        /// Override the auto-detected terminal emulator. Matches
+        /// case-insensitively against detected terminal names; also
+        /// accepts a substring (e.g. "alac" → Alacritty).
+        #[arg(long = "terminal")]
+        terminal: Option<String>,
+    },
+    /// Install the `pa://` URL handler. Writes:
+    ///   Linux → ~/.local/share/applications/portagenty.desktop
+    ///   Windows → HKCU\Software\Classes\pa (user-scope, no admin)
+    ///   macOS → errors with guidance (not automated yet)
+    Install {
+        /// Override the auto-detected terminal emulator.
+        #[arg(long = "terminal")]
+        terminal: Option<String>,
+    },
+    /// Remove a previously-installed registration.
+    Uninstall,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -1055,5 +1095,149 @@ pub fn list(workspace: Option<&PathBuf>) -> Result<()> {
             s.command
         )?;
     }
+    Ok(())
+}
+
+// ─── pa open <url> ──────────────────────────────────────────────────────
+
+/// Dispatch a `pa://...` URL to the matching pa action. Entry point
+/// for the OS-level URL scheme handler installed by `pa protocol
+/// install`. Printing a usable error on bad URLs beats silently
+/// opening the picker — URL clicks are asynchronous, the user might
+/// not see the terminal window that was spawned.
+pub fn open_url(url: &str) -> Result<()> {
+    use crate::protocol::ProtocolAction;
+    match crate::protocol::parse(url)? {
+        ProtocolAction::Open(path) => crate::tui::run(Some(&path)),
+        ProtocolAction::Shell(path) => {
+            // Re-use the same shell-out path the TUI uses. Print a
+            // banner first so the user knows why pa didn't launch.
+            eprintln!();
+            eprintln!("  pa → shell at {}", path.display());
+            eprintln!("        (from pa://shell URL click)");
+            eprintln!();
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+            let _ = std::process::Command::new(&shell)
+                .current_dir(&path)
+                .status()
+                .with_context(|| format!("spawning shell at {}", path.display()))?;
+            Ok(())
+        }
+        ProtocolAction::WorkspaceById(id) => {
+            let path = resolve_workspace_by_id(&id)?;
+            crate::tui::run(Some(&path))
+        }
+        ProtocolAction::LaunchSession {
+            workspace_id,
+            session,
+        } => {
+            let path = resolve_workspace_by_id(&workspace_id)?;
+            launch(&session, Some(&path), false, false, false)
+        }
+    }
+}
+
+/// Scan the global workspace registry for a TOML with `id =
+/// "<uuid>"` and return its file path. Errors if no match.
+fn resolve_workspace_by_id(id: &str) -> Result<PathBuf> {
+    for ws_path in crate::config::list_registered_workspaces().unwrap_or_default() {
+        let raw = match std::fs::read_to_string(&ws_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let doc: toml_edit::DocumentMut = match raw.parse() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if let Some(got) = doc.get("id").and_then(|v| v.as_str()) {
+            if got == id {
+                return Ok(ws_path);
+            }
+        }
+    }
+    Err(anyhow!(
+        "no registered workspace has id {id:?}. Make sure the workspace TOML has an `id = \"...\"` field and is in the global registry."
+    ))
+}
+
+// ─── pa protocol ... ────────────────────────────────────────────────────
+
+/// `pa protocol terminals` — list detected emulators for the current OS.
+pub fn protocol_terminals() -> Result<()> {
+    let terms = crate::protocol::register::detect_terminals();
+    if terms.is_empty() {
+        println!("No terminal emulators detected on {}.", std::env::consts::OS);
+        println!(
+            "Pass --terminal <name> on install/show to pick any binary, or install\n\
+             one of: wt.exe, alacritty, kitty, wezterm, gnome-terminal, konsole, ..."
+        );
+        return Ok(());
+    }
+    println!("Detected terminals (first entry is the install default):");
+    for t in &terms {
+        println!("  {t}");
+    }
+    Ok(())
+}
+
+fn pick_terminal(
+    override_name: Option<&str>,
+) -> Result<crate::protocol::register::Terminal> {
+    let terms = crate::protocol::register::detect_terminals();
+    if let Some(name) = override_name {
+        crate::protocol::register::match_by_name(&terms, name).ok_or_else(|| {
+            let avail: Vec<String> = terms.iter().map(|t| t.name.clone()).collect();
+            anyhow!(
+                "no detected terminal matches {name:?}. Available: {}",
+                if avail.is_empty() {
+                    "(none — run `pa protocol terminals`)".into()
+                } else {
+                    avail.join(", ")
+                }
+            )
+        })
+    } else {
+        terms
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no terminal emulator detected — pass --terminal <name>"))
+    }
+}
+
+fn own_binary_path() -> Result<PathBuf> {
+    std::env::current_exe().context("reading current executable path")
+}
+
+/// `pa protocol show [--terminal ...]` — print registration snippet.
+pub fn protocol_show(terminal: Option<&str>) -> Result<()> {
+    let term = pick_terminal(terminal)?;
+    let bin = own_binary_path()?;
+    let snippet = crate::protocol::register::show_snippet(&term, &bin)?;
+    eprintln!("# Using terminal: {term}");
+    eprintln!("# pa binary: {}", bin.display());
+    eprintln!();
+    println!("{snippet}");
+    Ok(())
+}
+
+/// `pa protocol install [--terminal ...]` — write the registration.
+pub fn protocol_install(terminal: Option<&str>) -> Result<()> {
+    let term = pick_terminal(terminal)?;
+    let bin = own_binary_path()?;
+    let where_to = crate::protocol::register::install(&term, &bin)?;
+    println!(
+        "installed pa:// handler via {}\n  → {}",
+        term, where_to
+    );
+    println!(
+        "\nTry: click a pa://open/<url-encoded-absolute-path> link, or run\n  xdg-open 'pa://open/tmp' (Linux)  /  start pa://open/tmp (Windows)"
+    );
+    Ok(())
+}
+
+/// `pa protocol uninstall` — reverse of install.
+pub fn protocol_uninstall() -> Result<()> {
+    let where_from = crate::protocol::register::uninstall()?;
+    println!("uninstalled pa:// handler\n  → {}", where_from);
     Ok(())
 }
