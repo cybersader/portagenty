@@ -74,7 +74,7 @@ pub struct TreeRow {
 }
 
 impl TreeBrowseState {
-    fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf) -> Self {
         let mut s = Self {
             expanded: std::collections::HashSet::new(),
             children_cache: std::collections::HashMap::new(),
@@ -798,6 +798,17 @@ impl Default for SearchState {
 }
 
 impl SearchState {
+    /// Construct a SearchState opened directly in tree-browse mode
+    /// at `root`. Used by the session list's `t` key — no walker
+    /// races, just an immediate tree view rooted where the caller
+    /// asked. Callers do not have to touch the private `opts` field.
+    pub fn tree_at(root: PathBuf) -> Self {
+        let mut s = Self::default();
+        s.opts.roots = vec![root.clone()];
+        s.mode = FindMode::Tree(Box::new(TreeBrowseState::new(root)));
+        s
+    }
+
     /// Re-root the search to a new directory. Used by tree mode's
     /// "search from here" (`/`) action. Clears the input and restarts
     /// the walker so results are scoped to the new root.

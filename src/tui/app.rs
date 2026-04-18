@@ -55,8 +55,10 @@ pub enum Action {
     Back,
     LaunchSelected,
     /// `o` pressed — ask the outer driver to exit pa and spawn a
-    /// plain shell at the workspace's directory.
-    OpenShellAtWorkspaceDir,
+    /// plain shell at the given directory. From the session list's
+    /// bare `o` this is the workspace's dir; from the file-tree
+    /// browser's `o` it's the highlighted folder.
+    OpenShellAt(std::path::PathBuf),
 }
 
 /// Top-level TUI state. Holds everything the event loop needs; no
@@ -92,6 +94,11 @@ pub struct App {
     /// When Some, the find overlay is open for cwd selection.
     /// Tuple: (session_name being edited, search state).
     browsing_cwd: Option<(String, crate::tui::find::SearchState)>,
+    /// When Some, the find overlay is open for general file-tree
+    /// browsing (not tied to a session edit). Opened via `t` on the
+    /// session list. OpenShellAt is the primary action from this
+    /// overlay — drop to shell at the highlighted folder.
+    browsing: Option<crate::tui::find::SearchState>,
     /// When Some, the "add new session" modal is showing. Two-stage:
     /// first name, then command. Enter advances or commits; Esc
     /// cancels.
@@ -174,6 +181,7 @@ impl App {
             status_set_at: None,
             editing: None,
             browsing_cwd: None,
+            browsing: None,
             adding_session: None,
         }
     }
@@ -282,24 +290,33 @@ impl App {
                 };
                 Some(AppOutcome::Launch(kind))
             }),
-            Action::OpenShellAtWorkspaceDir => {
-                // The workspace's "natural cwd" is the directory that
-                // contains its *.portagenty.toml file. Fall back to
-                // the first session's cwd or HOME if unavailable.
-                let dir = self
-                    .workspace
-                    .file_path
-                    .as_ref()
-                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                    .or_else(|| self.workspace.sessions.first().map(|s| s.cwd.clone()))
-                    .unwrap_or_else(|| {
-                        std::env::var_os("HOME")
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    });
-                Some(AppOutcome::OpenShellAt(dir))
-            }
+            Action::OpenShellAt(dir) => Some(AppOutcome::OpenShellAt(dir)),
         }
+    }
+
+    /// The workspace's "natural cwd" — the directory containing its
+    /// *.portagenty.toml file, with fallbacks to the first session's
+    /// cwd, then HOME, then ".". Used by `o` and `t` to choose a
+    /// sensible starting point.
+    fn workspace_dir(&self) -> std::path::PathBuf {
+        self.workspace
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .or_else(|| self.workspace.sessions.first().map(|s| s.cwd.clone()))
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            })
+    }
+
+    /// Open the file-tree browser rooted at the workspace's dir.
+    /// Triggered by `t` in the session list.
+    fn open_file_tree(&mut self) {
+        self.browsing = Some(crate::tui::find::SearchState::tree_at(
+            self.workspace_dir(),
+        ));
     }
 
     /// The currently-selected row, if any. Exposed so the outer entry
@@ -705,6 +722,51 @@ impl App {
             self.handle_add_session_key(code, mods);
             return Action::None;
         }
+        // General file-tree browsing overlay (session-list `t`).
+        // Not tied to editing a session field — primary action from
+        // here is `o` to drop to shell at the highlighted folder.
+        if self.browsing.is_some() {
+            let search = self.browsing.as_mut().unwrap();
+            search.poll_background();
+            search.tick_animation();
+            use crate::tui::find::SearchOutcome;
+            let result = crate::tui::find::handle_key(search, code, mods);
+            match result {
+                SearchOutcome::Continue => {}
+                SearchOutcome::Cancel => {
+                    self.browsing = None;
+                }
+                SearchOutcome::BackToSearch => {
+                    if let Some(s) = self.browsing.as_mut() {
+                        s.mode = crate::tui::find::FindMode::Search;
+                    }
+                }
+                SearchOutcome::SearchFromHere(dir) => {
+                    if let Some(s) = self.browsing.as_mut() {
+                        s.mode = crate::tui::find::FindMode::Search;
+                        s.set_root(dir);
+                    }
+                }
+                SearchOutcome::OpenHelp => {
+                    self.help_open = true;
+                }
+                SearchOutcome::OpenShellAt(dir) => {
+                    self.browsing = None;
+                    return Action::OpenShellAt(dir);
+                }
+                // ScaffoldAt / OpenExisting from inside the file-tree
+                // browser don't make sense (we're already in a
+                // workspace). Just close the overlay with a hint.
+                SearchOutcome::ScaffoldAt(_) | SearchOutcome::OpenExisting(_) => {
+                    self.browsing = None;
+                    self.set_status(
+                        "picking from the file tree here doesn't switch workspaces; \
+                         use Esc → picker if that's what you want",
+                    );
+                }
+            }
+            return Action::None;
+        }
         // CWD browse overlay: find overlay open for folder selection.
         if self.browsing_cwd.is_some() {
             let (ref session_name, ref mut search) = self.browsing_cwd.as_mut().unwrap();
@@ -875,7 +937,13 @@ impl App {
             }
             // `o` → open the workspace's dir in a plain terminal,
             // outside of pa. No mpx, no session — just `cd <dir> && $SHELL`.
-            (KeyCode::Char('o'), _) => Action::OpenShellAtWorkspaceDir,
+            (KeyCode::Char('o'), _) => Action::OpenShellAt(self.workspace_dir()),
+            // `t` → open the file tree rooted at the workspace's dir.
+            // Browse around, `o` inside to shell-out at any folder.
+            (KeyCode::Char('t'), _) => {
+                self.open_file_tree();
+                Action::None
+            }
             // `q` in the session list closes this view and goes back
             // to the workspace picker (home screen). `Ctrl+Q` matches
             // for symmetry. `Ctrl+C` still hard-quits the app for the
@@ -1070,6 +1138,13 @@ impl App {
                     ),
                     Span::styled("add  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
+                        "t ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("tree  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
                         "o ",
                         Style::default()
                             .fg(Color::Cyan)
@@ -1127,6 +1202,11 @@ impl App {
 
         // CWD browse overlay — same find overlay as the picker's `n`.
         if let Some((_, ref mut search)) = self.browsing_cwd {
+            crate::tui::find::render(frame, area, search);
+        }
+
+        // General file-tree browse overlay (session-list `t`).
+        if let Some(ref mut search) = self.browsing {
             crate::tui::find::render(frame, area, search);
         }
 
@@ -2404,15 +2484,7 @@ mod tests {
     }
 
     #[test]
-    fn o_key_returns_open_shell_action() {
-        let ws = sample_workspace("x", 2);
-        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
-        let action = app.handle_key(KeyCode::Char('o'), KeyModifiers::NONE);
-        assert_eq!(action, Action::OpenShellAtWorkspaceDir);
-    }
-
-    #[test]
-    fn open_shell_outcome_uses_workspace_file_dir() {
+    fn o_key_returns_open_shell_with_workspace_dir() {
         let ws = Workspace {
             name: "x".into(),
             id: None,
@@ -2422,13 +2494,70 @@ mod tests {
             sessions: vec![],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
-        let outcome = app.reduce_action(Action::OpenShellAtWorkspaceDir);
+        let action = app.handle_key(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(
+            action,
+            Action::OpenShellAt(PathBuf::from("/home/u/code/proj"))
+        );
+    }
+
+    #[test]
+    fn open_shell_action_reduces_to_app_outcome() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let outcome = app.reduce_action(Action::OpenShellAt(PathBuf::from("/tmp/here")));
         match outcome {
             Some(AppOutcome::OpenShellAt(dir)) => {
-                assert_eq!(dir, PathBuf::from("/home/u/code/proj"));
+                assert_eq!(dir, PathBuf::from("/tmp/here"));
             }
             other => panic!("expected OpenShellAt outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn t_key_opens_file_tree_browser() {
+        let ws = Workspace {
+            name: "x".into(),
+            id: None,
+            file_path: Some(PathBuf::from("/home/u/code/proj/x.portagenty.toml")),
+            multiplexer: MpxEnum::Tmux,
+            projects: vec![],
+            sessions: vec![],
+        };
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        assert!(app.browsing.is_none());
+        app.handle_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(app.browsing.is_some(), "t should open the file tree");
+        // Verify it's in tree mode and rooted at the workspace dir.
+        let search = app.browsing.as_ref().unwrap();
+        match &search.mode {
+            crate::tui::find::FindMode::Tree(tree) => {
+                assert_eq!(tree.root, PathBuf::from("/home/u/code/proj"));
+            }
+            _ => panic!("expected tree mode after pressing t"),
+        }
+    }
+
+    #[test]
+    fn t_then_esc_closes_file_tree() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let ws_path = tmp.path().join("x.portagenty.toml");
+        std::fs::write(&ws_path, "name = \"x\"\nmultiplexer = \"tmux\"\n").unwrap();
+        let ws = Workspace {
+            name: "x".into(),
+            id: None,
+            file_path: Some(ws_path),
+            multiplexer: MpxEnum::Tmux,
+            projects: vec![],
+            sessions: vec![],
+        };
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.handle_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(app.browsing.is_some());
+        // Esc in tree mode → BackToSearch (switch to search submode,
+        // not close). So one Esc won't close; Ctrl+C will.
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.browsing.is_none(), "Ctrl+C should cancel the browse");
     }
 
     #[test]

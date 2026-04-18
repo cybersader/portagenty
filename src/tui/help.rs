@@ -152,6 +152,7 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(heading(" Row + workspace actions"));
             lines.push(Line::raw(""));
             lines.push(row("a", "add a new session to the workspace"));
+            lines.push(row("t", "browse the workspace as a file tree"));
             lines.push(row("o", "open a plain shell at the workspace dir (exits pa)"));
             lines.push(row("e", "edit session field (rename/cwd/cmd/kind/env)"));
             lines.push(row("d", "delete the session (edits TOML)"));
