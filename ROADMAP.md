@@ -72,8 +72,16 @@ real projects:
 
 - **`pa claim` cross-device takeover.** Solves the "screen size
   stuck after attaching from a smaller device" issue inherent to
-  multi-client tmux sessions. tmux uses `-d` natively; zellij warns
-  when other clients appear attached (no equivalent CLI).
+  multi-client tmux sessions. tmux uses `-d` natively for real
+  takeover. Zellij does NOT support per-client disconnection
+  upstream (no `action disconnect-client`, no `kick-client`) — so
+  `pa claim` on zellij attaches as another shared client rather
+  than kicking the prior one. If you need hard takeover semantics,
+  the workspace should use tmux (press `m` on the row to switch).
+  The bundled `paclaim` shell function (via
+  `pa snippets install pa-aliases`) is the in-session equivalent:
+  tmux-only for real takeover; zellij prints the limitation + the
+  nuclear option (`paclaim --nuclear` kills the session).
 - **Full no-editor session lifecycle.** `pa init / add / rm / edit`
   with comment-preserving toml_edit writes. Makes phone-over-SSH
   authoring practical.

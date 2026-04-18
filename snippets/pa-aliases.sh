@@ -32,21 +32,37 @@ alias pad='pa add'
 # leaving and re-running `pa claim`.
 #
 # tmux: `detach-client -a` kicks all other clients but keeps you.
-# zellij: no equivalent built-in (upstream limitation). Best you can
-# do is detach + re-attach (`Ctrl+O d` then `zellij attach <name>`)
-# from this device — that runs pa's takeover path naturally.
+#       Fast, clean, works end-to-end.
+# zellij: NO EQUIVALENT. Zellij doesn't support per-client
+#         disconnection (upstream: no `action disconnect-client`,
+#         no `kick-client`, nothing). `pa claim` on zellij doesn't
+#         actually takeover either — it just attaches as another
+#         shared client. If you need real takeover semantics, the
+#         workspace should use tmux (press `m` in the pa session
+#         list to switch). paclaim prints this info + the nuclear
+#         option (`paclaim --nuclear` kills the session and recreates,
+#         losing running state in it).
 paclaim() {
     if [ -n "$TMUX" ]; then
         tmux detach-client -a
         echo "paclaim: detached other tmux clients; this terminal is now the only one attached."
-    elif [ -n "$ZELLIJ" ]; then
-        echo "paclaim: zellij has no 'detach others' command." >&2
-        echo "  Workaround: detach (Ctrl+O d), then 'zellij attach $ZELLIJ_SESSION_NAME'." >&2
-        echo "  That runs the pa takeover path naturally." >&2
-        return 1
-    else
-        echo "paclaim: not inside a tmux or zellij session." >&2
-        echo "  From outside a session, use 'pa claim <session>' to takeover-attach." >&2
+        return 0
+    fi
+    if [ -n "$ZELLIJ" ]; then
+        if [ "$1" = "--nuclear" ]; then
+            echo "paclaim --nuclear: killing zellij session $ZELLIJ_SESSION_NAME (disconnects all clients)."
+            zellij kill-session "$ZELLIJ_SESSION_NAME"
+            return $?
+        fi
+        echo "paclaim: zellij has no 'detach others' command (upstream limitation)." >&2
+        echo "  Other clients attached to this session will stay attached." >&2
+        echo "  Options:" >&2
+        echo "    - Accept it: zellij is built for shared clients." >&2
+        echo "    - Switch the workspace to tmux: exit, run pa, press 'm' on the row." >&2
+        echo "    - Nuclear: 'paclaim --nuclear' kills the session entirely (loses state)." >&2
         return 1
     fi
+    echo "paclaim: not inside a tmux or zellij session." >&2
+    echo "  From outside a session, use 'pa claim <session>' to takeover-attach." >&2
+    return 1
 }
