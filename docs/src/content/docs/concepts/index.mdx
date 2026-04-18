@@ -119,18 +119,44 @@ them alive across detaches. portagenty drives it via its CLI — it
 doesn't replace it. Each adapter (`TmuxAdapter`, `ZellijAdapter`) is
 a Rust implementation of the `Multiplexer` trait.
 
-## Attach mode (takeover / shared)
+## Attach mode (takeover / shared / fresh)
 
-Two shapes a `pa attach` can take:
+Three shapes a `pa attach` can take:
 
-- **Takeover** (default): detach any other clients on attach. Session
-  keeps running; the other device's *client* returns to its shell.
-  Fixes the "screen size stuck to smaller client" multi-client issue.
-- **Shared**: attach without disturbing other clients. Pass `--shared`
-  to `pa launch` or use `pa launch <name> --shared`.
+- **Takeover** (default on tmux): detach any other clients on attach.
+  Session keeps running; the other device's *client* returns to its
+  shell. Fixes the "screen size stuck to smaller client" multi-client
+  issue.
+- **Shared** (`--shared`): attach without disturbing other clients.
+  Pass `--shared` to `pa launch`.
+- **Fresh** (`--fresh`): kill any existing session with this name
+  before launching, then create anew. **Loses running state.** Main
+  use case: zellij takeover (see below).
 
 `pa claim` is a short verb for takeover-attach; it defaults the
-session name to the first one in the workspace.
+session name to the first one in the workspace and passes through
+`--fresh` / `--resume`.
+
+### The tmux / zellij takeover split
+
+The default takeover semantics work cleanly on tmux — the mpx
+natively supports `detach-client -a` (kick others). On zellij, it's
+a different story:
+
+| | Default | `--shared` | `--fresh` | From inside (`paclaim`) |
+|---|---|---|---|---|
+| **tmux** | real takeover, keeps state | explicit shared | overkill — wipes state | `detach-client -a` — instant |
+| **zellij** | de-facto shared (no kick) | same as default | **the only real takeover** | prints limitation + `--restart` to kill |
+
+Zellij doesn't expose per-client disconnection in any form (checked
+against 0.43.1 — no `action disconnect-client`, no equivalent). So
+"takeover" on zellij means "kill the session + recreate" — you lose
+running state but the other client drops because the session it was
+attached to is gone.
+
+If you need hard takeover without losing state, either use tmux for
+that workspace (press `m` on the row in the session list to switch)
+or accept shared clients (zellij is designed for them).
 
 ## Three-tier config merge
 

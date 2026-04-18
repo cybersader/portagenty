@@ -107,9 +107,10 @@ running; only the terminal attached to them changes.
     at `~/.cargo/bin/pa`.
   </Card>
   <Card title="Cross-device takeover" icon="seti:config">
-    SSH in from your phone, run `pa claim`, and the session instantly
-    reshapes to the new device. No more "stuck at my laptop's
-    terminal width" after device hops.
+    SSH in from your phone, run `pa claim`, and the session reshapes
+    to the new device. On tmux that's real takeover (other clients
+    get kicked); on zellij, add `--fresh` for the kill-and-recreate
+    path since zellij doesn't expose per-client disconnection.
   </Card>
   <Card title="Untracked session adoption" icon="approve-check">
     Tmux / zellij sessions you started manually show up in the TUI
@@ -235,13 +236,16 @@ re-attaches and reshapes the terminal to the new screen size.
     # On your phone — start a Claude Code session
     pa launch claude
 
-    # Later, on your laptop — take it over
-    pa claim claude
-    # Session reshapes to laptop's screen size instantly
+    # Later, on your laptop — take it over (tmux = real takeover;
+    # zellij add --fresh for the kill-and-recreate path)
+    pa claim claude                   # tmux: kicks phone's client
+    pa claim claude --fresh           # zellij: kill + recreate
 
-    # Even later, back on phone
+    # Already inside a tmux session? Kick other clients from here:
+    paclaim                           # needs the pa-aliases snippet
+
+    # Back on phone later — takeover again
     pa claim claude
-    # Back to phone-sized terminal, context intact
     ```
   </TabItem>
   <TabItem label="TUI workflow">
