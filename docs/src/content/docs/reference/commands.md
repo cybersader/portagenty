@@ -320,6 +320,14 @@ Bundled bash ergonomics shipped inside the `pa` binary. Idempotent:
 installing twice replaces the block in-place via a marker comment so
 your rc file never accumulates duplicates.
 
+The `pa-aliases` snippet includes a `paclaim` shell function for
+claiming a session **from inside** it (once pa has handed off to
+tmux/zellij, `pa claim` is refused due to nested-mpx guard). On
+tmux, `paclaim` runs `tmux detach-client -a` — kicks all other
+clients but keeps your current terminal attached. On zellij, there's
+no built-in equivalent; the function prints the detach + reattach
+workaround.
+
 ### `pa snippets list`
 
 Print the bundled snippet catalog with one-line descriptions.
