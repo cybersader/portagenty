@@ -84,6 +84,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 cli::protocol_install(terminal.as_deref())
             }
             cli::ProtocolCommand::Uninstall => cli::protocol_uninstall(),
+            cli::ProtocolCommand::Status => cli::protocol_status(),
         },
     }
 }

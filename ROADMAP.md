@@ -174,6 +174,58 @@ real projects:
   machine migration, and gives external tools (like
   `claudecode-project-sync`) a path-independent handle to track a
   workspace across folder moves and environments. See DESIGN §11.
+- **`pa <path>` positional arg.** `pa ~/code/myproject` opens the
+  workspace TUI at that path without needing to `cd` there first.
+  Accepts either a `*.portagenty.toml` file or a directory (walks
+  up from the directory). Missing path errors cleanly instead of
+  silently falling back to walk-up.
+- **File tree in the session list.** `t` from the session list
+  opens a tree browser rooted at the workspace's directory, with
+  the full tree-mode vocabulary (`.` drill, Backspace pop, `l`/`→`
+  expand, `n` new folder, `o` shell here, `/` search here).
+  Complements the existing `n` → tree path from the picker.
+- **Add session in TUI (`a`).** Two-stage modal (name → command);
+  writes via the same `cli::add` path used by `pa add`, reloads the
+  workspace so the new row shows immediately. Rejects duplicates.
+- **Rename workspace (`R`).** Picker-level key opens an input modal
+  seeded with the current name. Enter commits via
+  `workspace_edit::set_name` (comment-preserving toml_edit write);
+  the picker list reads the TOML `name` field so the change is
+  reflected live.
+- **"Open in Terminal" (`o`).** Single key in three places — picker
+  reveal modal, session list, tree mode — exits pa and drops into a
+  plain shell at the chosen directory. No mpx, no session, no state
+  written. Shell exits → you're back in your original terminal.
+- **`pa://` URL scheme handler.** New grammar: `pa://open/<path>`,
+  `pa://shell/<path>`, `pa://workspace/<uuid>`,
+  `pa://launch/<uuid>/<session>`. `pa open <url>` is the dispatcher.
+  `pa protocol terminals/show/install/uninstall/status` manages the
+  OS-level registration — detects Windows Terminal / ConEmu /
+  Alacritty / WezTerm / cmd.exe on Windows, gnome-terminal /
+  konsole / alacritty / kitty / wezterm / foot / xfce4-terminal /
+  xterm on Linux, iTerm2 / Terminal.app / friends on macOS. WSL
+  detection preferred Windows terminals and wraps in `wsl.exe -e`
+  automatically. Custom terminals via `--terminal <path>` work even
+  when not detected. Linux writes `.desktop`; Windows / WSL write
+  `HKCU\Software\Classes\pa` via `reg.exe` (no admin needed); macOS
+  errors with manual guidance for now.
+- **Vim-style navigation on picker + session list.** `l`/`→` opens
+  (same as Enter), `Ctrl+D`/`Ctrl+U` half-page, `PgDn`/`PgUp`
+  10-row jumps. Existing `j`/`k`/`g`/`G` stay. Footer hints `j/k
+  nav` / `g/G top/btm` / `Enter/l open` so the vim vocabulary is
+  discoverable.
+- **Session-list `q` → back to picker** (was hard-quit). `Ctrl+C`
+  still hard-quits for the "I really want out" case.
+- **Leaf-name fuzzy match.** Find overlay now matches the
+  highlighted query against the folder's leaf name only (falls
+  back to full-path matching when the query contains `/`). Fixes
+  typing "MEDIA" from spuriously matching deep paths like
+  `/mnt/c/Users/.../Documents` by scattered letters.
+- **Global search toggle (`Ctrl+R`).** In the find overlay,
+  `Ctrl+R` switches between project-roots mode (default) and
+  global mode (all mount points on WSL, or `/` on native Linux).
+  Clean single-key toggle instead of the old auto-reroot-on-
+  absolute-path approach.
 
 ### Still to ship (rough priority order)
 

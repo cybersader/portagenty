@@ -259,6 +259,10 @@ pub enum ProtocolCommand {
     },
     /// Remove a previously-installed registration.
     Uninstall,
+    /// Report on what's currently registered for `pa://` on this
+    /// machine. Useful for verifying install succeeded or debugging
+    /// "why doesn't my pa:// link work?".
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -1185,22 +1189,35 @@ fn pick_terminal(
 ) -> Result<crate::protocol::register::Terminal> {
     let terms = crate::protocol::register::detect_terminals();
     if let Some(name) = override_name {
-        crate::protocol::register::match_by_name(&terms, name).ok_or_else(|| {
-            let avail: Vec<String> = terms.iter().map(|t| t.name.clone()).collect();
-            anyhow!(
-                "no detected terminal matches {name:?}. Available: {}",
-                if avail.is_empty() {
-                    "(none — run `pa protocol terminals`)".into()
-                } else {
-                    avail.join(", ")
-                }
-            )
-        })
+        // 1) Name match against detected set (case-insensitive, substring).
+        if let Some(t) = crate::protocol::register::match_by_name(&terms, name) {
+            return Ok(t);
+        }
+        // 2) Custom: treat `name` as a binary path or PATH-resolvable
+        //    command. Works even when we didn't detect it. The user
+        //    vouches for the binary; we construct a generic
+        //    `-e {cmd}` template that most emulators accept.
+        if let Some(custom) = crate::protocol::register::custom_terminal(name) {
+            return Ok(custom);
+        }
+        let avail: Vec<String> = terms.iter().map(|t| t.name.clone()).collect();
+        Err(anyhow!(
+            "terminal {name:?} not found. Detected: {}. \
+             You can also pass an absolute path to any terminal binary.",
+            if avail.is_empty() {
+                "(none — run `pa protocol terminals`)".into()
+            } else {
+                avail.join(", ")
+            }
+        ))
     } else {
         terms
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow!("no terminal emulator detected — pass --terminal <name>"))
+            .ok_or_else(|| anyhow!(
+                "no terminal emulator detected — pass --terminal <name-or-path>. \
+                 Run `pa protocol terminals` for the list we probe for."
+            ))
     }
 }
 
@@ -1239,5 +1256,12 @@ pub fn protocol_install(terminal: Option<&str>) -> Result<()> {
 pub fn protocol_uninstall() -> Result<()> {
     let where_from = crate::protocol::register::uninstall()?;
     println!("uninstalled pa:// handler\n  → {}", where_from);
+    Ok(())
+}
+
+/// `pa protocol status` — print what's currently registered.
+pub fn protocol_status() -> Result<()> {
+    let s = crate::protocol::register::status()?;
+    print!("{s}");
     Ok(())
 }

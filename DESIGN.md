@@ -610,6 +610,56 @@ The recommended fix is a two-phase approach:
 See ROADMAP item 13 for the full solution matrix with effort
 estimates.
 
+### URL protocol handler (`pa://`)
+
+`pa` ships a URL scheme so OS-level clicks on `pa://...` links
+dispatch to pa actions. This is the hook external tools (note-apps,
+browser bookmarks, Obsidian plugins) use to "launch my workspace
+from a link."
+
+Grammar:
+
+- `pa://open/<path>` → `pa <path>` → open the workspace TUI
+- `pa://shell/<path>` → drop to plain shell at `path`
+- `pa://workspace/<uuid>` → resolve via the global registry (scans
+  `[[workspace]]` entries for a matching `id` field), then open
+- `pa://launch/<uuid>/<session>` → resolve workspace, then
+  `pa launch <session>`
+
+The dispatcher is `pa open <url>` — plain subcommand, no daemon.
+Percent-decoding is handled; unknown actions fail loudly rather
+than silently falling back to the picker (clicks are async — the
+spawned terminal might never be seen by the user).
+
+Registration is an explicit step (`pa protocol install`) and lives
+entirely OS-side. pa itself never speaks to the OS at runtime
+beyond the `pa open` CLI dispatch. Three platforms:
+
+- **Linux** — `~/.local/share/applications/portagenty.desktop` with
+  `MimeType=x-scheme-handler/pa;` + `xdg-mime default` to mark it
+  as the scheme's handler.
+- **Windows (and WSL from the Linux side)** — `HKCU\Software\
+  Classes\pa` via `reg.exe` (user-scope, no admin). On WSL, the
+  command template automatically wraps pa invocations in
+  `wsl.exe -e` since the click originates from Windows.
+- **macOS** — requires a `.app` bundle with a `CFBundleURLTypes`
+  entry. Not automated (would mean shipping a signed bundle);
+  `pa protocol show` prints guidance to apply manually.
+
+Terminal emulator detection is best-effort and override-friendly.
+The built-in list covers Windows Terminal / ConEmu / Alacritty /
+WezTerm / cmd.exe (Windows); gnome-terminal / konsole / alacritty
+/ kitty / wezterm / foot / xfce4-terminal / xterm (Linux); iTerm2
+/ Terminal.app / alacritty / wezterm / kitty (macOS). Users with
+anything else pass `--terminal <name-or-path>` and pa constructs a
+generic `-e {cmd}` template — works for most POSIX emulators.
+
+Why this doesn't violate the anti-daemon stance (§5): `pa://`
+clicks spawn a fresh pa process per link, identical to the user
+typing `pa` in a terminal. There's no resident listener, no socket,
+no "wake up pa and tell it to do X." Each click is a discrete
+subprocess.
+
 ## 13. Explicitly out of scope
 
 - **Scaffolding**. A tool for that exists (`agentic-workflow-and-tech-stack`'s `setup.sh`). Integration with a purpose-built scaffolder may happen later via a separate `pa new` subcommand that shells out.

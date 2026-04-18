@@ -10,12 +10,18 @@ them from anywhere under your workspace file and `pa` will find it.
 The `-w`/`--workspace` flag overrides the walk-up with an explicit
 path.
 
-## `pa`
+## `pa [path]`
 
-Opens the TUI. No flags today beyond whatever clap adds.
+Opens the TUI. With no arguments, walks up from `$PWD` for a
+`*.portagenty.toml` or (if none) shows the workspace picker. Pass an
+optional positional `path` to jump straight to a workspace without
+needing to `cd` there first. The path can be a `*.portagenty.toml`
+file or a directory (walks up from it).
 
 ```sh
-pa
+pa                                    # walk up / show picker
+pa ~/code/myproject                   # open workspace at this dir
+pa ~/code/my.portagenty.toml          # open this workspace file directly
 ```
 
 ### Workspace picker (home screen)
@@ -29,11 +35,14 @@ pressing `Esc` from the session list.
 | `k` / `↑` | Previous workspace |
 | `g` / `Home` | First workspace |
 | `G` / `End` | Last workspace |
-| `Enter` / `→` | Open the highlighted workspace |
+| `Enter` / `l` / `→` | Open the highlighted workspace |
+| `Ctrl+D` / `Ctrl+U` | Half-page down / up |
+| `PgDn` / `PgUp` | 10-row jumps |
 | `n` | Find a folder + scaffold a new workspace |
+| `R` | Rename workspace (edits TOML `name` field) |
+| `r` | Reveal workspace path (auto-copies; press `o` inside to open shell there) |
 | `d` | Unregister workspace from global index (file stays on disk) |
 | `D` | Delete workspace file and unregister (with confirm) |
-| `r` | Reveal workspace path (auto-copies to clipboard) |
 | `?` | Help overlay |
 | `q` / `Esc` | Exit `pa` |
 
@@ -45,36 +54,51 @@ pressing `Esc` from the session list.
 | `k` / `↑` / `Alt+K` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` / `→` | Attach-or-create the highlighted session (takeover) |
+| `Enter` / `l` / `→` | Attach-or-create the highlighted session (takeover) |
+| `Ctrl+D` / `Ctrl+U` | Half-page down / up |
+| `PgDn` / `PgUp` | 10-row jumps |
+| `a` | Add a new session (2-stage name → command modal) |
 | `e` | Edit session (name / cwd / command / kind / env) |
 | `d` | Delete session from workspace TOML (with confirm) |
 | `x` | Kill a live mpx session (with confirm) |
 | `m` | Switch workspace multiplexer (tmux ↔ zellij) |
+| `t` | Open the file tree rooted at the workspace's directory |
+| `o` | Open a plain shell at the workspace's directory (exits pa) |
 | `?` | Help overlay |
-| `Esc` / `←` | Back to workspace picker |
-| `q` / `Ctrl+C` | Exit `pa` directly |
+| `Esc` / `q` / `Ctrl+Q` | Back to workspace picker |
+| `Ctrl+C` | Exit `pa` directly |
 
 ### Find overlay (triggered by `n` in picker or `e → c` in session list)
 
 | Key | Action |
 |---|---|
-| Type characters | Fuzzy-search folders (nucleo ranking) |
+| Type characters | Fuzzy-search folders by leaf name (nucleo ranking) |
 | `↑` / `↓` | Move highlight through results |
+| `>` / `→` | Drill into highlighted folder |
+| `<` / `←` | Go up to parent folder |
 | `Enter` | Select folder (scaffold or open existing workspace) |
+| `Ctrl+R` | Toggle global search (all mount points / filesystem root) |
 | `Ctrl+T` | Switch to tree-browse mode |
 | `Ctrl+F` | Fullscreen path display |
 | `Esc` | Close the find overlay |
 
-### Tree browser (triggered by `Ctrl+T` inside find overlay)
+### Tree browser (triggered by `Ctrl+T` inside find overlay, or `t` in session list)
 
 | Key | Action |
 |---|---|
 | `j` / `↓` | Next row |
 | `k` / `↑` | Previous row |
-| `Enter` / `→` | Expand directory (or select leaf) |
-| `←` / `Backspace` | Collapse directory (or go to parent) |
-| `Shift+Enter` | Select the highlighted directory as result |
-| `Esc` | Back to search mode |
+| `g` / `G` | First / last row |
+| `Enter` | Select (file or leaf) |
+| `l` / `→` / `Space` | Expand directory (inline) |
+| `h` / `←` | Collapse directory |
+| `.` | Drill — re-root the tree at the highlighted folder |
+| `Backspace` | Pop root — re-root at the current root's parent |
+| `n` | Create a new folder under the current root |
+| `o` | Open a plain shell at the highlighted folder (exits pa) |
+| `/` | Search from here — back to search mode with this folder as root |
+| `Ctrl+T` / `Esc` | Back to search mode |
+| `q` / `Ctrl+C` | Close the overlay |
 
 ## `pa launch <session>`
 
@@ -341,4 +365,103 @@ user content is preserved byte-for-byte.
 
 ```sh
 pa snippets uninstall pa-aliases
+```
+
+## `pa open <url>`
+
+Dispatch a `pa://...` URL to the matching pa action. Called
+automatically by the OS when the user clicks a `pa://` link (see
+`pa protocol` below). Supported URL shapes:
+
+| URL | Opens |
+|---|---|
+| `pa://open/<path>` | Workspace TUI for the workspace at `path` (percent-encoded) |
+| `pa://shell/<path>` | Plain shell at `path` (no pa state, no mpx) |
+| `pa://workspace/<uuid>` | Workspace whose TOML has `id = "<uuid>"` |
+| `pa://launch/<uuid>/<session>` | Launch `session` in the workspace with that id |
+
+```sh
+pa open "pa://open/home/u/code/myproject"
+pa open "pa://workspace/a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+```
+
+Unknown actions error cleanly rather than silently opening the
+picker — clicks are asynchronous and a wrong-scheme URL shouldn't
+leave you staring at a generic home screen.
+
+## `pa protocol`
+
+Manage the OS-level `pa://` URL scheme so browser / note-app / Slack
+clicks on `pa://...` links launch pa in your terminal.
+
+### `pa protocol terminals`
+
+List terminal emulators detected on this machine, highest-priority
+first. The first entry is what `install` / `show` default to.
+Detection covers: Windows Terminal, ConEmu, Alacritty, WezTerm,
+cmd.exe (Windows) · GNOME Terminal, Konsole, Alacritty, Kitty,
+WezTerm, Foot, XFCE Terminal, xterm (Linux) · iTerm2, Terminal.app,
+Alacritty, WezTerm, Kitty (macOS).
+
+On WSL, Windows terminals (e.g. `wt.exe`) are preferred — URL
+clicks originate from Windows, so that's where the handler lives.
+
+```sh
+pa protocol terminals
+```
+
+### `pa protocol show [--terminal <name-or-path>]`
+
+Print the OS-appropriate registration snippet without writing
+anything. Safe — always a read-only preview. Output is:
+
+- **Linux** → a `.desktop` file body
+- **Windows / WSL** → a `.reg` file body
+- **macOS** → guidance (install not automated there)
+
+```sh
+pa protocol show
+pa protocol show --terminal alacritty       # override the default
+pa protocol show --terminal /opt/my-term    # absolute path works too
+```
+
+### `pa protocol install [--terminal <name-or-path>]`
+
+Write the registration:
+
+- **Linux** → `~/.local/share/applications/portagenty.desktop` + runs
+  `xdg-mime default portagenty.desktop x-scheme-handler/pa` so the
+  desktop environment picks it up immediately.
+- **Windows / WSL** → `HKCU\Software\Classes\pa` (user-scope, no
+  admin needed; works from WSL via `reg.exe`).
+- **macOS** → errors; use `pa protocol show` and apply the Info.plist
+  guidance manually.
+
+`--terminal` accepts either a detected terminal name (substring
+match, case-insensitive) or any absolute path / PATH-resolvable
+binary. Custom terminals get a generic `-e {cmd}` template — works
+for most POSIX emulators.
+
+```sh
+pa protocol install                          # auto-pick the best
+pa protocol install --terminal alacritty
+pa protocol install --terminal /usr/local/bin/my-terminal
+```
+
+### `pa protocol uninstall`
+
+Reverse of `install`. Idempotent — removing an already-absent
+registration is a no-op.
+
+```sh
+pa protocol uninstall
+```
+
+### `pa protocol status`
+
+Report what's currently registered. Useful for verifying install or
+debugging "why doesn't my pa:// link work?".
+
+```sh
+pa protocol status
 ```

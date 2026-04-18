@@ -176,6 +176,88 @@ pub fn install(term: &Terminal, pa_binary: &Path) -> Result<String> {
     }
 }
 
+/// Report on what's currently registered for `pa://` on this machine.
+/// Returns human-readable lines ready to print.
+pub fn status() -> Result<String> {
+    match effective_os() {
+        "linux" => status_linux(),
+        "windows" => status_windows(),
+        "macos" => Ok(
+            "macOS status check isn't automated yet — check\n  \
+             defaults read com.apple.LaunchServices/com.apple.launchservices.secure \
+             LSHandlers | grep pa"
+                .into(),
+        ),
+        other => Err(anyhow!("unsupported OS: {other}")),
+    }
+}
+
+fn status_linux() -> Result<String> {
+    let path = linux_desktop_path()?;
+    if !path.exists() {
+        return Ok(format!("not installed (no file at {})", path.display()));
+    }
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let exec = body
+        .lines()
+        .find_map(|l| l.strip_prefix("Exec="))
+        .unwrap_or("(no Exec= line?)");
+    // Query xdg-mime for the currently-default handler; tolerate
+    // missing / failing invocations (not every minimal Linux has
+    // xdg-mime installed).
+    let xdg_default = std::process::Command::new("xdg-mime")
+        .args(["query", "default", "x-scheme-handler/pa"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        });
+    let mut out = format!("installed: {}\n  Exec: {exec}\n", path.display());
+    if let Some(def) = xdg_default {
+        if !def.is_empty() {
+            out.push_str(&format!("  xdg-mime default: {def}\n"));
+        }
+    }
+    Ok(out)
+}
+
+fn status_windows() -> Result<String> {
+    let reg = find_reg_exe()
+        .ok_or_else(|| anyhow!("reg.exe not found on PATH (are you on Windows/WSL?)"))?;
+    let out = std::process::Command::new(&reg)
+        .args([
+            "query",
+            "HKCU\\Software\\Classes\\pa\\shell\\open\\command",
+            "/ve",
+        ])
+        .output()
+        .with_context(|| format!("invoking {}", reg.display()))?;
+    if !out.status.success() {
+        return Ok("not installed (no HKCU\\Software\\Classes\\pa key)".into());
+    }
+    // Parse out the (Default) REG_SZ value from the reg.exe output.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let cmd = text
+        .lines()
+        .filter_map(|l| {
+            let trimmed = l.trim();
+            trimmed
+                .strip_prefix("(Default)")
+                .or_else(|| trimmed.strip_prefix("(default)"))
+        })
+        .map(|s| s.trim().trim_start_matches("REG_SZ").trim())
+        .next()
+        .unwrap_or("(couldn't parse reg.exe output)");
+    Ok(format!(
+        "installed: HKCU\\Software\\Classes\\pa\n  command: {cmd}\n"
+    ))
+}
+
 /// Remove a previously-installed registration.
 pub fn uninstall() -> Result<String> {
     match effective_os() {
@@ -622,6 +704,42 @@ fn shell_quote(p: &Path) -> String {
     } else {
         s
     }
+}
+
+/// Construct a Terminal for a user-supplied binary that we didn't
+/// detect. Accepts either a PATH-resolvable name (`alacritty`) or
+/// an absolute path (`/usr/local/bin/weird-term`). Applies a
+/// generic `-e {cmd}` template — works for most POSIX terminals and
+/// is the closest we can get without knowing the specific flag
+/// idiom. If the user needs a different flag, they can still write
+/// the `.desktop` / `.reg` snippet by hand using `pa protocol show`
+/// as a starting point.
+pub fn custom_terminal(name_or_path: &str) -> Option<Terminal> {
+    let binary = if name_or_path.contains('/') || name_or_path.contains('\\') {
+        let p = PathBuf::from(name_or_path);
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
+    } else {
+        which_with_extra_paths(name_or_path, crate::find::is_wsl())
+    }?;
+    // Platform tag: if the binary path ends in `.exe` or lives under
+    // /mnt/c (WSL's Windows mount), it's a Windows terminal — that
+    // matters for the wsl.exe wrapping in build_invocation.
+    let looks_windows = binary
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        || binary.to_string_lossy().starts_with("/mnt/c/");
+    Some(Terminal {
+        name: format!("custom: {name_or_path}"),
+        binary,
+        platform: if looks_windows { "windows" } else { std::env::consts::OS },
+        args_template: vec!["-e".into(), "{cmd}".into()],
+        split_args: true,
+    })
 }
 
 /// Terminal matching by name (case-insensitive, substring match).

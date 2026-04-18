@@ -114,7 +114,11 @@ pa                        # open the TUI
 | **TUI** | Workspace picker home screen, session list, recency sort, color-coded state markers, kind glyphs, attached-client count, responsive 2-line footer, help overlay (`?`). |
 | **Navigation** | Android-back semantics (Esc = back one level). Arrow keys, vim keys (`j`/`k`), Alt+J/K. |
 | **Session management** | `pa init` / `add` / `rm` / `edit` from CLI. In-TUI editing (`e` key) for name, cwd, command, kind, env. |
-| **Find + scaffold** | `n` in picker: fuzzy-search folders (recency, zoxide, plocate, fd, stdlib walker, nucleo ranking). `t` for tree browser. Scaffold on confirm. |
+| **Find + scaffold** | `n` in picker: fuzzy-search folders (recency, zoxide, plocate, fd, stdlib walker, nucleo ranking). `Ctrl+R` toggles global search. `Ctrl+T` for tree browser. Scaffold on confirm. |
+| **File tree in TUI** | `t` in session list opens a tree rooted at the workspace dir. `.` drills, Backspace pops up, `n` creates a new folder, `o` drops to a plain shell at the highlighted folder, `/` searches from here. |
+| **Add / rename / edit in TUI** | `a` adds a new session via a 2-stage modal. `R` renames the workspace (edits the TOML `name` field). `e` edits existing session fields. |
+| **Open in Terminal** | `o` in session list / tree mode / picker's reveal modal drops you into a plain shell at the chosen path — exits pa, no mpx, no session state. |
+| **pa://** URL scheme | `pa open <url>` dispatches `pa://open/<path>`, `pa://workspace/<uuid>`, `pa://launch/<uuid>/<session>`, and `pa://shell/<path>` links. `pa protocol install` registers the scheme with the OS (Linux `.desktop`, Windows / WSL registry); works with any detected or user-specified terminal emulator. |
 | **Cross-device** | `pa claim` takeover-attach. `pa launch --resume` appends `--continue` for claude-code sessions. |
 | **Workspace scoping** | Session names prefixed with workspace name in the mpx (`my-project-shell`). Auto-re-register on walk-up (folder move resilience). |
 | **Extras** | Declarative export (`pa export`), onboarding wizard, shell completions, bundled bash snippets, per-session env vars. |
