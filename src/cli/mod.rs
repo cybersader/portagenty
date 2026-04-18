@@ -64,6 +64,16 @@ pub enum Command {
         /// so committed workspace files are reproducible.
         #[arg(long = "resume")]
         resume: bool,
+
+        /// Kill any existing mpx session with this name before
+        /// launching a fresh one. Useful on zellij where takeover
+        /// isn't supported natively — "fresh launch" is the only
+        /// way to guarantee other clients are disconnected. On tmux
+        /// the default takeover already handles this cleanly; use
+        /// `--fresh` only when you specifically want to wipe running
+        /// state (reset to the workspace's declared command).
+        #[arg(long = "fresh")]
+        fresh: bool,
     },
     /// "Make this device the main session." Short-form alias for
     /// `launch --takeover` that defaults the session name to the
@@ -86,6 +96,12 @@ pub enum Command {
         /// as `pa launch --resume`.
         #[arg(long = "resume")]
         resume: bool,
+
+        /// Kill any existing mpx session with this name before
+        /// launching. Same semantics as `pa launch --fresh` — the
+        /// zellij "takeover" workaround (loses running state).
+        #[arg(long = "fresh")]
+        fresh: bool,
     },
     /// Print the currently-resolved workspace (name, multiplexer,
     /// sessions) to stdout.
@@ -401,6 +417,7 @@ pub fn launch(
     dry_run: bool,
     shared: bool,
     resume: bool,
+    fresh: bool,
 ) -> Result<()> {
     let (mut sess, ws) = resolve(session, workspace)?;
     let mode = if shared {
@@ -412,6 +429,9 @@ pub fn launch(
     if resume {
         apply_resume_modifier(&mut sess)?;
     }
+
+    let mux = build_mux(ws.multiplexer)?;
+    let mpx_name = crate::mux::workspace_session_name(&ws.name, &sess.name);
 
     if dry_run {
         let out = io::stdout();
@@ -425,7 +445,27 @@ pub fn launch(
         )?;
         writeln!(out, "  cwd:     {}", sess.cwd.display())?;
         writeln!(out, "  command: {}", sess.command)?;
+        if fresh {
+            writeln!(
+                out,
+                "  fresh:   true (would kill any existing mpx session {mpx_name:?} first)"
+            )?;
+        }
         return Ok(());
+    }
+
+    // --fresh: kill any existing session with this name before
+    // launching. For zellij this is the only way to guarantee
+    // takeover semantics — other clients get dropped because the
+    // session they were attached to is gone. For tmux it's
+    // overkill (the default takeover already kicks clients without
+    // destroying state) but respected if explicitly asked.
+    if fresh {
+        if let Ok(true) = mux.has_session(&mpx_name) {
+            mux.kill(&mpx_name).with_context(|| {
+                format!("killing existing session {mpx_name:?} before fresh launch")
+            })?;
+        }
     }
 
     // Record the launch BEFORE attaching — attach blocks until the
@@ -435,8 +475,6 @@ pub fn launch(
         let _ = crate::state::record_launch(path, &sess.name);
     }
 
-    let mux = build_mux(ws.multiplexer)?;
-    let mpx_name = crate::mux::workspace_session_name(&ws.name, &sess.name);
     mux.create_and_attach(&sess, &mpx_name, mode)
         .with_context(|| format!("launching session {:?}", sess.name))
 }
@@ -482,6 +520,7 @@ pub fn claim(
     workspace: Option<&PathBuf>,
     dry_run: bool,
     resume: bool,
+    fresh: bool,
 ) -> Result<()> {
     let name_owned: String;
     let name: &str = match session {
@@ -502,7 +541,7 @@ pub fn claim(
     };
 
     // Always takeover; that's the whole point of the verb.
-    launch(name, workspace, dry_run, /* shared = */ false, resume)
+    launch(name, workspace, dry_run, /* shared = */ false, resume, fresh)
 }
 
 fn attach_mode_label(mode: AttachMode) -> &'static str {
@@ -1136,7 +1175,7 @@ pub fn open_url(url: &str) -> Result<()> {
             session,
         } => {
             let path = resolve_workspace_by_id(&workspace_id)?;
-            launch(&session, Some(&path), false, false, false)
+            launch(&session, Some(&path), false, false, false, false)
         }
     }
 }

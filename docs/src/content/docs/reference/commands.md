@@ -111,6 +111,7 @@ entering the TUI.
 | `--dry-run` | off | Print what would happen, don't run it |
 | `--shared` | off | Don't detach other clients (see [attach modes](../../concepts/#attach-mode-takeover--shared)) |
 | `--resume` | off | Kind-aware resume. For `kind = "claude-code"` sessions, appends `--continue` before launch so Claude picks up its prior conversation. Other kinds print a one-line hint to stderr and launch unchanged. The workspace TOML command string is never mutated on disk. |
+| `--fresh` | off | Kill any existing mpx session with this name before launching. On zellij this is the only way to guarantee other clients are disconnected (zellij doesn't support per-client takeover). On tmux the default takeover already handles it — use `--fresh` only when you specifically want to wipe running state and restart from the workspace's declared command. |
 
 Examples:
 
@@ -133,6 +134,7 @@ the workspace.
 | `-w`, `--workspace <path>` | walk-up | Explicit workspace file |
 | `--dry-run` | off | Print what would happen |
 | `--resume` | off | Same semantics as `pa launch --resume`: appends `--continue` for `kind = "claude-code"` sessions, one-line hint for other kinds. |
+| `--fresh` | off | Same semantics as `pa launch --fresh`: kill any existing mpx session first. The zellij takeover workaround (loses running state). |
 
 Examples:
 

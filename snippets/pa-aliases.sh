@@ -49,17 +49,18 @@ paclaim() {
         return 0
     fi
     if [ -n "$ZELLIJ" ]; then
-        if [ "$1" = "--nuclear" ]; then
-            echo "paclaim --nuclear: killing zellij session $ZELLIJ_SESSION_NAME (disconnects all clients)."
+        if [ "$1" = "--nuclear" ] || [ "$1" = "--restart" ]; then
+            echo "paclaim $1: killing zellij session $ZELLIJ_SESSION_NAME (disconnects all clients, loses running state)."
             zellij kill-session "$ZELLIJ_SESSION_NAME"
             return $?
         fi
         echo "paclaim: zellij has no 'detach others' command (upstream limitation)." >&2
         echo "  Other clients attached to this session will stay attached." >&2
-        echo "  Options:" >&2
-        echo "    - Accept it: zellij is built for shared clients." >&2
-        echo "    - Switch the workspace to tmux: exit, run pa, press 'm' on the row." >&2
-        echo "    - Nuclear: 'paclaim --nuclear' kills the session entirely (loses state)." >&2
+        echo "  Real takeover on zellij = kill + recreate (loses running state):" >&2
+        echo "    - From outside:  pa claim --fresh  (cleanest — one command)" >&2
+        echo "    - From in here:  paclaim --restart, then re-enter via pa" >&2
+        echo "  Or accept shared clients — zellij is built for that." >&2
+        echo "  Or switch the workspace to tmux: exit, run pa, press 'm' on the row." >&2
         return 1
     fi
     echo "paclaim: not inside a tmux or zellij session." >&2

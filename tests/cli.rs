@@ -123,6 +123,40 @@ fn launch_with_shared_flag_reports_shared_mode() {
 }
 
 #[test]
+fn launch_fresh_flag_surfaces_in_dry_run() {
+    // --fresh should appear in the dry-run output so the user can
+    // verify they typed the right flag, and should mention the mpx
+    // session name that would be killed.
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    pa_cmd()
+        .args(["launch", "claude", "--dry-run", "--fresh"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("fresh"))
+        .stdout(contains("kill any existing"));
+}
+
+#[test]
+fn claim_accepts_fresh_flag() {
+    // Parser-level smoke test — claim should accept --fresh just
+    // like launch does (they share the same codepath).
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    pa_cmd()
+        .args(["claim", "claude", "--dry-run", "--fresh"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("fresh"));
+}
+
+#[test]
 fn claim_with_explicit_name_dry_runs_as_takeover() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);
