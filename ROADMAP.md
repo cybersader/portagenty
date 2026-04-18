@@ -311,6 +311,23 @@ These are plausibly valuable, but we're committing to not thinking about them un
 - **Session dependencies / DAG.** "Start B only after A is attached." Interesting, but risks scope explosion.
 - **Multi-workspace views.** A meta-view that spans workspaces (e.g. "all my claude sessions across workspaces").
 
+- **Obsidian plugin — vault-aware workspace curator.** A companion
+  Obsidian plugin that scans the current vault for `*.portagenty.toml`
+  files (e.g. workspaces committed alongside projects in a vault) and
+  auto-generates `pa://` links to each one. Use cases:
+    - A "Projects" base view with one row per workspace, showing
+      name / id / last-opened / sessions count, with clickable
+      `pa://workspace/<id>` links that drop you into the TUI.
+    - Inline transclusion: `![[foo.portagenty.toml]]` renders the
+      workspace as a card with a "launch" button.
+    - Daily-note integration: "today's workspaces" list driven by
+      recency, each with a one-click launch.
+  Leverages the v1.x workspace `id` field as the stable handle
+  (survives folder moves inside the vault). The plugin is external
+  to portagenty-the-Rust-binary — this repo ships the `pa://` scheme
+  grammar + handler; the plugin lives in its own repo and is a
+  consumer of that grammar.
+
 ---
 
 ## Non-goals, period
