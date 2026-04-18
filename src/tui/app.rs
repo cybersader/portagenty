@@ -389,20 +389,34 @@ impl App {
                     }
                 }
                 AddStage::Command => {
-                    if st.command.trim().is_empty() {
-                        st.error = Some("command can't be empty".into());
-                        self.adding_session = Some(st);
-                    } else if let Some(ws_path) = self.workspace.file_path.clone() {
+                    // Empty command → plain shell at the workspace
+                    // dir. Matches what `pa init` scaffolds as its
+                    // starter session. Most useful case: "just give
+                    // me a persistent terminal here," no agent, no
+                    // dev server.
+                    let cmd_trimmed = st.command.trim();
+                    let (command, kind): (&str, Option<crate::cli::AddKindArg>) =
+                        if cmd_trimmed.is_empty() {
+                            ("bash", Some(crate::cli::AddKindArg::Shell))
+                        } else {
+                            (cmd_trimmed, None)
+                        };
+                    if let Some(ws_path) = self.workspace.file_path.clone() {
                         match crate::cli::add(
                             st.name.trim(),
-                            st.command.trim(),
+                            command,
                             None,
-                            None,
+                            kind,
                             Some(&ws_path),
                         ) {
                             Ok(()) => {
                                 let name = st.name.clone();
-                                self.set_status(format!("added session {name:?}"));
+                                let note = if cmd_trimmed.is_empty() {
+                                    format!("added shell session {name:?}")
+                                } else {
+                                    format!("added session {name:?}")
+                                };
+                                self.set_status(note);
                                 self.reload_workspace();
                                 // modal closes.
                             }
@@ -1476,6 +1490,14 @@ fn render_add_session_modal(frame: &mut Frame<'_>, area: Rect, st: &AddSessionSt
         AddStage::Name => (active, dim),
         AddStage::Command => (dim, active),
     };
+    // Placeholder in the command field when stage=Command and
+    // input is empty. Signals "press Enter now for a plain shell
+    // session" without forcing the user to type "bash".
+    let cmd_empty = st.stage == AddStage::Command && st.command.is_empty();
+    let cmd_placeholder = Span::styled(
+        "(empty → plain shell)",
+        Style::default().add_modifier(Modifier::DIM).fg(Color::DarkGray),
+    );
     let mut lines = vec![
         Line::from(vec![
             Span::styled("  name:    ", name_style),
@@ -1490,6 +1512,11 @@ fn render_add_session_modal(frame: &mut Frame<'_>, area: Rect, st: &AddSessionSt
         Line::from(vec![
             Span::styled("  command: ", cmd_style),
             Span::styled(st.command.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            if cmd_empty {
+                cmd_placeholder
+            } else {
+                Span::raw("")
+            },
             if st.stage == AddStage::Command {
                 caret.clone()
             } else {
@@ -2558,6 +2585,46 @@ mod tests {
         // not close). So one Esc won't close; Ctrl+C will.
         app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.browsing.is_none(), "Ctrl+C should cancel the browse");
+    }
+
+    #[test]
+    fn add_session_empty_command_defaults_to_bash_shell() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let ws_path = tmp.path().join("t.portagenty.toml");
+        std::fs::write(
+            &ws_path,
+            "name = \"t\"\nmultiplexer = \"tmux\"\n\n\
+             [[session]]\nname = \"existing\"\ncwd = \".\"\ncommand = \"bash\"\n",
+        )
+        .unwrap();
+        let ws = crate::config::load(&crate::config::LoadOptions {
+            workspace_path: Some(ws_path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut mock = MockMultiplexer::new();
+        mock.expect_list_sessions().returning(|| Ok(vec![]));
+        let mut app = App::new(ws, Box::new(mock), vec![]);
+
+        // Open modal, type a name, Enter to advance, hit Enter AGAIN
+        // on empty command → should default to bash shell.
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        for ch in "plain-shell".chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        // Empty command — just press Enter.
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        // Modal closed (success).
+        assert!(
+            app.adding_session.is_none(),
+            "empty command should succeed with a default, not error"
+        );
+        let raw = std::fs::read_to_string(&ws_path).unwrap();
+        assert!(raw.contains("\"plain-shell\""), "name missing:\n{raw}");
+        assert!(raw.contains("\"bash\""), "command missing:\n{raw}");
+        assert!(raw.contains("\"shell\""), "kind missing:\n{raw}");
     }
 
     #[test]
