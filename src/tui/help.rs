@@ -100,6 +100,13 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("Esc / q", "exit pa"));
             lines.push(row("Ctrl+C", "exit pa"));
             lines.push(row("?", "toggle this help"));
+            lines.push(row("Ctrl+R", "refresh live-session counts"));
+            lines.push(Line::raw(""));
+            lines.push(heading(" Live-session badge"));
+            lines.push(Line::raw(""));
+            lines.push(row("● 2 live", "number of this workspace's sessions"));
+            lines.push(row("", "currently running in the mpx. Probed"));
+            lines.push(row("", "once on entry; Ctrl+R re-probes."));
             lines.push(Line::raw(""));
             lines.push(heading(" Workspace actions"));
             lines.push(Line::raw(""));

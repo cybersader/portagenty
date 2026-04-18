@@ -109,6 +109,11 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
     let mut info: Option<InfoModal> = None;
     let mut search: Option<crate::tui::find::SearchState> = None;
     let mut status = StatusLine::default();
+    // Live-session count per workspace, used to render a "2 live"
+    // badge next to each row. Probed on picker entry (cheap: at
+    // most one mpx invocation per distinct mpx across all
+    // workspaces) and refreshed on Ctrl+R for the power user.
+    let mut live_counts = compute_live_counts(&workspaces);
 
     loop {
         // Auto-age the status line so messages don't sit forever.
@@ -124,6 +129,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                 &info,
                 &mut search,
                 &status.text,
+                &live_counts,
             )
         })?;
 
@@ -300,6 +306,13 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             }
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 return Ok(PickerOutcome::Quit);
+            }
+            // Ctrl+R: re-probe mpxs and refresh the live-session
+            // badges. Useful after the user expects state to have
+            // changed (e.g. started/killed a session elsewhere).
+            (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
+                live_counts = compute_live_counts(&workspaces);
+                status.set("refreshed live-session counts".into());
             }
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
                 let sel = state.selected().unwrap_or(0);
@@ -577,6 +590,68 @@ fn perform_scaffold_at(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
     Ok(outcome.path().to_path_buf())
 }
 
+/// Probe the multiplexers once and return a map of workspace path
+/// → number of live sessions that correspond to its declared
+/// sessions. "Live" means an mpx session exists under the
+/// workspace-scoped name (matches what the session-list TUI shows
+/// with the green ● marker, minus Idle and Untracked).
+///
+/// Errors are swallowed as 0 — a workspace whose TOML is broken or
+/// whose mpx is unreachable just gets a live count of 0.
+fn compute_live_counts(workspaces: &[PathBuf]) -> std::collections::HashMap<PathBuf, usize> {
+    use std::collections::{HashMap, HashSet};
+    let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+
+    // Resolve each workspace (name, mpx, session names).
+    let mut resolved: Vec<(PathBuf, String, crate::domain::Multiplexer, Vec<String>)> =
+        Vec::with_capacity(workspaces.len());
+    for p in workspaces {
+        let Ok(ws) = crate::config::load(&crate::config::LoadOptions {
+            workspace_path: Some(p.clone()),
+            ..Default::default()
+        }) else {
+            counts.insert(p.clone(), 0);
+            continue;
+        };
+        let names: Vec<String> = ws.sessions.iter().map(|s| s.name.clone()).collect();
+        resolved.push((p.clone(), ws.name, ws.multiplexer, names));
+    }
+
+    // Probe each distinct mpx at most once — spawning tmux / zellij
+    // is ~100ms, so collapsing across workspaces is worth it.
+    let mut live_by_mpx: HashMap<crate::domain::Multiplexer, HashSet<String>> = HashMap::new();
+    let unique_mpxs: HashSet<crate::domain::Multiplexer> =
+        resolved.iter().map(|(_, _, m, _)| *m).collect();
+    for mpx in unique_mpxs {
+        let mux: Option<Box<dyn crate::mux::Multiplexer>> = match mpx {
+            crate::domain::Multiplexer::Tmux => Some(Box::new(crate::mux::TmuxAdapter::new())),
+            crate::domain::Multiplexer::Zellij => {
+                Some(Box::new(crate::mux::ZellijAdapter::new()))
+            }
+            crate::domain::Multiplexer::Wezterm => None,
+        };
+        if let Some(m) = mux {
+            if let Ok(live) = m.list_sessions() {
+                live_by_mpx.insert(mpx, live.into_iter().map(|s| s.name).collect());
+            }
+        }
+    }
+
+    // Count per workspace.
+    for (path, ws_name, mpx, session_names) in &resolved {
+        let Some(live) = live_by_mpx.get(mpx) else {
+            counts.insert(path.clone(), 0);
+            continue;
+        };
+        let n = session_names
+            .iter()
+            .filter(|sn| live.contains(&crate::mux::workspace_session_name(ws_name, sn)))
+            .count();
+        counts.insert(path.clone(), n);
+    }
+    counts
+}
+
 fn clamp_selection(workspaces: &[PathBuf], state: &mut ListState) {
     let total = workspaces.len() + 1; // + live-sessions sentinel
     let sel = state.selected().unwrap_or(0);
@@ -597,6 +672,7 @@ fn render(
     info: &Option<InfoModal>,
     search: &mut Option<crate::tui::find::SearchState>,
     status: &Option<String>,
+    live_counts: &std::collections::HashMap<PathBuf, usize>,
 ) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -642,14 +718,31 @@ fn render(
             .map(|p| compact_path(&p.display().to_string()))
             .unwrap_or_default();
         let relative = crate::state::relative_time(crate::state::last_launch_for_workspace(path));
+        // Live-session badge for this workspace, if any.
+        // Color-coded: green `●N live` when > 0, nothing otherwise.
+        let live_n = live_counts.get(path).copied().unwrap_or(0);
+        let live_badge: Option<Span<'static>> = if live_n > 0 {
+            Some(Span::styled(
+                format!("● {live_n} live"),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            None
+        };
 
         if row_width >= 70 {
-            // Wide: name · path · time. Path middle-truncates to fit.
+            // Wide: name · path · live · time. Path middle-truncates
+            // to fit; live badge only shown if > 0.
             let name_budget = label.chars().count().min(22);
-            // Remaining after: gutter(6) + name + sep(3) + time(12) + pad(2)
-            let used = 6 + name_budget + 3 + 12 + 2;
+            // Remaining after: gutter(6) + name + sep(3) + time(12)
+            // + live-badge-slot(10) + pad(2). We reserve the live
+            // slot even if this row is 0-live so columns stay aligned
+            // across rows.
+            let used = 6 + name_budget + 3 + 12 + 10 + 2;
             let path_budget = row_width.saturating_sub(used).clamp(10, 50);
-            items.push(ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(" "),
                 Span::styled("●", Style::default().fg(Color::Cyan)),
                 Span::raw("  "),
@@ -664,24 +757,34 @@ fn render(
                 ),
                 Span::raw("   "),
                 Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
-            ])));
+            ];
+            if let Some(b) = live_badge {
+                spans.push(Span::raw("   "));
+                spans.push(b);
+            }
+            items.push(ListItem::new(Line::from(spans)));
         } else {
             // Narrow / Termux portrait: two-line card. Line 1 name +
-            // relative time; line 2 indented dim path with middle
-            // truncation so it can't overflow.
+            // relative time (+ live badge if any); line 2 indented
+            // dim path with middle truncation so it can't overflow.
             let path_budget = row_width.saturating_sub(6).max(10);
+            let mut line1 = vec![
+                Span::raw(" "),
+                Span::styled("●", Style::default().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::styled(
+                    label.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
+            ];
+            if let Some(b) = live_badge {
+                line1.push(Span::raw("  "));
+                line1.push(b);
+            }
             items.push(ListItem::new(vec![
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled("●", Style::default().fg(Color::Cyan)),
-                    Span::raw("  "),
-                    Span::styled(
-                        label.to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
-                ]),
+                Line::from(line1),
                 Line::from(vec![
                     Span::raw("    "),
                     Span::styled(

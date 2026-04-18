@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// other two variants deserialize successfully so a workspace file can pin
 /// a future mpx without a parse error, and an attempt to actually launch
 /// surfaces a clear "adapter not available" message.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Multiplexer {
     #[default]
