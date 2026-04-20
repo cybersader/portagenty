@@ -181,3 +181,7 @@ Full docs: <https://cybersader.github.io/portagenty/>
 - **No agent-API wrapping.** Claude Code / OpenCode are external processes.
 - **No SQLite.** State is TOML files plus live polling.
 - **No GUI.** Terminal only. Forever.
+
+## Related
+
+- **[agentic-workflow-and-tech-stack](https://github.com/cybersader/agentic-workflow-and-tech-stack)** — my scaffold + knowledge base for filesystem-based AI agent workflows. portagenty is its stratum-2 launcher. See [stack / 02-terminal](https://cybersader.github.io/agentic-workflow-and-tech-stack/stack/02-terminal/) for how `pa` composes with WezTerm + Zellij + Claude Code in the broader agentic-coding setup, and [terminal emulator stack research](https://cybersader.github.io/agentic-workflow-and-tech-stack/agent-context/zz-research/2026-04-18-terminal-emulator-stack/) for the layer model portagenty sits inside.

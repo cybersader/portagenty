@@ -6,6 +6,10 @@
 #   p        → pa
 #   pl       → pa launch
 #   pc       → pa claim
+#   plr      → pa launch --resume   (kind-aware continue, e.g. claude --continue)
+#   pcr      → pa claim --resume    (takeover + kind-aware continue)
+#   plf      → pa launch --fresh    (kill existing + recreate; zellij takeover)
+#   pcf      → pa claim --fresh
 #   pls      → pa list
 #   pe       → pa export
 #   pi       → pa init
@@ -21,6 +25,17 @@
 alias p='pa'
 alias pl='pa launch'
 alias pc='pa claim'
+# --resume variants: kind-aware "continue prior state". For
+# kind=claude-code, appends --continue to the command so Claude
+# picks up the last conversation. Plain `pc`/`pl` launch fresh.
+alias plr='pa launch --resume'
+alias pcr='pa claim --resume'
+# --fresh variants: kill any existing mpx session first, then
+# create anew. The zellij takeover workaround (loses running
+# state). On tmux the default takeover is already real, so
+# --fresh is the "restart from workspace-declared command" option.
+alias plf='pa launch --fresh'
+alias pcf='pa claim --fresh'
 alias pls='pa list'
 alias pe='pa export'
 alias pi='pa init'
