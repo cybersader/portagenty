@@ -71,7 +71,15 @@ selection order + `pa claim`'s default session.
 - **`cwd`** (required) — absolute, `~`-prefixed, `${VAR}`-templated,
   or relative to the workspace file's directory.
 - **`command`** (required) — the shell command. Runs as-is under a
-  shell, so pipes/redirections work.
+  shell, so pipes/redirections work. **Caveat**: multiplexers spawn
+  commands under a **non-interactive** shell, which means `~/.bashrc`
+  / `~/.zshrc` aliases and functions are NOT loaded. A `command =
+  "ccry"` that resolves to `claude --continue` in your interactive
+  shell will fail in a pa session ("command not found" → session
+  immediately exits). Write the literal command (`"claude --continue"`)
+  or promote your alias to a real binary on `PATH` (see the
+  [session commands](#session-commands-aliases-vs-real-binaries)
+  section below).
 - **`kind`** (optional) — one of `claude-code`, `opencode`,
   `editor`, `dev-server`, `shell`, `other`. Drives the TUI's per-row
   glyph (display-only in v1.x).
@@ -141,3 +149,80 @@ launched-at-unix = 1700000000
 
 Bounded to 50 entries (most-recent first). Dedupes on (workspace,
 session) so the same session hitting the top twice doesn't stack.
+
+## Session commands: aliases vs real binaries
+
+A session's `command = "..."` is executed under a **non-interactive
+shell** spawned by the multiplexer (`bash -c "<cmd>"` under tmux,
+a similar path under zellij). Non-interactive shells do NOT source
+`~/.bashrc` / `~/.zshrc` — so **shell aliases and shell functions
+defined there are invisible to pa sessions**.
+
+If you have `alias ccry='claude --continue'` in `~/.bashrc` and
+write:
+
+```toml
+[[session]]
+name = "claude"
+command = "ccry"    # ← WRONG — non-interactive shell can't find this
+kind = "claude-code"
+```
+
+…the session will launch, the shell will error with `ccry: command
+not found`, the process will exit immediately, and the multiplexer
+will close the pane. From the user's perspective: a flash of
+something, then they're back in their parent shell.
+
+### Three ways to fix it
+
+**1. Write the literal command in the TOML.**
+
+```toml
+command = "claude --continue"
+```
+
+Simplest. Matches what `ccry` expands to. Downside: on a project
+with no prior Claude conversation, `claude --continue` errors on
+first launch. Works best for projects that have already been
+"seeded" with a session.
+
+**2. Use `command = "claude"` + pa's `--resume` flag.**
+
+```toml
+command = "claude"
+kind = "claude-code"
+```
+
+Then launch with `pa launch claude --resume` (or the bundled alias
+`plr claude` via `pa snippets install pa-aliases`). pa's kind-aware
+`--resume` transform appends `--continue` only at invocation time,
+so fresh launches work and continued launches work — one TOML
+handles both. Takeover-claim version: `pa claim claude --resume`
+(or `pcr claude`).
+
+**3. Promote the alias to a real binary on `PATH`.**
+
+```sh
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/ccry <<'EOF2'
+#!/usr/bin/env bash
+exec claude --continue "$@"
+EOF2
+chmod +x ~/.local/bin/ccry
+```
+
+Now `ccry` is a real executable — interactive shells, pa sessions,
+cron, any process on PATH can run it. You can keep the shell alias
+too or delete it (the binary replaces the alias for interactive use
+once PATH prefers `~/.local/bin`). Generally the cleanest approach
+for shortcuts you want available everywhere.
+
+### Why not auto-source `~/.bashrc`?
+
+Tempting, but risky: sourcing user rc files at session spawn
+imports env vars (PATH mutations, custom PS1, etc.) that can
+fight the multiplexer's own conventions, shadow the session's
+declared `env`, or break reproducibility across devices. pa's
+position: the workspace TOML is the single source of truth for
+what a session does; don't let a user's interactive rc file
+silently influence committed workspace behavior.
