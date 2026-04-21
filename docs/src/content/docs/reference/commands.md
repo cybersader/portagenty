@@ -180,13 +180,42 @@ SSH: you don't have to hand-edit TOML before `pa` works.
 | `name` (positional) | current-directory name | Workspace display name; filename stem is a sanitized version |
 | `--mpx tmux\|zellij` | global default, else tmux | Which multiplexer to pin |
 | `--force` | off | Overwrite an existing `<name>.portagenty.toml` |
+| `--with-agent-hooks` | off | Also scaffold `.mcp.json` + `.claude/commands/` + `.claude/skills/` so a Claude Code agent in this workspace self-discovers portaconv (conversation extractor) and the portagenty workspace shape |
 
 ```sh
 pa init                        # name taken from current dir
 pa init my-space               # explicit name
 pa init my-space --mpx zellij
 pa init my-space --force       # overwrite existing
+pa init --with-agent-hooks     # also drop .mcp.json + .claude/ hooks
 ```
+
+### `--with-agent-hooks`
+
+Writes four files (skipped if already present — opt-in, not
+authoritative):
+
+- `.mcp.json` — registers the `portaconv` MCP server so Claude
+  Code's MCP client can call `list_conversations` /
+  `get_conversation` against this workspace's history.
+- `.claude/commands/convos.md` — a slash command that lists /
+  dumps conversations via `pa convos`.
+- `.claude/skills/portaconv.md` — a skill describing what
+  portaconv is and when to reach for it.
+- `.claude/skills/portagenty-workspace.md` — a skill describing
+  the workspace's TOML contract (sessions, id, `previous_paths`).
+
+If `pconv` (portaconv) isn't on PATH yet, the hooks are still
+written — they're harmless without it, and the MCP handshake starts
+succeeding the moment you run `cargo install portaconv`. A hint is
+printed either way.
+
+**Safe on existing workspaces.** `pa init --with-agent-hooks` in a
+directory that already has a `*.portagenty.toml` does NOT replace
+the TOML; it leaves the workspace file alone and just retrofits
+the agent hooks. Re-running is idempotent (skipped files stay
+untouched). Pair with `--force` only when you actually want to
+rewrite the TOML itself.
 
 ## `pa add <session> -c <command>`
 
@@ -256,6 +285,34 @@ pa edit claude --unset-env DEBUG
 Same comment-preserving behavior as `pa rm`: only the target field
 on the target session changes; everything else in the file is left
 untouched.
+
+## `pa convos <...>`
+
+Workspace-aware shim over [portaconv](https://github.com/cybersader/portaconv)
+(`pconv`). Forwards any subcommand + flags you pass to `pconv` with
+`--workspace-toml <resolved-path>` prepended so the tool only sees
+this workspace's conversation history.
+
+| Flag | Default | What |
+|---|---|---|
+| `-w`, `--workspace <path>` | walk-up | Explicit workspace file (maps to pconv's `--workspace-toml`) |
+| everything else | — | Passed through verbatim to `pconv` |
+
+```sh
+pa convos list                          # list conversations in this workspace
+pa convos list --since 7d               # pconv flags pass through
+pa convos dump <session-id>             # paste-ready markdown
+pa convos dump <session-id> --rewrite wsl-to-win
+```
+
+portagenty doesn't bundle pconv. Install it separately with
+`cargo install portaconv` (or drop a release binary on PATH). When
+pconv isn't installed, `pa convos` exits with a clear install hint
+— it doesn't silently become a no-op.
+
+Scripts that care about pconv's exit code work the same as if you'd
+invoked pconv directly: `pa convos` re-exits with pconv's status on
+non-zero.
 
 ## `pa completions <shell>`
 

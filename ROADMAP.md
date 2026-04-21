@@ -234,6 +234,32 @@ real projects:
   global mode (all mount points on WSL, or `/` on native Linux).
   Clean single-key toggle instead of the old auto-reroot-on-
   absolute-path approach.
+- **Portaconv integration (three-PR batch).** Portagenty-side of
+  the conversation-extractor bridge landed in v1.x after portaconv
+  (sibling crate `pconv`) hit v0.1. Three pieces:
+  (a) **`previous_paths` on workspace TOML.** Auto-appended on
+      walk-up re-registration when the workspace's stable `id` is
+      found at a different canonical path. Portaconv reads it to
+      bridge Claude Code conversations authored at the old cwd
+      after a folder move — without it, `mv ~/code/foo ~/arch/foo`
+      silently orphans the pre-move session history that lives at
+      `~/.claude/projects/-home-code-foo/`. The global registry
+      mirrors each workspace's `id` too so reconcile can match
+      even when the old file was deleted (the realistic `mv`).
+  (b) **`pa convos <...>` shim.** Thin pass-through to `pconv`
+      with `--workspace-toml <resolved>` injected. Shapes like
+      `pa convos list`, `pa convos dump <id>`,
+      `pa convos dump <id> --rewrite wsl-to-win` just work.
+      Portagenty stays agnostic: if `pconv` isn't on PATH, a clear
+      install hint fires instead of a silent no-op.
+  (c) **`pa init --with-agent-hooks`.** Opt-in scaffolding of
+      `.mcp.json` (registers the portaconv MCP server),
+      `.claude/commands/convos.md` (a slash command), and two
+      skill files (`portaconv.md`, `portagenty-workspace.md`) so a
+      Claude Code agent entering the workspace self-discovers the
+      extraction capabilities + the workspace contract without the
+      user explaining. Existing files are skipped, so re-running
+      the flag never overwrites user customizations.
 
 ### Still to ship (rough priority order)
 

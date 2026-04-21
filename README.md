@@ -120,7 +120,8 @@ pa                        # open the TUI
 | **Open in Terminal** | `o` in session list / tree mode / picker's reveal modal drops you into a plain shell at the chosen path — exits pa, no mpx, no session state. |
 | **pa://** URL scheme | `pa open <url>` dispatches `pa://open/<path>`, `pa://workspace/<uuid>`, `pa://launch/<uuid>/<session>`, and `pa://shell/<path>` links. `pa protocol install` registers the scheme with the OS (Linux `.desktop`, Windows / WSL registry); works with any detected or user-specified terminal emulator. |
 | **Cross-device** | `pa claim` takeover-attach. `pa launch --resume` appends `--continue` for claude-code sessions. |
-| **Workspace scoping** | Session names prefixed with workspace name in the mpx (`my-project-shell`). Auto-re-register on walk-up (folder move resilience). |
+| **Workspace scoping** | Session names prefixed with workspace name in the mpx (`my-project-shell`). Auto-re-register on walk-up (folder move resilience). Auto-maintained `previous_paths` when moves are detected. |
+| **Portaconv integration** | `pa convos list` / `pa convos dump <id>` forwards to [portaconv](https://github.com/cybersader/portaconv) scoped to this workspace. `pa init --with-agent-hooks` scaffolds `.mcp.json` + `.claude/` so agents self-discover the conversation extractor. |
 | **Extras** | Declarative export (`pa export`), onboarding wizard, shell completions, bundled bash snippets, per-session env vars. |
 
 **Still roadmapped**: Tags/Groups views, `pa up` eager-launch, datetime column, jump-back-to-pa from inside a session. See [ROADMAP.md](./ROADMAP.md).
@@ -184,4 +185,5 @@ Full docs: <https://cybersader.github.io/portagenty/>
 
 ## Related
 
+- **[portaconv](https://github.com/cybersader/portaconv)** — sibling crate. Terminal-native conversation extractor + MCP server for Claude Code (and, eventually, other agent CLIs). Reads JSONL history read-only, emits paste-ready markdown with optional WSL ↔ Windows path rewriting. Portagenty's `pa convos` forwards to it with workspace scoping auto-injected.
 - **[agentic-workflow-and-tech-stack](https://github.com/cybersader/agentic-workflow-and-tech-stack)** — my scaffold + knowledge base for filesystem-based AI agent workflows. portagenty is its stratum-2 launcher. See [stack / 02-terminal](https://cybersader.github.io/agentic-workflow-and-tech-stack/stack/02-terminal/) for how `pa` composes with WezTerm + Zellij + Claude Code in the broader agentic-coding setup, and [terminal emulator stack research](https://cybersader.github.io/agentic-workflow-and-tech-stack/agent-context/zz-research/2026-04-18-terminal-emulator-stack/) for the layer model portagenty sits inside.

@@ -126,6 +126,20 @@ pub enum Command {
         /// Overwrite an existing workspace file if one's already here.
         #[arg(long = "force")]
         force: bool,
+
+        /// Also scaffold `.mcp.json` + `.claude/commands/` +
+        /// `.claude/skills/` so a Claude Code agent entering this
+        /// workspace can discover portaconv (conversation extractor)
+        /// and portagenty's workspace shape without the user having
+        /// to explain either. Files are self-contained; skipped if
+        /// already present. Prints an install hint for `pconv` if
+        /// it's not on PATH — the hooks still work the moment pconv
+        /// is installed. Safe to re-run against an already-scaffolded
+        /// workspace: the existing TOML is left alone and only the
+        /// missing hook files are written — pair it with `--force`
+        /// only when you actually want to rewrite the TOML itself.
+        #[arg(long = "with-agent-hooks")]
+        with_agent_hooks: bool,
     },
     /// Append a new session to the current workspace file. Faster
     /// than editing TOML by hand — especially from Termux.
@@ -246,6 +260,27 @@ pub enum Command {
     /// Manage the OS-level `pa://` URL scheme registration.
     #[command(subcommand)]
     Protocol(ProtocolCommand),
+    /// Forward to `pconv` (portaconv) with this workspace's TOML
+    /// as context. Thin shim: `pa convos list`, `pa convos dump <id>`,
+    /// etc. dispatch to the matching `pconv` subcommand with
+    /// `--workspace-toml <resolved-path>` automatically injected, so
+    /// the agent CLI sees only this workspace's conversations. Any
+    /// extra flags pass through unchanged. Errors cleanly with an
+    /// install hint when `pconv` isn't on PATH — portagenty does
+    /// NOT bundle portaconv; it's a separate crate.
+    #[command(trailing_var_arg = true, allow_hyphen_values = true)]
+    Convos {
+        /// Explicit workspace TOML. Auto-walks up from `$PWD` when
+        /// omitted. Forwarded to `pconv --workspace-toml`.
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+
+        /// The pconv subcommand and its args: e.g. `list`,
+        /// `dump <session-id>`, `list --since 1d`. Passed through
+        /// verbatim to `pconv`.
+        #[arg(value_name = "PCONV_ARGS")]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -541,7 +576,9 @@ pub fn claim(
     };
 
     // Always takeover; that's the whole point of the verb.
-    launch(name, workspace, dry_run, /* shared = */ false, resume, fresh)
+    launch(
+        name, workspace, dry_run, /* shared = */ false, resume, fresh,
+    )
 }
 
 fn attach_mode_label(mode: AttachMode) -> &'static str {
@@ -573,7 +610,12 @@ fn toml_basic_string(s: &str) -> String {
 /// `<name>.portagenty.toml` with one starter session (`shell`, just
 /// bash) so `pa` works end-to-end on the first run. Returns the path
 /// that got written.
-pub fn init(name: Option<String>, mpx: Option<InitMpxArg>, force: bool) -> Result<()> {
+pub fn init(
+    name: Option<String>,
+    mpx: Option<InitMpxArg>,
+    force: bool,
+    with_agent_hooks: bool,
+) -> Result<()> {
     use crate::scaffold::{create_at, ScaffoldOutcome};
     let cwd = std::env::current_dir().context("reading current directory")?;
     let workspace_name = match name {
@@ -611,14 +653,245 @@ pub fn init(name: Option<String>, mpx: Option<InitMpxArg>, force: bool) -> Resul
             )?;
         }
         ScaffoldOutcome::AlreadyExisted(path) => {
-            return Err(anyhow!(
-                "{} already exists; pass --force to overwrite",
-                path.display()
-            ));
+            // With --with-agent-hooks on an existing workspace, the
+            // intent is "retrofit agent hooks onto this project,"
+            // not "clobber my TOML." Print a note and fall through
+            // to the hook scaffold instead of bailing. Without the
+            // hooks flag, keep the historical error so a bare
+            // `pa init` in an already-scaffolded dir still fails
+            // loudly.
+            if with_agent_hooks {
+                writeln!(
+                    out,
+                    "workspace file {} already exists — leaving it untouched; only scaffolding agent hooks.",
+                    path.display()
+                )?;
+            } else {
+                return Err(anyhow!(
+                    "{} already exists; pass --force to overwrite",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if with_agent_hooks {
+        let report = scaffold_agent_hooks(&cwd)?;
+        for line in report.lines() {
+            writeln!(out, "{line}")?;
         }
     }
     Ok(())
 }
+
+/// Write `.mcp.json` + `.claude/commands/` + `.claude/skills/` at
+/// `target_dir` so a Claude Code agent entering the workspace
+/// self-discovers the portaconv (conversation extractor) integration
+/// and portagenty's workspace shape. Files that already exist are
+/// left alone — this is opt-in scaffolding, not authoritative
+/// configuration, and users may have customized them.
+///
+/// Returns a multi-line report for the caller to print (which files
+/// were created / skipped, plus a pconv-install hint if the binary
+/// isn't on PATH). Errors only bubble up on filesystem I/O failure;
+/// a missing pconv binary is a *hint*, not a failure — the hooks
+/// are valid the moment pconv is installed.
+pub(crate) fn scaffold_agent_hooks(target_dir: &std::path::Path) -> Result<String> {
+    let mut report = String::new();
+    report.push_str("scaffolding agent hooks:\n");
+
+    let mcp_path = target_dir.join(".mcp.json");
+    let cmd_dir = target_dir.join(".claude").join("commands");
+    let skills_dir = target_dir.join(".claude").join("skills");
+
+    std::fs::create_dir_all(&cmd_dir).with_context(|| format!("creating {}", cmd_dir.display()))?;
+    std::fs::create_dir_all(&skills_dir)
+        .with_context(|| format!("creating {}", skills_dir.display()))?;
+
+    let files: [(&std::path::Path, &str, &str); 4] = [
+        (mcp_path.as_path(), "  .mcp.json", MCP_JSON_TEMPLATE),
+        (
+            &cmd_dir.join("convos.md"),
+            "  .claude/commands/convos.md",
+            CONVOS_COMMAND_TEMPLATE,
+        ),
+        (
+            &skills_dir.join("portaconv.md"),
+            "  .claude/skills/portaconv.md",
+            PORTACONV_SKILL_TEMPLATE,
+        ),
+        (
+            &skills_dir.join("portagenty-workspace.md"),
+            "  .claude/skills/portagenty-workspace.md",
+            PORTAGENTY_WORKSPACE_SKILL_TEMPLATE,
+        ),
+    ];
+
+    for (path, label, body) in files {
+        if path.exists() {
+            report.push_str(label);
+            report.push_str("  (skipped — already exists)\n");
+            continue;
+        }
+        std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
+        report.push_str(label);
+        report.push_str("  (created)\n");
+    }
+
+    // pconv detection: a portable `which`. ErrorKind::NotFound on a
+    // --version spawn is the clearest signal that the binary is
+    // absent. We don't want to fail init on a missing dep — just
+    // hint.
+    let pconv_present = std::process::Command::new("pconv")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    if !pconv_present {
+        report.push_str(
+            "\nhint: `pconv` (portaconv) is not on PATH yet. The scaffolded files\n\
+             are harmless without it, but the Claude Code MCP handshake in .mcp.json\n\
+             will only succeed once you run `cargo install portaconv` (or drop a\n\
+             release binary onto PATH).\n",
+        );
+    }
+
+    Ok(report)
+}
+
+/// `.mcp.json` template: points Claude Code at the locally-installed
+/// pconv binary's stdio MCP server. Project-scoped MCP config —
+/// applies only when the agent enters this workspace. `pconv mcp
+/// serve` is portaconv's v0.1 MCP entrypoint (see portaconv/README).
+const MCP_JSON_TEMPLATE: &str = r#"{
+  "mcpServers": {
+    "portaconv": {
+      "command": "pconv",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+"#;
+
+/// A slash command template an agent can use to list conversations
+/// via the `pa convos` shim — useful when the MCP handshake isn't
+/// available (e.g. during cold-start inside a workspace). The YAML
+/// frontmatter shape matches Claude Code's slash-command schema.
+const CONVOS_COMMAND_TEMPLATE: &str = r#"---
+description: List this workspace's prior Claude Code conversations.
+---
+
+Run `pa convos list` via the Bash tool and show the output.
+
+Use `pa convos dump <id>` to export a specific conversation as
+paste-ready markdown. Pass `--rewrite wsl-to-win` (or `win-to-wsl`)
+to normalize OS-specific paths baked into content before pasting
+into a new session.
+
+`pa convos ...` auto-scopes to this workspace's TOML via
+`--workspace-toml <path>`; you don't need to pass it yourself.
+"#;
+
+/// Skill describing what portaconv is and when to reach for it.
+/// Skills are "the map of the tools you just installed" — per the
+/// portaconv integration plan, the agent entering this workspace
+/// should be able to self-discover the extraction capabilities
+/// without the human explaining.
+const PORTACONV_SKILL_TEMPLATE: &str = r#"---
+name: portaconv
+description: This workspace is wired to portaconv (`pconv`) — a terminal-native conversation extractor + MCP server for Claude Code history. Use it whenever the user asks to read, re-paste, or bridge prior-session context.
+---
+
+# portaconv
+
+Portaconv (binary `pconv`) normalizes Claude Code's on-disk JSONL
+conversation history into paste-ready markdown or MCP resources, and
+rewrites WSL/Windows absolute paths baked into content so pasted
+context lands coherently on whatever host is replying.
+
+## Two interfaces, same data
+
+- **MCP (preferred)** — `.mcp.json` registers the `portaconv` server.
+  Tools: `list_conversations(since, workspace_id?, limit)` and
+  `get_conversation(id, format, rewrite?)`. Each conversation is
+  also exposed as a resource at `convos://conversation/<id>`.
+- **CLI** — shell out via `pa convos ...` (a workspace-aware shim
+  over `pconv`):
+  - `pa convos list` — list conversations scoped to this workspace
+  - `pa convos dump <id>` — emit paste-ready markdown
+  - `pa convos dump <id> --rewrite wsl-to-win` — normalize paths
+
+## Workspace scoping
+
+`pa convos` injects `--workspace-toml <path>` so pconv sees only
+conversations whose `cwd` prefix matches this workspace's
+`projects` (plus any `previous_paths` — see the
+`portagenty-workspace` skill).
+
+## When to use
+
+- User asks "what did we do before"/"show me the last session".
+- User wants a transcript to paste into a new session / another
+  agent CLI.
+- Agent needs prior context to avoid re-asking the human.
+- Folder was moved and old sessions aren't showing — check that
+  `previous_paths` is populated in the workspace TOML (portagenty
+  maintains this automatically on walk-up re-registration).
+"#;
+
+/// Skill describing portagenty's workspace shape so the agent knows
+/// the structural contract of the TOML it's living in — session
+/// list, multiplexer, stable `id`, `previous_paths`. Lets agents
+/// read and reason about the workspace without the user having to
+/// explain "what is a portagenty workspace."
+const PORTAGENTY_WORKSPACE_SKILL_TEMPLATE: &str = r#"---
+name: portagenty-workspace
+description: This project is a portagenty workspace — a portable, terminal-native launcher for agent sessions, driven by a committed `*.portagenty.toml`. Read it to understand the workspace's declared sessions, multiplexer, project paths, and move history.
+---
+
+# portagenty-workspace
+
+A portagenty workspace is a single TOML file at the project root
+whose name ends in `.portagenty.toml`. It's the source of truth for
+what sessions exist, what they run, and how they're multiplexed.
+
+## Key fields
+
+- `name` — human display name.
+- `id` — UUID. Stable across folder moves; used by tooling
+  (portaconv included) to track the workspace across environments.
+- `multiplexer` — `"tmux"` or `"zellij"`.
+- `projects = [...]` — project roots this workspace covers.
+- `previous_paths = [...]` — auto-maintained by pa on walk-up
+  re-registration. When the project folder moves, pa appends the
+  old location here so external tools can bridge state
+  (conversations, caches) authored at the old path.
+- `[[session]]` blocks — `name`, `cwd`, `command`, optional
+  `kind` (`claude-code`, `opencode`, `editor`, `dev-server`,
+  `shell`, `other`) and `env`.
+
+## Common commands
+
+- `pa` — open the TUI (workspace picker → session list).
+- `pa launch <name>` — attach a specific session.
+- `pa claim <name>` — takeover: kicks other clients attached to
+  the same session (the "move this session to this device" verb).
+- `pa convos list` / `pa convos dump <id>` — see the `portaconv`
+  skill.
+- `pa add <name> --command "..."` — append a session without
+  editing TOML by hand.
+
+## Why sessions sometimes flash + exit
+
+Multiplexers spawn commands under a *non-interactive* shell —
+`~/.bashrc`/`~/.zshrc` aliases and functions are NOT loaded. A
+`command = "my-alias"` that works in your interactive shell will
+error with "command not found" inside pa. Write the literal command
+or promote the alias to a real binary on PATH. See
+<https://cybersader.github.io/portagenty/reference/schema/>
+for the full story.
+"#;
 
 /// Append a new session to the current workspace file. Keeps the
 /// existing content verbatim (comments + formatting preserved) —
@@ -1141,6 +1414,97 @@ pub fn list(workspace: Option<&PathBuf>) -> Result<()> {
     Ok(())
 }
 
+// ─── pa convos ──────────────────────────────────────────────────────────
+
+/// Forward args to `pconv` with this workspace's TOML prepended as
+/// `--workspace-toml <path>`. Thin pass-through: portagenty does NOT
+/// parse pconv's subcommand surface — any subcommand, flag, or
+/// shape pconv supports now or in the future works verbatim via
+/// `pa convos ...`.
+///
+/// Design notes:
+///   - Workspace resolution: explicit `-w` > walk-up from `$PWD`.
+///     If neither resolves, error early with a clear hint (we don't
+///     want pconv to handle "no workspace" — that's a portagenty
+///     concern).
+///   - `--workspace-toml` injection is skipped when the caller
+///     already passed it (avoids `pconv: unexpected argument`).
+///   - Missing pconv binary is a portagenty-owned error with an
+///     install hint. We check via `std::process::Command` spawn
+///     returning `ErrorKind::NotFound`, matching how `cargo` /
+///     `git` shell out to find-or-hint-install other tools.
+///   - stdin / stdout / stderr pass through unchanged via `status()`
+///     so the user's terminal sees pconv output directly (no capture,
+///     no reformatting). Exit code propagates via `std::process::exit`
+///     on any non-zero status — scripts relying on `$?` still work.
+pub fn convos(workspace: Option<&PathBuf>, args: &[String]) -> Result<()> {
+    let ws_path = resolve_workspace_path(workspace)?;
+    let pconv_args = build_pconv_argv(args, &ws_path);
+
+    let status = match std::process::Command::new("pconv")
+        .args(&pconv_args)
+        .status()
+    {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "`pconv` not found on PATH. portaconv is a separate crate — \
+                 install it with `cargo install portaconv` \
+                 (or grab a release from https://github.com/cybersader/portaconv). \
+                 portagenty stays agnostic of the agent-CLI you use; `pa convos` \
+                 is just a workspace-aware shim."
+            ));
+        }
+        Err(err) => {
+            return Err(
+                anyhow::Error::from(err).context("spawning `pconv` (portaconv) from `pa convos`")
+            );
+        }
+    };
+
+    if !status.success() {
+        // Exit with pconv's code so scripts (`pa convos list && ...`)
+        // see the same failure signal they'd see from raw pconv.
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Build the argv to pass to `pconv`. Pure function, split out so
+/// arg-ordering is regression-testable without shelling out.
+///
+/// Auto-injects `--workspace-toml <ws_path>` AFTER the first
+/// positional arg (the pconv subcommand). pconv's `--workspace-toml`
+/// is a subcommand-level flag (parsed by `list` / `dump`), so
+/// injecting it before the subcommand name — as a naive "prepend to
+/// argv" would — trips pconv's top-level clap parser with
+/// `unexpected argument '--workspace-toml'`.
+///
+/// Skipped when:
+///   - the caller already passed `--workspace-toml` (respect intent)
+///   - the caller ran `pa convos` bare or only with flags / `--help`
+///     (no subcommand → let pconv surface its own help)
+fn build_pconv_argv(args: &[String], ws_path: &std::path::Path) -> Vec<String> {
+    let caller_passed_ws_flag = args
+        .iter()
+        .any(|a| a == "--workspace-toml" || a.starts_with("--workspace-toml="));
+
+    if caller_passed_ws_flag {
+        return args.to_vec();
+    }
+
+    let Some(subcmd_idx) = args.iter().position(|a| !a.starts_with('-')) else {
+        return args.to_vec();
+    };
+
+    let mut out = Vec::with_capacity(args.len() + 2);
+    out.extend(args[..=subcmd_idx].iter().cloned());
+    out.push("--workspace-toml".to_string());
+    out.push(ws_path.display().to_string());
+    out.extend(args[subcmd_idx + 1..].iter().cloned());
+    out
+}
+
 // ─── pa open <url> ──────────────────────────────────────────────────────
 
 /// Dispatch a `pa://...` URL to the matching pa action. Entry point
@@ -1209,7 +1573,10 @@ fn resolve_workspace_by_id(id: &str) -> Result<PathBuf> {
 pub fn protocol_terminals() -> Result<()> {
     let terms = crate::protocol::register::detect_terminals();
     if terms.is_empty() {
-        println!("No terminal emulators detected on {}.", std::env::consts::OS);
+        println!(
+            "No terminal emulators detected on {}.",
+            std::env::consts::OS
+        );
         println!(
             "Pass --terminal <name> on install/show to pick any binary, or install\n\
              one of: wt.exe, alacritty, kitty, wezterm, gnome-terminal, konsole, ..."
@@ -1223,9 +1590,7 @@ pub fn protocol_terminals() -> Result<()> {
     Ok(())
 }
 
-fn pick_terminal(
-    override_name: Option<&str>,
-) -> Result<crate::protocol::register::Terminal> {
+fn pick_terminal(override_name: Option<&str>) -> Result<crate::protocol::register::Terminal> {
     let terms = crate::protocol::register::detect_terminals();
     if let Some(name) = override_name {
         // 1) Name match against detected set (case-insensitive, substring).
@@ -1250,13 +1615,12 @@ fn pick_terminal(
             }
         ))
     } else {
-        terms
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!(
+        terms.into_iter().next().ok_or_else(|| {
+            anyhow!(
                 "no terminal emulator detected — pass --terminal <name-or-path>. \
                  Run `pa protocol terminals` for the list we probe for."
-            ))
+            )
+        })
     }
 }
 
@@ -1281,10 +1645,7 @@ pub fn protocol_install(terminal: Option<&str>) -> Result<()> {
     let term = pick_terminal(terminal)?;
     let bin = own_binary_path()?;
     let where_to = crate::protocol::register::install(&term, &bin)?;
-    println!(
-        "installed pa:// handler via {}\n  → {}",
-        term, where_to
-    );
+    println!("installed pa:// handler via {}\n  → {}", term, where_to);
     println!(
         "\nTry: click a pa://open/<url-encoded-absolute-path> link, or run\n  xdg-open 'pa://open/tmp' (Linux)  /  start pa://open/tmp (Windows)"
     );
@@ -1303,4 +1664,145 @@ pub fn protocol_status() -> Result<()> {
     let s = crate::protocol::register::status()?;
     print!("{s}");
     Ok(())
+}
+
+#[cfg(test)]
+mod convos_argv_tests {
+    //! Guard against the "--workspace-toml landed in the wrong slot"
+    //! regression discovered during end-to-end verification with a
+    //! real `pconv` binary. `pconv`'s --workspace-toml is a subcommand-
+    //! level flag (parsed by `list` / `dump`), not global — so it
+    //! MUST appear after the subcommand name in argv.
+    use super::*;
+
+    fn s(s: &str) -> String {
+        s.to_string()
+    }
+
+    #[test]
+    fn injects_workspace_toml_after_subcommand() {
+        let ws = std::path::Path::new("/ws/my.portagenty.toml");
+        let out = build_pconv_argv(&[s("list")], ws);
+        assert_eq!(
+            out,
+            vec![
+                s("list"),
+                s("--workspace-toml"),
+                s("/ws/my.portagenty.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn injects_before_caller_flags_but_after_subcommand() {
+        let ws = std::path::Path::new("/ws/my.portagenty.toml");
+        let out = build_pconv_argv(&[s("list"), s("--since"), s("7d")], ws);
+        assert_eq!(
+            out,
+            vec![
+                s("list"),
+                s("--workspace-toml"),
+                s("/ws/my.portagenty.toml"),
+                s("--since"),
+                s("7d"),
+            ]
+        );
+    }
+
+    #[test]
+    fn injects_after_subcommand_when_positional_id_follows() {
+        let ws = std::path::Path::new("/ws/my.portagenty.toml");
+        let out = build_pconv_argv(&[s("dump"), s("abc-session-id")], ws);
+        assert_eq!(
+            out,
+            vec![
+                s("dump"),
+                s("--workspace-toml"),
+                s("/ws/my.portagenty.toml"),
+                s("abc-session-id"),
+            ]
+        );
+    }
+
+    #[test]
+    fn respects_caller_supplied_workspace_toml_flag() {
+        let ws = std::path::Path::new("/ws/my.portagenty.toml");
+        let caller = vec![s("list"), s("--workspace-toml"), s("/other/path")];
+        let out = build_pconv_argv(&caller, ws);
+        assert_eq!(out, caller, "should pass through without duplicate");
+    }
+
+    #[test]
+    fn respects_caller_supplied_workspace_toml_equals_form() {
+        let ws = std::path::Path::new("/ws/my.portagenty.toml");
+        let caller = vec![s("list"), s("--workspace-toml=/other/path")];
+        let out = build_pconv_argv(&caller, ws);
+        assert_eq!(out, caller);
+    }
+
+    #[test]
+    fn skips_injection_when_no_subcommand() {
+        // `pa convos` bare, or `pa convos --help` — no positional.
+        // Let pconv surface its own help/error; don't force a flag
+        // into an empty or help-only call.
+        let ws = std::path::Path::new("/ws/my.portagenty.toml");
+        assert_eq!(build_pconv_argv(&[], ws), Vec::<String>::new());
+        let help = vec![s("--help")];
+        assert_eq!(build_pconv_argv(&help, ws), help);
+    }
+}
+
+#[cfg(test)]
+mod agent_hooks_tests {
+    use super::*;
+
+    #[test]
+    fn scaffold_writes_expected_files() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let report = scaffold_agent_hooks(tmp.path()).unwrap();
+        assert!(report.contains(".mcp.json"));
+        assert!(report.contains("portaconv.md"));
+        assert!(report.contains("portagenty-workspace.md"));
+        assert!(report.contains("convos.md"));
+
+        assert!(tmp.path().join(".mcp.json").is_file());
+        assert!(tmp.path().join(".claude/commands/convos.md").is_file());
+        assert!(tmp.path().join(".claude/skills/portaconv.md").is_file());
+        assert!(tmp
+            .path()
+            .join(".claude/skills/portagenty-workspace.md")
+            .is_file());
+
+        let mcp = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
+        assert!(mcp.contains(r#""pconv""#), "mcp.json should register pconv");
+        assert!(mcp.contains(r#""mcp""#));
+        assert!(mcp.contains(r#""serve""#));
+    }
+
+    #[test]
+    fn scaffold_does_not_overwrite_existing_files() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let mcp_path = tmp.path().join(".mcp.json");
+        std::fs::write(&mcp_path, r#"{"mcpServers":{"custom":{}}}"#).unwrap();
+        let report = scaffold_agent_hooks(tmp.path()).unwrap();
+        assert!(
+            report.contains(".mcp.json") && report.contains("skipped"),
+            "existing .mcp.json should be skipped: {report}"
+        );
+        let preserved = std::fs::read_to_string(&mcp_path).unwrap();
+        assert!(
+            preserved.contains("custom"),
+            "user's .mcp.json was overwritten: {preserved}"
+        );
+    }
+
+    #[test]
+    fn scaffold_creates_nested_dirs_when_absent() {
+        // Scaffold on a brand-new dir with no `.claude/` at all.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        assert!(!tmp.path().join(".claude").exists());
+        scaffold_agent_hooks(tmp.path()).unwrap();
+        assert!(tmp.path().join(".claude/commands").is_dir());
+        assert!(tmp.path().join(".claude/skills").is_dir());
+    }
 }
