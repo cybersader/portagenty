@@ -1,0 +1,211 @@
+---
+title: Portaconv integration
+description: How portagenty and portaconv fit together for folder-move recovery, WSL↔Windows bridging, and agent self-discovery.
+sidebar:
+  order: 10
+---
+
+import { Aside, Card, CardGrid, Steps, Tabs, TabItem } from "@astrojs/starlight/components";
+
+[**portaconv**](https://github.com/cybersader/portaconv) (binary
+`pconv`) is portagenty's **sister tool**. It's a terminal-native
+conversation extractor + MCP server for agent CLIs (Claude Code
+first, others later). Portagenty is the **launcher**; portaconv is
+the **bridge**.
+
+<CardGrid>
+  <Card title="Portagenty" icon="rocket">
+    Launches agent sessions. Cross-device takeover. Workspace files
+    with stable `id` and auto-maintained `previous_paths`.
+  </Card>
+  <Card title="Portaconv" icon="random">
+    Reads those agent sessions' conversation history (read-only),
+    emits paste-ready markdown, normalizes OS-specific paths baked
+    into content, exposes it all over MCP.
+  </Card>
+</CardGrid>
+
+## Why they're sister tools
+
+The workflow they split between them is:
+
+<div style="border: 2px solid var(--sl-color-gray-4); border-radius: 12px; padding: 1rem 1.25rem; margin: 1.5rem 0; background: var(--sl-color-gray-6);">
+  <div style="display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1rem; font-size: 0.9rem; align-items: start;">
+    <div style="font-weight: 600; color: var(--sl-color-accent);">pa</div>
+    <div>Launches a Claude Code session at <code>/path/to/project</code>. Records <code>id</code> and (eventually) <code>previous_paths</code> in the workspace TOML.</div>
+
+    <div style="font-weight: 600; color: var(--sl-color-blue);">Claude Code</div>
+    <div>Writes <code>~/.claude/projects/&lt;path-encoded-cwd&gt;/*.jsonl</code>. Conversation content references absolute paths (<code>/mnt/c/…</code> on WSL, <code>C:\…</code> on Windows).</div>
+
+    <div style="font-weight: 600; color: var(--sl-color-accent);">pa</div>
+    <div>User moves the folder. Walk-up on the next run re-registers, appends the old location to <code>previous_paths</code>.</div>
+
+    <div style="font-weight: 600; color: var(--sl-color-purple);">pconv</div>
+    <div>Reads storage scoped to <code>projects + previous_paths</code>. Finds the pre-move JSONLs. Emits paste-ready markdown with paths rewritten for the current host.</div>
+
+    <div style="font-weight: 600; color: var(--sl-color-accent);">pa</div>
+    <div><code>pa convos</code> shim forwards with <code>--workspace-toml</code> injected. <code>pa init --with-agent-hooks</code> scaffolds the MCP wiring so agents self-discover pconv.</div>
+  </div>
+</div>
+
+## The three integration points
+
+<Steps>
+
+1. **`previous_paths` auto-maintenance (config layer).**
+
+   Every workspace TOML gets a `id = "<uuid>"` field on `pa init` /
+   onboarding wizard / in-TUI scaffold. When walk-up runs on a
+   workspace whose `id` is already in the global registry at a
+   *different* canonical path (i.e. you `mv`'d the folder), `pa`
+   appends the *old directory* to a committed
+   `previous_paths = [...]` array in the TOML and drops the stale
+   registry entry.
+
+   The registry mirrors each workspace's `id` alongside its path,
+   so even the realistic move (old file deleted by `mv`) reconciles
+   correctly — there's evidence of the prior location in the
+   registry regardless of whether the old file survives on disk.
+
+   ```toml
+   name = "my-project"
+   id = "76452e59-6066-4628-a6e3-b69cbf45da20"
+   projects = ["."]
+   previous_paths = [
+     "/home/me/code/old-location",
+     "/home/me/code/even-older-location",
+   ]
+   ```
+
+   Portaconv reads `projects + previous_paths` for scope when
+   listing or dumping conversations — without this, the pre-move
+   session history keyed to `~/.claude/projects/<encoded-old-cwd>/`
+   is silently orphaned.
+
+2. **`pa convos` shim (CLI layer).**
+
+   Thin pass-through to `pconv` with `--workspace-toml <resolved>`
+   injected into the pconv subcommand argv. Any shape pconv supports
+   now or in the future works verbatim via `pa convos ...`:
+
+   ```sh
+   pa convos list                               # scoped to this workspace
+   pa convos list --since 7d                    # pconv flags pass through
+   pa convos dump <session-id>                  # paste-ready markdown
+   pa convos dump <session-id> --rewrite wsl-to-win
+   pa convos dump <session-id> --full-results   # un-truncate tool outputs
+   ```
+
+   Portagenty does NOT bundle pconv. When `pconv` isn't on PATH,
+   `pa convos` exits with a clear install hint
+   (`cargo install portaconv`) rather than silently becoming a
+   no-op.
+
+3. **`pa init --with-agent-hooks` (scaffold layer).**
+
+   Opt-in flag that writes four files next to the workspace TOML:
+
+   | File | Purpose |
+   |---|---|
+   | `.mcp.json` | Registers `pconv mcp serve` as an MCP server |
+   | `.claude/commands/convos.md` | Slash command that uses `pa convos` |
+   | `.claude/skills/portaconv.md` | Skill describing what portaconv is + when to reach for it |
+   | `.claude/skills/portagenty-workspace.md` | Skill describing the workspace TOML contract |
+
+   A Claude Code agent entering the workspace self-discovers both
+   tools from these files — no human needs to explain what pconv is
+   or which `rewrite` flag to use. **Idempotent**: re-running
+   against an already-scaffolded workspace leaves the TOML alone
+   and only writes missing hook files.
+
+</Steps>
+
+## Install portaconv
+
+portagenty doesn't bundle it — `pconv` is a separate crate with its
+own release cadence.
+
+<Tabs>
+  <TabItem label="With Rust installed">
+    ```sh
+    cargo install --git https://github.com/cybersader/portaconv
+    ```
+
+    Binary lands at `~/.cargo/bin/pconv`. `pa convos` picks it up
+    automatically on the next invocation.
+  </TabItem>
+  <TabItem label="From a local clone">
+    ```sh
+    git clone https://github.com/cybersader/portaconv ~/code/portaconv
+    cargo install --path ~/code/portaconv
+    ```
+
+    Useful if you're developing pconv alongside pa.
+  </TabItem>
+</Tabs>
+
+Verify:
+
+```sh
+pconv --version                 # confirms pconv is on PATH
+pa convos list                  # uses it, scoped to this workspace
+```
+
+## When you'd actually reach for it
+
+<CardGrid>
+  <Card title="Folder moved" icon="translate">
+    `mv ~/code/foo ~/archive/foo`. Claude Code can't `--continue`
+    the old sessions. `pa convos list` still sees them via
+    `previous_paths`. `pa convos dump <id>` gives you paste-ready
+    content for a fresh session.
+  </Card>
+  <Card title="WSL ↔ Windows switch" icon="comment">
+    WSL-authored conversation, Windows host trying to resume. The
+    baked-in `/mnt/c/…` paths will fail. `pa convos dump <id>
+    --rewrite wsl-to-win` rewrites them to `C:\…` before you paste.
+  </Card>
+  <Card title="Agent self-discovery" icon="rocket">
+    After `pa init --with-agent-hooks`, a Claude Code agent entering
+    the workspace can query conversation history via MCP without
+    the user explaining how. Skills file describes the contract.
+  </Card>
+  <Card title="Paste-ready handoff" icon="document">
+    Generic transcript export. `pa convos dump <id>` renders a
+    session as markdown suitable for pasting into another agent CLI
+    (OpenCode, Aider, continue.dev) or a different Claude model.
+  </Card>
+</CardGrid>
+
+## What portagenty explicitly does NOT do
+
+<Aside type="note">
+portagenty is a launcher. It does not read, write, or sync Claude
+Code's conversation storage itself. The `id` + `previous_paths`
+fields are anchors that downstream tools consume.
+</Aside>
+
+- No daemon, no file watching, no auto-sync.
+- No content rewriting — that's pconv's job.
+- No MCP server of its own — `pa convos` is a shim, not an MCP
+  provider.
+- No bundling of pconv — separate install path, separate release
+  cadence.
+
+The split keeps each tool's scope tight: portagenty knows about
+workspaces and sessions, portaconv knows about conversation
+storage and content normalization.
+
+## Relationship to other tools
+
+- **portaconv.** Direct sister. The workflow above.
+- **claudecode-project-sync** (in
+  [agentic-workflow-and-tech-stack](https://github.com/cybersader/agentic-workflow-and-tech-stack)).
+  Earlier sibling: a Python script that symlinks WSL and Windows
+  Claude project dirs. Superseded in practice by portaconv
+  (extraction handles the content-poisoning case; symlinks don't).
+  Kept for reference.
+- **Claude Code native project-id** (if it ships someday). Would
+  make `id` redundant for the cross-env case, but the `id` +
+  `previous_paths` anchors stay useful as a general workspace
+  identity handle for tooling that isn't Claude Code-specific.

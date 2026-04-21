@@ -61,6 +61,26 @@ Planned for v1.x. Until then, the `cargo install --git` one-liner is
 the recommended path — it builds locally against your exact platform
 and toolchain.
 
+## Install portaconv (recommended companion)
+
+[**portaconv**](https://github.com/cybersader/portaconv) (`pconv`) is
+portagenty's sister tool — a terminal-native extractor + MCP server
+for Claude Code conversation history. portagenty integrates with it
+via `pa convos` (scoped lookups) and `pa init --with-agent-hooks`
+(scaffolds an `.mcp.json` that registers `pconv mcp serve`).
+
+```sh
+cargo install --git https://github.com/cybersader/portaconv
+```
+
+Lands at `~/.cargo/bin/pconv`. Verify with `pconv --version`. See
+the [Portaconv integration](../../concepts/portaconv-integration/)
+concept page for the full workflow — folder-move recovery,
+WSL↔Windows path rewriting, agent self-discovery.
+
+`pa` works without `pconv` installed; the `pa convos` subcommand
+just errors with a clear install hint if you try to use it.
+
 ## Smoke-test your setup
 
 ```sh

@@ -321,9 +321,13 @@ manually re-register a workspace after moving its parent directory.
 ## Agent context persistence
 
 <Aside type="caution">
-This is a known limitation of path-based agent storage, not a
-portagenty bug. portagenty provides the stable `id` field as an
-anchor; the actual context bridging lives in external tools.
+Path-based agent storage has known limits — portagenty can't fix
+them in the launcher layer. It ships **stable anchors** (workspace
+`id` + `previous_paths`), and the sister tool
+[**portaconv**](https://github.com/cybersader/portaconv) (binary
+`pconv`) is the bridge that consumes them. See
+[Portaconv integration](../portaconv-integration/) for the full
+walkthrough.
 </Aside>
 
 Claude Code stores conversations at
@@ -331,19 +335,61 @@ Claude Code stores conversations at
 
 - **Folder moves** — move a project and the encoded path changes.
   `--continue` can't find old sessions.
-- **WSL vs Windows** — the same project gets different encoded paths
-  in each environment. Context is siloed.
+- **WSL vs Windows** — the same project gets different encoded
+  paths in each environment. Context is siloed.
+- **Content poisoning** — even when you bridge the storage dirs,
+  WSL-authored conversations have `/mnt/c/…` paths baked into the
+  content itself. A Windows Claude resuming that content hits
+  `Read` errors on the first path reference.
 
-portagenty helps by shipping a **stable `id` field** (UUIDv4) in
-every new workspace TOML. The ID is committed, survives git clone,
-and gives external tools a path-independent handle. The
-`claudecode-project-sync` tool (in the
-[agentic-workflow-and-tech-stack](https://github.com/cybersader/agentic-workflow-and-tech-stack)
-repo) uses symlinks to bridge WSL and Windows context directories.
+### What portagenty ships
+
+- **Stable `id` field** (UUIDv4) in every new workspace TOML.
+  Committed, survives git clone, gives external tools a
+  path-independent handle.
+- **`previous_paths` auto-maintenance.** When walk-up re-registers
+  a workspace at a new location (i.e. the folder was moved), `pa`
+  appends the *old directory* to the TOML's `previous_paths` list.
+  The trail of past locations travels with the repo.
+- **`pa convos` shim.** Forwards to `pconv` with the workspace's
+  TOML auto-injected, so lookups scope to this workspace's
+  projects + `previous_paths`.
+- **`pa init --with-agent-hooks`** scaffolds `.mcp.json` +
+  `.claude/skills/` so Claude Code agents self-discover portaconv
+  when they enter the workspace.
+
+### What portaconv does
+
+portaconv reads each agent CLI's conversation storage
+(Claude Code first) read-only and emits paste-ready markdown —
+optionally with WSL↔Windows path rewriting (`--rewrite wsl-to-win`
+/ `win-to-wsl`). Also ships as an MCP server (`pconv mcp serve`)
+so any MCP-aware agent can query past conversations directly.
+
+You don't try to resume in place. You extract what you said, paste
+it into a fresh session on whatever host is in front of you, and
+the new session picks up the thread — with the paths already
+rewritten to the new OS.
+
+```sh
+# List this workspace's Claude Code sessions (scoped via pa)
+pa convos list
+
+# Dump a specific session as paste-ready markdown
+pa convos dump <session-id>
+
+# Same, with WSL paths rewritten to Windows before pasting
+pa convos dump <session-id> --rewrite wsl-to-win
+```
+
+See the dedicated [Portaconv integration](../portaconv-integration/)
+concept page for the full move-recovery + paste-ready story, and
+`pa convos` / `pa init --with-agent-hooks` command reference for
+the surface.
 
 If Claude Code adds native project-ID or path-migration support,
-the `id` field becomes redundant for that use case but remains
-useful as a general workspace identity anchor.
+the `id` + `previous_paths` fields become redundant for that use
+case but remain useful as general workspace-identity anchors.
 
 ## Pre-launch banner
 

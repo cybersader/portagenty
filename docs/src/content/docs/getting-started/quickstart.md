@@ -113,6 +113,35 @@ Each launch writes an entry to
 machine-local and not committed anywhere. v1 tracks the data; the
 **Recent** view that displays it is a v1.x feature.
 
+## Conversation bridging — `pa convos`
+
+If you've installed [portaconv](../installation/#install-portaconv-recommended-companion)
+(`pconv`) alongside `pa`, you can query Claude Code's conversation
+history scoped to this workspace:
+
+```sh
+pa convos list                               # sessions in this workspace
+pa convos dump <session-id>                  # paste-ready markdown
+pa convos dump <session-id> --rewrite wsl-to-win
+```
+
+`pa convos` forwards to `pconv` with `--workspace-toml <path>`
+auto-injected, so the lookup only sees Claude sessions whose `cwd`
+falls under this workspace's `projects` (or its `previous_paths`,
+auto-maintained when folders move).
+
+For a Claude Code agent to self-discover this capability, scaffold
+the MCP + skill hooks when you `pa init`:
+
+```sh
+pa init --with-agent-hooks           # on a fresh workspace
+pa init --with-agent-hooks           # safe to re-run on an existing one
+                                     # (TOML untouched, only missing hooks written)
+```
+
+See [Portaconv integration](../../concepts/portaconv-integration/)
+for the full workflow.
+
 ## Per-project sessions
 
 A project can ship its own `portagenty.toml` at its root:

@@ -158,6 +158,16 @@ running; only the terminal attached to them changes.
     view. Expand/collapse directories, navigate with arrow keys or
     vim bindings, select a folder with Shift+Enter.
   </Card>
+  <Card title="Portaconv integration" icon="random">
+    Sister tool [portaconv](https://github.com/cybersader/portaconv)
+    extracts Claude Code conversation history, rewrites OS paths
+    baked into content, and exposes it over MCP. `pa convos list` /
+    `pa convos dump <id>` scope it to this workspace automatically
+    (including `previous_paths` from folder moves). `pa init
+    --with-agent-hooks` drops `.mcp.json` + `.claude/skills/` so
+    agents self-discover it. See
+    [Portaconv integration](/portagenty/concepts/portaconv-integration/).
+  </Card>
 </CardGrid>
 
 ## How it works
