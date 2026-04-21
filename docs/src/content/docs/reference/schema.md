@@ -28,6 +28,12 @@ multiplexer = "tmux"                          # or "zellij"
 # Optional — projects this workspace covers. Paths accept ~ and ${VAR}.
 projects = ["~/code/portagenty", "./cyberbase"]
 
+# Optional (auto-maintained) — historical locations the workspace
+# lived at before it was moved. pa auto-appends on walk-up
+# re-registration; external tools (portaconv) read this to bridge
+# state authored at the old path.
+previous_paths = ["/home/cybersader/code/old-location"]
+
 # Optional — session list. Name collisions resolve workspace-wins.
 [[session]]
 name = "claude"                               # required
@@ -62,6 +68,21 @@ with a clear "use tmux or zellij" message; see
 Paths to project roots. Resolved against the workspace file's
 directory for relative entries; `~` expands to `$HOME`; `${VAR}`
 expands to the env var.
+
+### `previous_paths`
+Historical on-disk locations this workspace lived at before. **You
+don't write this field by hand** — `pa` auto-appends to it when
+walk-up discovery finds the workspace's stable `id` previously
+registered at a different path (i.e. you moved the folder). The
+entries are parent directories, not workspace file paths, because
+external tools (portaconv) key conversation histories by the
+process `cwd`, not by the TOML file.
+
+The field uses `snake_case` on the wire — a deliberate break with
+portagenty's otherwise-kebab-case convention, so the contract with
+portaconv (and any other downstream tool reading this field) stays
+stable and agent-friendly. Safe to commit alongside `id` and
+`projects`.
 
 ### `[[session]]`
 Array-of-tables. Order is preserved and drives the default TUI

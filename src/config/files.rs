@@ -45,6 +45,13 @@ pub struct GlobalProjectEntry {
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalWorkspaceEntry {
     pub path: String,
+    /// Copy of the workspace TOML's `id` at registration time. Used
+    /// to detect folder moves even when the old file is gone — a
+    /// later registration of the same id at a different path means
+    /// the workspace moved, and reconcile appends the old location
+    /// to the workspace's `previous_paths`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// Any `*.portagenty.toml` with a non-empty prefix. The workspace
@@ -68,6 +75,21 @@ pub struct WorkspaceFile {
     /// merge time against the workspace file's own directory.
     #[serde(default)]
     pub projects: Vec<String>,
+
+    /// Historical on-disk locations this workspace has lived at
+    /// before. Auto-appended by `pa` when walk-up detects the
+    /// workspace's `id` was previously registered at a different
+    /// path (i.e. the folder was moved). Consumed by portaconv to
+    /// bridge to conversation histories that reference the old
+    /// cwd. Snake-case on the wire — this is the one field that
+    /// intentionally breaks with our kebab-case convention, so the
+    /// portaconv contract stays stable and agent-friendly.
+    #[serde(
+        default,
+        rename = "previous_paths",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub previous_paths: Vec<String>,
 
     #[serde(default, rename = "session")]
     pub sessions: Vec<RawSession>,

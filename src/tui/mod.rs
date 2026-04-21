@@ -100,9 +100,15 @@ pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
             // Auto-re-register: if walk-up found a workspace that
             // isn't in the global registry (e.g. the user moved the
             // folder), register it so the picker sees it next time.
+            // After registering, reconcile against prior registrations
+            // of the same `id` — a different-path match means the
+            // folder moved, and we record the old location in the
+            // workspace TOML's `previous_paths` so external tools
+            // (portaconv) can bridge to pre-move conversation state.
             if let Some(ref w) = loaded {
                 if let Some(ref path) = w.file_path {
                     let _ = crate::config::register_global_workspace(path);
+                    let _ = crate::config::reconcile_previous_paths_on_reregister(path);
                 }
             }
             loaded
@@ -189,9 +195,7 @@ enum PickResult {
 
 /// Run the workspace picker and return the user's choice.
 /// `Err` only for unexpected IO errors.
-fn show_picker(
-    terminal: &mut ratatui::DefaultTerminal,
-) -> Result<PickResult> {
+fn show_picker(terminal: &mut ratatui::DefaultTerminal) -> Result<PickResult> {
     let mut registered = crate::config::list_registered_workspaces().unwrap_or_default();
     // Recency sort: workspaces with a recorded launch come first,
     // most-recent at the top; workspaces never launched fall to the

@@ -204,6 +204,7 @@ mod tests {
             id: None,
             multiplexer: None,
             projects: vec!["/p".into()],
+            previous_paths: vec![],
             sessions: vec![session("s1", "/abs", "echo 1")],
         };
         let per_project = PerProjectFiles::new();
@@ -224,6 +225,7 @@ mod tests {
             id: None,
             multiplexer: None,
             projects: vec!["/p".into()],
+            previous_paths: vec![],
             sessions: vec![session("shared", "/abs", "workspace-version")],
         };
         let mut per_project = PerProjectFiles::new();
@@ -254,6 +256,7 @@ mod tests {
             id: None,
             multiplexer: None,
             projects: vec![],
+            previous_paths: vec![],
             sessions: vec![],
         };
 
@@ -293,6 +296,7 @@ mod tests {
             id: None,
             multiplexer: None,
             projects: vec!["/real/project".into()],
+            previous_paths: vec![],
             sessions: vec![],
         };
         let mut per_project = PerProjectFiles::new();

@@ -309,6 +309,19 @@ The net effect: a TUI that feels generous on a desktop but remains one-handed-on
   migration, and gives external tools a path-independent handle to
   track a workspace across folder moves and environments.
 
+- **`previous_paths` auto-maintenance.** When walk-up re-registers
+  a workspace at a new on-disk location (i.e. the folder was moved),
+  pa detects the move via a registry-mirrored copy of the
+  workspace's `id` and appends the *old directory* to a
+  `previous_paths = [...]` array in the workspace TOML. Stored as
+  a committed list, not machine-local state, so the trail of prior
+  locations travels with the repo. External tools consume it to
+  bridge state (conversation histories, caches) authored when the
+  project lived at an earlier path. The field uses `snake_case` on
+  the wire — a deliberate break with portagenty's kebab-case
+  convention — so the contract with downstream readers stays
+  stable.
+
 - **Workspace files are designed to commit** and use relative paths
   (§2, §3). They cross environments trivially via git.
 
@@ -317,25 +330,50 @@ The net effect: a TUI that feels generous on a desktop but remains one-handed-on
   (Syncthing, dotfiles repo, symlink into a shared mount).
   portagenty does not ship a sync daemon.
 
+- **Agent-hook scaffolding (`pa init --with-agent-hooks`).** Opt-in
+  flag that writes `.mcp.json` + `.claude/commands/` +
+  `.claude/skills/` alongside the workspace TOML so a Claude Code
+  agent entering the workspace self-discovers the portaconv
+  integration + the workspace's structural contract. Idempotent;
+  safe to re-run on an already-scaffolded workspace to retrofit
+  hooks without touching the TOML.
+
+- **`pa convos` shim.** Workspace-aware pass-through to `pconv`
+  (portaconv, below). Injects `--workspace-toml <path>` into the
+  pconv subcommand argv so lookups scope to this workspace's
+  history (plus its `previous_paths`). Portagenty does not bundle
+  pconv — missing binary is a clear install hint, not a silent
+  no-op.
+
 ### What portagenty does NOT do
 
 portagenty does not read, write, or sync Claude Code's conversation
-storage. The `id` field is a stable anchor that external tools can
-use; the actual context bridging (symlinks, copies, or future Claude
-Code-native solutions) belongs outside the launcher.
+storage. The `id` + `previous_paths` fields are stable anchors that
+external tools (portaconv) consume; portagenty itself stays a
+launcher.
 
 ### External tools
 
+- **portaconv (`pconv`).** Sibling crate; terminal-native
+  conversation extractor + MCP server. Reads Claude Code's JSONL
+  storage read-only and emits paste-ready markdown (optionally
+  with WSL ↔ Windows path rewriting). Scopes by `projects +
+  previous_paths` from the portagenty workspace TOML. The
+  `pa convos` shim forwards to it; `pa init --with-agent-hooks`
+  writes an `.mcp.json` that registers pconv as an MCP server for
+  Claude Code. See <https://github.com/cybersader/portaconv>.
+
 - **`claudecode-project-sync`** (in `agentic-workflow-and-tech-stack`
-  repo, `tools/claudecode-project-sync/`). A ~270-line Python script
-  that creates symlinks between WSL-encoded and Windows-encoded
-  Claude project dirs. Handles cross-environment context sharing.
-  Does not yet handle folder moves — the workspace `id` field makes
-  that possible in a future version.
+  repo, `tools/claudecode-project-sync/`). Earlier sibling: a
+  ~270-line Python script that creates symlinks between WSL-encoded
+  and Windows-encoded Claude project dirs. Superseded in practice
+  by portaconv (extraction > sync for the content-poisoning case,
+  per the portaconv README). Kept for now; a deprecation banner is
+  on the backlog.
 
 - If Claude Code adds native project-ID or path-migration support,
-  the `id` field becomes redundant for that use case but remains
-  useful as a general workspace identity anchor.
+  the `id` + `previous_paths` fields become redundant for that use
+  case but remain useful as general workspace-identity anchors.
 
 ## 12. Entry-point behavior — what `pa` does from any directory
 
