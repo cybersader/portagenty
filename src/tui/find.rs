@@ -102,11 +102,7 @@ impl TreeBrowseState {
         // Reject anything that'd escape the current root (path
         // separators, `..`). Forces the user to drill into nested
         // creations intentionally instead of sneaking them in.
-        if trimmed.contains('/')
-            || trimmed.contains('\\')
-            || trimmed == "."
-            || trimmed == ".."
-        {
+        if trimmed.contains('/') || trimmed.contains('\\') || trimmed == "." || trimmed == ".." {
             return Err("folder name can't contain / or \\".into());
         }
         let new_path = self.root.join(trimmed);
@@ -120,11 +116,7 @@ impl TreeBrowseState {
         self.load_children(&self.root.clone());
         self.rebuild_rows();
         // Select the newly-created folder.
-        if let Some(idx) = self
-            .rows
-            .iter()
-            .position(|r| r.path == new_path)
-        {
+        if let Some(idx) = self.rows.iter().position(|r| r.path == new_path) {
             self.selected = idx;
             self.list_state.select(Some(idx));
         }
@@ -277,7 +269,10 @@ impl TreeBrowseState {
         let new_root = if row.is_dir {
             row.path.clone()
         } else {
-            row.path.parent().map(|p| p.to_path_buf()).unwrap_or(row.path.clone())
+            row.path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(row.path.clone())
         };
         if new_root != self.root {
             self.root = new_root;
@@ -286,11 +281,8 @@ impl TreeBrowseState {
             self.load_children(&self.root.clone());
             self.rebuild_rows();
             self.selected = 0;
-            self.list_state.select(if self.rows.is_empty() {
-                None
-            } else {
-                Some(0)
-            });
+            self.list_state
+                .select(if self.rows.is_empty() { None } else { Some(0) });
         }
     }
 
@@ -307,11 +299,8 @@ impl TreeBrowseState {
                 self.load_children(&self.root.clone());
                 self.rebuild_rows();
                 self.selected = 0;
-                self.list_state.select(if self.rows.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
+                self.list_state
+                    .select(if self.rows.is_empty() { None } else { Some(0) });
             }
         }
     }
@@ -402,7 +391,10 @@ pub fn handle_tree_key(
                 let dir = if row.path.is_dir() {
                     row.path.clone()
                 } else {
-                    row.path.parent().map(|p| p.to_path_buf()).unwrap_or(row.path.clone())
+                    row.path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or(row.path.clone())
                 };
                 return SearchOutcome::SearchFromHere(dir);
             }
@@ -412,22 +404,26 @@ pub fn handle_tree_key(
         // the highlighted folder (or tree root if nothing is selected
         // or highlighted is a file).
         (KeyCode::Char('o'), _) => {
-            let dir = state.selected_row().map(|r| {
-                if r.path.is_dir() {
-                    r.path.clone()
-                } else {
-                    r.path.parent().map(|p| p.to_path_buf()).unwrap_or(r.path.clone())
-                }
-            }).unwrap_or_else(|| state.root.clone());
+            let dir = state
+                .selected_row()
+                .map(|r| {
+                    if r.path.is_dir() {
+                        r.path.clone()
+                    } else {
+                        r.path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or(r.path.clone())
+                    }
+                })
+                .unwrap_or_else(|| state.root.clone());
             SearchOutcome::OpenShellAt(dir)
         }
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::Cancel,
         // Ctrl+T in tree mode → toggle back to search mode (same as
         // Esc, but symmetrical with Ctrl+T entering tree mode from
         // search).
-        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
-            SearchOutcome::BackToSearch
-        }
+        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::BackToSearch,
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
             state.move_selection(1);
             SearchOutcome::Continue
@@ -638,10 +634,7 @@ fn render_new_folder_modal(
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(
-                err.to_string(),
-                Style::default().fg(Color::Red),
-            ),
+            Span::styled(err.to_string(), Style::default().fg(Color::Red)),
         ]));
     }
 
@@ -879,10 +872,7 @@ impl SearchState {
         // Stash the currently highlighted path so we can restore the
         // selection after rebuilding the candidate list. Without this,
         // every background-walker batch resets the cursor to index 0.
-        let prev_selected_path = self
-            .candidates
-            .get(self.selected)
-            .map(|c| c.path.clone());
+        let prev_selected_path = self.candidates.get(self.selected).map(|c| c.path.clone());
 
         let trimmed = self.input.trim();
         if trimmed.is_empty() {
@@ -1075,7 +1065,12 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             while state.input.ends_with(' ') {
                 state.input.pop();
             }
-            while state.input.chars().last().is_some_and(|c| !c.is_whitespace()) {
+            while state
+                .input
+                .chars()
+                .last()
+                .is_some_and(|c| !c.is_whitespace())
+            {
                 state.input.pop();
             }
             state.rerank();
@@ -1168,8 +1163,7 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             let trimmed = state.input.trim();
             let root = if trimmed.starts_with('/') || trimmed.starts_with("~/") {
                 let abs = crate::find::expand_tilde(trimmed);
-                crate::find::first_existing_ancestor(&abs)
-                    .unwrap_or_else(|| PathBuf::from("/"))
+                crate::find::first_existing_ancestor(&abs).unwrap_or_else(|| PathBuf::from("/"))
             } else if state.global_mode {
                 let mnt = PathBuf::from("/mnt");
                 if crate::find::is_wsl() && mnt.is_dir() {
@@ -1347,12 +1341,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
         }
     };
     let bc_label = format!("{mode_tag} · {}", state.backends.one_liner());
-    let breadcrumb = render_marquee_breadcrumb(
-        &bc_roots,
-        inner_w,
-        &bc_label,
-        state.anim_offset,
-    );
+    let breadcrumb = render_marquee_breadcrumb(&bc_roots, inner_w, &bc_label, state.anim_offset);
     frame.render_widget(Paragraph::new(breadcrumb), chunks[0]);
 
     // Input line: prompt char + user text + caret (block style).
@@ -2132,11 +2121,7 @@ mod tree_tests {
         handle_tree_key(&mut tree, KeyCode::Enter, KeyModifiers::NONE);
 
         assert!(tree.last_error.is_some());
-        assert!(tree
-            .last_error
-            .as_ref()
-            .unwrap()
-            .contains("already exists"));
+        assert!(tree.last_error.as_ref().unwrap().contains("already exists"));
     }
 
     #[test]
@@ -2226,9 +2211,8 @@ mod tree_tests {
         // new-folder name input.
         let tmp = assert_fs::TempDir::new().unwrap();
         let mut state = super::SearchState::default();
-        state.mode = super::FindMode::Tree(Box::new(TreeBrowseState::new(
-            tmp.path().to_path_buf(),
-        )));
+        state.mode =
+            super::FindMode::Tree(Box::new(TreeBrowseState::new(tmp.path().to_path_buf())));
         // Enter the new-folder modal.
         let _ = super::handle_key(&mut state, KeyCode::Char('n'), KeyModifiers::NONE);
         // Type "test".

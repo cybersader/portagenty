@@ -36,7 +36,10 @@ pub enum ProtocolAction {
     /// Look up a workspace by UUID in the global registry and open it.
     WorkspaceById(String),
     /// Launch a specific session in a workspace (by UUID).
-    LaunchSession { workspace_id: String, session: String },
+    LaunchSession {
+        workspace_id: String,
+        session: String,
+    },
 }
 
 /// Parse a `pa://...` URL into a structured action. Accepts raw URLs
@@ -65,8 +68,8 @@ pub fn parse(url: &str) -> Result<ProtocolAction> {
         "launch" => {
             let (id, session) = split_once(payload);
             let id = trim_trailing_slash(id);
-            let session = percent_decode(trim_trailing_slash(session))
-                .context("decoding session name")?;
+            let session =
+                percent_decode(trim_trailing_slash(session)).context("decoding session name")?;
             if id.is_empty() || session.is_empty() {
                 return Err(anyhow!(
                     "pa://launch/<workspace-id>/<session-name> requires both"

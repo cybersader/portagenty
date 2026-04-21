@@ -218,12 +218,10 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                     KeyCode::Esc => {
                         status.set("rename cancelled".into());
                     }
-                    KeyCode::Enter => {
-                        match crate::workspace_edit::set_name(&path, &input) {
-                            Ok(_) => status.set(format!("renamed to {input:?}")),
-                            Err(e) => status.set(format!("rename failed: {e:#}")),
-                        }
-                    }
+                    KeyCode::Enter => match crate::workspace_edit::set_name(&path, &input) {
+                        Ok(_) => status.set(format!("renamed to {input:?}")),
+                        Err(e) => status.set(format!("rename failed: {e:#}")),
+                    },
                     KeyCode::Backspace => {
                         input.pop();
                         pending = Some(PickerPending::Rename { path, input });
@@ -625,9 +623,7 @@ fn compute_live_counts(workspaces: &[PathBuf]) -> std::collections::HashMap<Path
     for mpx in unique_mpxs {
         let mux: Option<Box<dyn crate::mux::Multiplexer>> = match mpx {
             crate::domain::Multiplexer::Tmux => Some(Box::new(crate::mux::TmuxAdapter::new())),
-            crate::domain::Multiplexer::Zellij => {
-                Some(Box::new(crate::mux::ZellijAdapter::new()))
-            }
+            crate::domain::Multiplexer::Zellij => Some(Box::new(crate::mux::ZellijAdapter::new())),
             crate::domain::Multiplexer::Wezterm => None,
         };
         if let Some(m) = mux {
@@ -1003,7 +999,6 @@ fn compact_path(p: &str) -> String {
     }
     p.to_string()
 }
-
 
 /// Centered input modal for renaming a workspace. Mirrors the
 /// confirm-modal layout but with a text input line instead of a y/N

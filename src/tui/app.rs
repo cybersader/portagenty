@@ -314,9 +314,7 @@ impl App {
     /// Open the file-tree browser rooted at the workspace's dir.
     /// Triggered by `t` in the session list.
     fn open_file_tree(&mut self) {
-        self.browsing = Some(crate::tui::find::SearchState::tree_at(
-            self.workspace_dir(),
-        ));
+        self.browsing = Some(crate::tui::find::SearchState::tree_at(self.workspace_dir()));
     }
 
     /// The currently-selected row, if any. Exposed so the outer entry
@@ -402,13 +400,7 @@ impl App {
                             (cmd_trimmed, None)
                         };
                     if let Some(ws_path) = self.workspace.file_path.clone() {
-                        match crate::cli::add(
-                            st.name.trim(),
-                            command,
-                            None,
-                            kind,
-                            Some(&ws_path),
-                        ) {
+                        match crate::cli::add(st.name.trim(), command, None, kind, Some(&ws_path)) {
                             Ok(()) => {
                                 let name = st.name.clone();
                                 let note = if cmd_trimmed.is_empty() {
@@ -1496,12 +1488,17 @@ fn render_add_session_modal(frame: &mut Frame<'_>, area: Rect, st: &AddSessionSt
     let cmd_empty = st.stage == AddStage::Command && st.command.is_empty();
     let cmd_placeholder = Span::styled(
         "(empty → plain shell)",
-        Style::default().add_modifier(Modifier::DIM).fg(Color::DarkGray),
+        Style::default()
+            .add_modifier(Modifier::DIM)
+            .fg(Color::DarkGray),
     );
     let mut lines = vec![
         Line::from(vec![
             Span::styled("  name:    ", name_style),
-            Span::styled(st.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                st.name.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             if st.stage == AddStage::Name {
                 caret.clone()
             } else {
@@ -1511,7 +1508,10 @@ fn render_add_session_modal(frame: &mut Frame<'_>, area: Rect, st: &AddSessionSt
         Line::from(""),
         Line::from(vec![
             Span::styled("  command: ", cmd_style),
-            Span::styled(st.command.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                st.command.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             if cmd_empty {
                 cmd_placeholder
             } else {
@@ -2415,7 +2415,10 @@ mod tests {
         assert_eq!(app.adding_session.as_ref().unwrap().name, "dev");
         // Enter advances to command stage.
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.adding_session.as_ref().unwrap().stage, AddStage::Command);
+        assert_eq!(
+            app.adding_session.as_ref().unwrap().stage,
+            AddStage::Command
+        );
         for ch in ['b', 'u', 'n'] {
             app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
         }
@@ -2439,7 +2442,10 @@ mod tests {
         app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
-        assert_eq!(app.adding_session.as_ref().unwrap().stage, AddStage::Command);
+        assert_eq!(
+            app.adding_session.as_ref().unwrap().stage,
+            AddStage::Command
+        );
     }
 
     #[test]

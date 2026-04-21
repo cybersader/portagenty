@@ -182,12 +182,10 @@ pub fn status() -> Result<String> {
     match effective_os() {
         "linux" => status_linux(),
         "windows" => status_windows(),
-        "macos" => Ok(
-            "macOS status check isn't automated yet — check\n  \
+        "macos" => Ok("macOS status check isn't automated yet — check\n  \
              defaults read com.apple.LaunchServices/com.apple.launchservices.secure \
              LSHandlers | grep pa"
-                .into(),
-        ),
+            .into()),
         other => Err(anyhow!("unsupported OS: {other}")),
     }
 }
@@ -197,8 +195,8 @@ fn status_linux() -> Result<String> {
     if !path.exists() {
         return Ok(format!("not installed (no file at {})", path.display()));
     }
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let exec = body
         .lines()
         .find_map(|l| l.strip_prefix("Exec="))
@@ -320,11 +318,7 @@ fn install_linux(term: &Terminal, pa_binary: &Path) -> Result<String> {
     // Failures here aren't fatal — the .desktop file itself is
     // sufficient; `update-desktop-database` etc. are just caches.
     let _ = std::process::Command::new("xdg-mime")
-        .args([
-            "default",
-            "portagenty.desktop",
-            "x-scheme-handler/pa",
-        ])
+        .args(["default", "portagenty.desktop", "x-scheme-handler/pa"])
         .status();
     Ok(path.display().to_string())
 }
@@ -332,8 +326,7 @@ fn install_linux(term: &Terminal, pa_binary: &Path) -> Result<String> {
 fn uninstall_linux() -> Result<String> {
     let path = linux_desktop_path()?;
     if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("removing {}", path.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         Ok(path.display().to_string())
     } else {
         Ok(format!("(nothing to remove at {})", path.display()))
@@ -381,25 +374,46 @@ fn install_windows(term: &Terminal, pa_binary: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("reg.exe not found on PATH (are you on Windows/WSL?)"))?;
 
     // Root scheme key.
-    run(&reg, &[
-        "add", "HKCU\\Software\\Classes\\pa", "/ve",
-        "/d", "URL:portagenty", "/f",
-    ])?;
-    run(&reg, &[
-        "add", "HKCU\\Software\\Classes\\pa",
-        "/v", "URL Protocol", "/d", "", "/f",
-    ])?;
+    run(
+        &reg,
+        &[
+            "add",
+            "HKCU\\Software\\Classes\\pa",
+            "/ve",
+            "/d",
+            "URL:portagenty",
+            "/f",
+        ],
+    )?;
+    run(
+        &reg,
+        &[
+            "add",
+            "HKCU\\Software\\Classes\\pa",
+            "/v",
+            "URL Protocol",
+            "/d",
+            "",
+            "/f",
+        ],
+    )?;
     // shell/open/command value.
-    run(&reg, &[
-        "add", "HKCU\\Software\\Classes\\pa\\shell\\open\\command", "/ve",
-        "/d", &quoted, "/f",
-    ])?;
+    run(
+        &reg,
+        &[
+            "add",
+            "HKCU\\Software\\Classes\\pa\\shell\\open\\command",
+            "/ve",
+            "/d",
+            &quoted,
+            "/f",
+        ],
+    )?;
     Ok("HKCU\\Software\\Classes\\pa".into())
 }
 
 fn uninstall_windows() -> Result<String> {
-    let reg = find_reg_exe()
-        .ok_or_else(|| anyhow!("reg.exe not found on PATH"))?;
+    let reg = find_reg_exe().ok_or_else(|| anyhow!("reg.exe not found on PATH"))?;
     let status = std::process::Command::new(&reg)
         .args(["delete", "HKCU\\Software\\Classes\\pa", "/f"])
         .status()
@@ -736,7 +750,11 @@ pub fn custom_terminal(name_or_path: &str) -> Option<Terminal> {
     Some(Terminal {
         name: format!("custom: {name_or_path}"),
         binary,
-        platform: if looks_windows { "windows" } else { std::env::consts::OS },
+        platform: if looks_windows {
+            "windows"
+        } else {
+            std::env::consts::OS
+        },
         args_template: vec!["-e".into(), "{cmd}".into()],
         split_args: true,
     })
@@ -837,7 +855,7 @@ mod tests {
         assert_eq!(argv[1], "/c");
         assert_eq!(argv[2], "start");
         assert_eq!(argv[3], ""); // empty title arg to `start`
-        // {cmd} expanded to `pa open %1` (shell-quoted).
+                                 // {cmd} expanded to `pa open %1` (shell-quoted).
         assert!(argv[4].contains("pa"));
         assert!(argv[4].contains("open"));
         assert!(argv[4].contains("%1"));
