@@ -21,14 +21,14 @@ name = "portagenty"
 path = "src/lib.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
-clap = { version = "4.5", features = ["derive"] }
+ratatui = "0.30"
+crossterm = "0.29"
+clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.5"
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-toml_edit = "0.22"
-directories = "5.0"
+toml = "1.1"
+toml_edit = "0.25"
+directories = "6.0"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
@@ -42,9 +42,9 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 insta = "1.41"
-rstest = "0.23"
-mockall = "0.13"
-assert_cmd = "2.0"
+rstest = "0.26"
+mockall = "0.14"
+assert_cmd = "2.2"
 predicates = "3.1"
 assert_fs = "1.1"
 serial_test = "3.2"
