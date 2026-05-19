@@ -180,6 +180,19 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                     help_open = true;
                 }
                 SearchOutcome::OpenExisting(path) => {
+                    // Picking an existing-but-unregistered workspace
+                    // via `n` should register it on the way out, so
+                    // it shows up in the picker list next time
+                    // without the user having to walk-up + re-enter.
+                    // Mirrors the auto-re-register hook in
+                    // `tui::run`: register, then reconcile any
+                    // previous_paths owed (e.g. the same id was
+                    // previously registered at a different path —
+                    // i.e. a folder move + manual re-pick via find).
+                    // Best-effort: a registry-write failure must not
+                    // block opening the workspace.
+                    let _ = crate::config::register_global_workspace(&path);
+                    let _ = crate::config::reconcile_previous_paths_on_reregister(&path);
                     return Ok(PickerOutcome::Workspace(path));
                 }
                 SearchOutcome::ScaffoldAt(path) => {
