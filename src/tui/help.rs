@@ -115,6 +115,10 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("d", "unregister from global index (file stays)"));
             lines.push(row("D", "delete workspace file (destructive)"));
             lines.push(row(
+                "X",
+                "kill ALL live sessions under this workspace (destructive — confirms first)",
+            ));
+            lines.push(row(
                 "r",
                 "reveal: show file path + option to open a shell there",
             ));

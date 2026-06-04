@@ -8,7 +8,7 @@
 //! vs sessions) so folding them into one widget would mean more
 //! conditionals than code. Keeping them separate is easier to read.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -60,6 +60,23 @@ impl StatusLine {
     }
 }
 
+/// One target of a mass-kill operation: the mpx session name to
+/// kill, plus whether it was declared in the workspace TOML
+/// (`tracked`) or only discovered live in the multiplexer
+/// (`untracked` — leaked from outside `pa` but still under the
+/// workspace's prefix). Surfaced in the confirm prompt so the user
+/// sees exactly what dies.
+#[derive(Debug, Clone)]
+struct KillTarget {
+    /// Multiplexer session name (post-`workspace_session_name`).
+    mpx_name: String,
+    /// Display label — the declared TOML session name for tracked
+    /// entries, or the bare mpx name (minus workspace prefix when
+    /// known) for untracked. Used only in the confirm prompt.
+    display: String,
+    tracked: bool,
+}
+
 /// Destructive action awaiting user confirmation in the picker.
 #[derive(Debug, Clone)]
 enum PickerPending {
@@ -77,6 +94,17 @@ enum PickerPending {
     /// Rename the workspace's display name. Holds the file path and
     /// the user's in-progress input. Enter commits, Esc cancels.
     Rename { path: PathBuf, input: String },
+    /// Kill every live mpx session belonging to this workspace.
+    /// Triggered by `X` in the picker. Holds the workspace's display
+    /// name (for the prompt title), the resolved multiplexer (to
+    /// dispatch kill calls), and the list of targets — pre-computed
+    /// at key-press time so the confirm prompt names exactly what's
+    /// about to die.
+    KillAllSessions {
+        ws_display_name: String,
+        mpx: crate::domain::Multiplexer,
+        targets: Vec<KillTarget>,
+    },
 }
 
 /// Sticky info modal contents. Distinct from `PickerPending` because
@@ -290,8 +318,18 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                             }
                         }
                     } else {
+                        // Re-probe live counts after a kill so the
+                        // badge column reflects reality without
+                        // waiting for Ctrl+R. Other actions don't
+                        // touch live mpx state, so spare them the
+                        // probe cost (~100ms per distinct mpx).
+                        let was_kill =
+                            matches!(action, PickerPending::KillAllSessions { .. });
                         let msg = perform_picker_action(action, &mut workspaces, &mut state);
                         status.set(msg);
+                        if was_kill {
+                            live_counts = compute_live_counts(&workspaces);
+                        }
                     }
                 }
                 crate::tui::confirm::ConfirmKey::Cancel => {
@@ -382,6 +420,38 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                     pending = Some(PickerPending::DeleteFile(path));
                 } else {
                     status.set("D: nothing to delete — live-sessions row isn't a workspace".into());
+                }
+            }
+            // X: kill every live mpx session under the highlighted
+            // workspace. Capital — mirrors `D` for delete-file: both
+            // destructive sweeps, both gated by an explicit y/N
+            // confirm that names exactly what's about to die. Zero
+            // live sessions short-circuits to a status message, no
+            // confirm needed (nothing to confirm).
+            (KeyCode::Char('X'), _) => {
+                let Some(path) = selected_workspace(&workspaces, &state) else {
+                    status.set(
+                        "X: live-sessions row has no workspace — \
+                         use `x` from inside the session list for ad-hoc kills".into(),
+                    );
+                    continue;
+                };
+                match enumerate_kill_targets(&path) {
+                    Ok((ws_display_name, mpx, targets)) => {
+                        if targets.is_empty() {
+                            status.set(format!(
+                                "X: no live sessions under {ws_display_name:?} to kill"
+                            ));
+                        } else {
+                            let _ = path; // path was only used to load the workspace above
+                            pending = Some(PickerPending::KillAllSessions {
+                                ws_display_name,
+                                mpx,
+                                targets,
+                            });
+                        }
+                    }
+                    Err(e) => status.set(format!("X: couldn't read workspace: {e:#}")),
                 }
             }
             (KeyCode::Char('r'), _) => {
@@ -565,6 +635,11 @@ fn perform_picker_action(
                 Err(e) => format!("delete failed: {e}"),
             }
         }
+        PickerPending::KillAllSessions {
+            ws_display_name,
+            mpx,
+            targets,
+        } => perform_kill_all_sessions(&ws_display_name, mpx, &targets),
         // ScaffoldAt is handled inline in the run loop because on
         // success we exit the picker entirely, returning the new
         // workspace as the outcome. Reaching this arm is a bug.
@@ -572,6 +647,113 @@ fn perform_picker_action(
         // Rename has its own input-divert flow in the main loop, so
         // this arm is also unreachable in practice.
         PickerPending::Rename { .. } => "rename path took the wrong branch (bug)".into(),
+    }
+}
+
+/// Resolve a workspace + probe its mpx for live sessions, returning
+/// the kill list with tracked / untracked labels. Tracked = declared
+/// in TOML AND live in mpx. Untracked = live in mpx, prefixed with
+/// the workspace's sanitized name, but NOT in the declared set —
+/// i.e. leaked from outside `pa` but logically under this workspace.
+/// Mirrors the session-list TUI's "show both kinds" semantics so the
+/// kill verb covers the same surface the eye sees.
+fn enumerate_kill_targets(
+    path: &Path,
+) -> anyhow::Result<(String, crate::domain::Multiplexer, Vec<KillTarget>)> {
+    let ws = crate::config::load(&crate::config::LoadOptions {
+        workspace_path: Some(path.to_path_buf()),
+        ..Default::default()
+    })?;
+    let ws_name = ws.name.clone();
+    let mpx = ws.multiplexer;
+    let declared_names: Vec<String> = ws.sessions.iter().map(|s| s.name.clone()).collect();
+
+    let mux: Option<Box<dyn crate::mux::Multiplexer>> = match mpx {
+        crate::domain::Multiplexer::Tmux => Some(Box::new(crate::mux::TmuxAdapter::new())),
+        crate::domain::Multiplexer::Zellij => Some(Box::new(crate::mux::ZellijAdapter::new())),
+        crate::domain::Multiplexer::Wezterm => None,
+    };
+    let Some(mux) = mux else {
+        return Ok((ws_name, mpx, vec![]));
+    };
+    let live: std::collections::HashSet<String> = match mux.list_sessions() {
+        Ok(rows) => rows.into_iter().map(|s| s.name).collect(),
+        Err(_) => return Ok((ws_name, mpx, vec![])),
+    };
+
+    let mut targets: Vec<KillTarget> = Vec::new();
+    let mut tracked_mpx: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sn in &declared_names {
+        let mpx_name = crate::mux::workspace_session_name(&ws_name, sn);
+        if live.contains(&mpx_name) {
+            targets.push(KillTarget {
+                mpx_name: mpx_name.clone(),
+                display: sn.clone(),
+                tracked: true,
+            });
+            tracked_mpx.insert(mpx_name);
+        }
+    }
+    let prefix = format!(
+        "{}-",
+        crate::mux::workspace_session_name(&ws_name, "").trim_end_matches('-')
+    );
+    for live_name in &live {
+        if tracked_mpx.contains(live_name) {
+            continue;
+        }
+        if live_name.starts_with(&prefix) {
+            let display = live_name
+                .strip_prefix(&prefix)
+                .unwrap_or(live_name)
+                .to_string();
+            targets.push(KillTarget {
+                mpx_name: live_name.clone(),
+                display,
+                tracked: false,
+            });
+        }
+    }
+    Ok((ws_name, mpx, targets))
+}
+
+/// Iterate the kill list, invoking the right mpx adapter for each.
+/// Best-effort: per-target failures append to an error tally but
+/// don't abort the sweep. Returns the human-readable status line.
+fn perform_kill_all_sessions(
+    ws_display_name: &str,
+    mpx: crate::domain::Multiplexer,
+    targets: &[KillTarget],
+) -> String {
+    let mux: Option<Box<dyn crate::mux::Multiplexer>> = match mpx {
+        crate::domain::Multiplexer::Tmux => Some(Box::new(crate::mux::TmuxAdapter::new())),
+        crate::domain::Multiplexer::Zellij => Some(Box::new(crate::mux::ZellijAdapter::new())),
+        crate::domain::Multiplexer::Wezterm => None,
+    };
+    let Some(mux) = mux else {
+        return format!(
+            "X: workspace {ws_display_name:?} mpx isn't supported — nothing killed"
+        );
+    };
+    let mut killed = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for t in targets {
+        match mux.kill(&t.mpx_name) {
+            Ok(()) => killed += 1,
+            Err(e) => failed.push(format!("{}: {e}", t.display)),
+        }
+    }
+    if failed.is_empty() {
+        format!(
+            "killed {killed} live session{} under {ws_display_name:?}",
+            if killed == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "killed {killed} of {} under {ws_display_name:?}; failed: {}",
+            targets.len(),
+            failed.join(", ")
+        )
     }
 }
 
@@ -889,6 +1071,13 @@ fn render(
                 ),
                 Span::styled("delete  ", Style::default().add_modifier(Modifier::DIM)),
                 Span::styled(
+                    "X ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("kill-all  ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
                     "r ",
                     Style::default()
                         .fg(Color::Cyan)
@@ -968,6 +1157,38 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
                      a starter shell session, registered globally, and opened \
                      in the session TUI immediately.",
                     path.display(),
+                ),
+            )
+        }
+        PickerPending::KillAllSessions {
+            ws_display_name,
+            mpx: _,
+            targets,
+        } => {
+            let n = targets.len();
+            let tracked = targets.iter().filter(|t| t.tracked).count();
+            let untracked = n - tracked;
+            let mix = match (tracked, untracked) {
+                (_, 0) => format!(" ({tracked} tracked)"),
+                (0, _) => format!(" ({untracked} untracked)"),
+                _ => format!(" ({tracked} tracked + {untracked} untracked)"),
+            };
+            let list = targets
+                .iter()
+                .map(|t| {
+                    let tag = if t.tracked { "tracked" } else { "untracked" };
+                    format!("  · {} ({tag})", t.display)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (
+                "Kill all live sessions".into(),
+                format!(
+                    "Kill {n} live session{plural} under {ws_display_name:?}?{mix}\n\
+                     \n{list}\n\
+                     \n\
+                     Sessions die immediately — running state is lost.",
+                    plural = if n == 1 { "" } else { "s" },
                 ),
             )
         }
