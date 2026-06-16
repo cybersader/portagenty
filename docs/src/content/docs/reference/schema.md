@@ -141,6 +141,8 @@ tags = ["rust", "agentic"]
 
 [[workspace]]                                  # optional
 path = "~/workspaces/agentic.portagenty.toml"
+id = "a1b2c3d4-..."                            # optional, auto-mirrored
+archived = true                                # optional, set by `a` in the picker
 ```
 
 ### `default-multiplexer`
@@ -152,8 +154,16 @@ Global project registry (optional). `tags` is recognized by the
 loader but the filter view that uses it is still on the roadmap.
 
 ### `[[workspace]]`
-Known workspace files — populates (eventually) a TUI home screen
-selector.
+Known workspace files — populates the TUI picker home screen.
+
+- **`path`** (required) — absolute path to the `*.portagenty.toml`.
+- **`id`** (optional) — mirror of the workspace file's `id`,
+  auto-written on registration. Lets `pa` detect folder moves even
+  after the old file is gone (drives `previous_paths`).
+- **`archived`** (optional) — when `true`, the workspace is hidden
+  from the picker's default list and only shown in the archived view
+  (`A` to toggle, `a` to archive/unarchive). Purely a per-machine
+  display preference; omitted from the wire when `false`.
 
 ## State file (`$XDG_STATE_HOME/portagenty/state.toml`)
 

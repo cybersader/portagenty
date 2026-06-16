@@ -134,7 +134,12 @@ real projects:
   always sees `?` and `q` plus their labels.
 - **Picker row actions.** `d` unregister, `D` delete file with
   confirm, `r` reveal path in a sticky info modal with auto
-  copy-to-clipboard.
+  copy-to-clipboard, `X` kill all live sessions under a workspace
+  (confirm names each session), `a` archive (hide from the default
+  list) / `A` toggle the archived view. Archiving is a per-machine
+  display preference (`archived = true` on the global `[[workspace]]`
+  entry) — it never touches the workspace TOML and archived
+  workspaces stay reachable by path / `pa://`.
 - **Workspace scaffolder extracted.** `crate::scaffold::create_at`
   is the single source of truth for filename sanitization, TOML
   body rendering, and global registration. `pa init`, the

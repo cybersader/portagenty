@@ -41,10 +41,25 @@ pressing `Esc` from the session list.
 | `n` | Find a folder + scaffold a new workspace |
 | `R` | Rename workspace (edits TOML `name` field) |
 | `r` | Reveal workspace path (auto-copies; press `o` inside to open shell there) |
+| `a` | Archive workspace — hide it from this list (reversible). In the archived view, `a` unarchives instead. |
+| `A` | Toggle the archived-workspaces view |
 | `d` | Unregister workspace from global index (file stays on disk) |
 | `D` | Delete workspace file and unregister (with confirm) |
+| `X` | Kill **all** live sessions under the workspace (with confirm) |
+| `Ctrl+R` | Refresh live-session counts |
 | `?` | Help overlay |
 | `q` / `Esc` | Exit `pa` |
+
+### Archiving workspaces
+
+Long registries get noisy. Press `a` on any workspace to **archive**
+it — it disappears from the picker's main list but stays registered
+and on disk. Press `A` to toggle into the archived view, where you
+can `a` a workspace to bring it back. Archiving is purely a
+per-machine display preference (stored as `archived = true` on the
+`[[workspace]]` entry in your global config); it never touches the
+workspace TOML or its files, and archived workspaces are still
+reachable by `pa <path>` and `pa://` links.
 
 ### Session list
 

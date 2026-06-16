@@ -196,22 +196,34 @@ enum PickResult {
 /// Run the workspace picker and return the user's choice.
 /// `Err` only for unexpected IO errors.
 fn show_picker(terminal: &mut ratatui::DefaultTerminal) -> Result<PickResult> {
-    let mut registered = crate::config::list_registered_workspaces().unwrap_or_default();
-    // Recency sort: workspaces with a recorded launch come first,
-    // most-recent at the top; workspaces never launched fall to the
-    // bottom in alphabetical order. The "live sessions" sentinel is
-    // added by the picker itself and always trails.
-    registered.sort_by(|a, b| {
-        let ra = crate::state::last_launch_for_workspace(a);
-        let rb = crate::state::last_launch_for_workspace(b);
-        match (ra, rb) {
-            (Some(x), Some(y)) => y.cmp(&x), // more recent first
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.file_name().cmp(&b.file_name()),
-        }
+    let registered = crate::config::list_registered_workspaces().unwrap_or_default();
+    let archived_set = crate::config::archived_workspaces().unwrap_or_default();
+    // Partition into the default (active) list and the archived list.
+    // Membership tests canonicalize so a path spelled differently at
+    // registration still matches the archived set.
+    let (mut archived, mut active): (Vec<_>, Vec<_>) = registered.into_iter().partition(|p| {
+        let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+        archived_set.contains(&canon)
     });
-    match picker::run(terminal, &registered)? {
+    // Recency sort each bucket: workspaces with a recorded launch
+    // come first, most-recent at the top; never-launched fall to the
+    // bottom alphabetically. The "live sessions" sentinel is added by
+    // the picker itself (active view only) and always trails.
+    let recency_sort = |list: &mut Vec<std::path::PathBuf>| {
+        list.sort_by(|a, b| {
+            let ra = crate::state::last_launch_for_workspace(a);
+            let rb = crate::state::last_launch_for_workspace(b);
+            match (ra, rb) {
+                (Some(x), Some(y)) => y.cmp(&x), // more recent first
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.file_name().cmp(&b.file_name()),
+            }
+        });
+    };
+    recency_sort(&mut active);
+    recency_sort(&mut archived);
+    match picker::run(terminal, &active, &archived)? {
         picker::PickerOutcome::Quit => Ok(PickResult::Quit),
         picker::PickerOutcome::LiveBrowse => {
             Ok(PickResult::Workspace(synthetic_browse_workspace()?))

@@ -374,6 +374,100 @@ pub fn list_registered_workspaces() -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Return the set of registered workspace paths flagged `archived =
+/// true`, as canonicalized absolute paths. Missing-on-disk entries
+/// are filtered out (same as [`list_registered_workspaces`]). The
+/// picker uses this to partition its list into the default view vs
+/// the archived view.
+pub fn archived_workspaces() -> Result<std::collections::HashSet<PathBuf>> {
+    let path = match global_config_path() {
+        Ok(p) => p,
+        Err(_) => return Ok(std::collections::HashSet::new()),
+    };
+    if !path.is_file() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let global: GlobalFile = load_toml(&path)?;
+    let mut out = std::collections::HashSet::new();
+    for entry in &global.workspaces {
+        if !entry.archived {
+            continue;
+        }
+        let expanded = resolve_path(&entry.path, std::path::Path::new("."))?;
+        if expanded.is_file() {
+            // Canonicalize so picker membership tests match regardless
+            // of how the path was spelled at registration time.
+            let canon = expanded.canonicalize().unwrap_or(expanded);
+            out.insert(canon);
+        }
+    }
+    Ok(out)
+}
+
+/// Set (or clear) the `archived` flag on a registered workspace,
+/// matched by path. Idempotent; preserves all other fields/comments
+/// via toml_edit. If the workspace isn't registered yet, it's added
+/// with the requested flag so archiving a walk-up-only workspace
+/// still sticks. Returns an error only on config I/O failure.
+pub fn set_workspace_archived(ws_path: &Path, archived: bool) -> Result<()> {
+    let cfg_path = global_config_path()?;
+    let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .with_context(|| format!("parsing existing global config {}", cfg_path.display()))?;
+
+    let canonical = ws_path
+        .canonicalize()
+        .unwrap_or_else(|_| ws_path.to_path_buf());
+    let wanted = canonical.display().to_string();
+
+    if !doc.contains_key("workspace") {
+        doc["workspace"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    let arr = doc["workspace"]
+        .as_array_of_tables_mut()
+        .ok_or_else(|| anyhow!("global config has a non-array 'workspace' field"))?;
+
+    let mut found = false;
+    for t in arr.iter_mut() {
+        let matches_this = t
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| s == wanted)
+            .unwrap_or(false);
+        if matches_this {
+            found = true;
+            if archived {
+                t["archived"] = toml_edit::value(true);
+            } else {
+                // Clear the flag entirely so unarchived rows go back
+                // to the tidy `{ path, id? }` shape.
+                t.remove("archived");
+            }
+            break;
+        }
+    }
+    if !found {
+        let mut t = toml_edit::Table::new();
+        t["path"] = toml_edit::value(wanted);
+        if let Some(id) = read_workspace_id(ws_path) {
+            t["id"] = toml_edit::value(id.as_str());
+        }
+        if archived {
+            t["archived"] = toml_edit::value(true);
+        }
+        arr.push(t);
+    }
+
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&cfg_path, doc.to_string())
+        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    Ok(())
+}
+
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -845,5 +939,82 @@ mod previous_paths_tests {
             .filter(|rp| rp.canonicalize().ok().as_deref() == Some(&p))
             .collect();
         assert_eq!(matches.len(), 1, "row count drifted: {regged:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn archive_then_unarchive_round_trips() {
+        let _s = Sandbox::new();
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let p = write_ws(tmp.path(), "abababab-cdcd-efef-0101-202020202020");
+        register_global_workspace(&p).unwrap();
+
+        // Not archived initially.
+        assert!(
+            archived_workspaces().unwrap().is_empty(),
+            "fresh registration should not be archived"
+        );
+
+        set_workspace_archived(&p, true).unwrap();
+        let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+        assert!(
+            archived_workspaces().unwrap().contains(&canon),
+            "archive flag not reflected in archived_workspaces()"
+        );
+        // list_registered_workspaces still includes archived (so
+        // resolve-by-id / protocol can still open them).
+        assert!(
+            list_registered_workspaces()
+                .unwrap()
+                .iter()
+                .any(|rp| rp.canonicalize().ok().as_deref() == Some(&canon)),
+            "archived workspace dropped from full registry list"
+        );
+
+        set_workspace_archived(&p, false).unwrap();
+        assert!(
+            archived_workspaces().unwrap().is_empty(),
+            "unarchive didn't clear the flag"
+        );
+        // Unarchived row should be back to the tidy shape (no
+        // `archived` key lingering).
+        let cfg_raw = fs::read_to_string(global_config_path().unwrap()).unwrap();
+        assert!(
+            !cfg_raw.contains("archived"),
+            "archived key not removed on unarchive: {cfg_raw}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn archive_is_idempotent_and_keeps_single_row() {
+        let _s = Sandbox::new();
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let p = write_ws(tmp.path(), "12121212-3434-5656-7878-909090909090");
+        register_global_workspace(&p).unwrap();
+        set_workspace_archived(&p, true).unwrap();
+        set_workspace_archived(&p, true).unwrap();
+        let regged = list_registered_workspaces().unwrap();
+        let matches: Vec<_> = regged
+            .iter()
+            .filter(|rp| rp.canonicalize().ok() == p.canonicalize().ok())
+            .collect();
+        assert_eq!(matches.len(), 1, "archive duplicated the row: {regged:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn archiving_unregistered_workspace_adds_a_row() {
+        let _s = Sandbox::new();
+        let tmp = assert_fs::TempDir::new().unwrap();
+        // Note: NOT registered first — archiving a walk-up-only
+        // workspace should still create the entry so it sticks.
+        let p = write_ws(tmp.path(), "fefefefe-0000-1111-2222-333344445555");
+        set_workspace_archived(&p, true).unwrap();
+        let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+        assert!(
+            archived_workspaces().unwrap().contains(&canon),
+            "archiving an unregistered workspace didn't persist"
+        );
     }
 }

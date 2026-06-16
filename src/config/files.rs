@@ -52,6 +52,13 @@ pub struct GlobalWorkspaceEntry {
     /// to the workspace's `previous_paths`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// When true, this workspace is hidden from the picker's default
+    /// list and only shown in the archived view (toggled with `A`).
+    /// Machine-local view preference — archiving doesn't touch the
+    /// workspace TOML or its on-disk file at all. Defaults to false;
+    /// omitted from the wire when false to keep the config tidy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// Any `*.portagenty.toml` with a non-empty prefix. The workspace

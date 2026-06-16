@@ -120,15 +120,36 @@ struct InfoModal {
     workspace_path: Option<PathBuf>,
 }
 
+/// Which list the picker is currently showing. Default is the
+/// active workspaces; `A` toggles to the archived list and back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerView {
+    Active,
+    Archived,
+}
+
 /// Run the picker inside an already-initialized ratatui terminal.
 /// Terminal init + restore stay with the caller so a single
 /// `ratatui::init()` handles both the picker and the session-list
 /// TUI that follows — no flicker from tearing down between them.
-pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<PickerOutcome> {
-    // Picker-local mutable copy: actions like unregister / delete
-    // change the list in place without having to re-enter the outer
-    // run loop.
-    let mut workspaces: Vec<PathBuf> = workspaces.to_vec();
+///
+/// `active` is the default list; `archived` holds workspaces the
+/// user hid with `a`. `A` toggles which list is shown. The two
+/// buckets swap into `workspaces` on toggle so all the existing
+/// index/render logic operates on one list unchanged — only the
+/// live-sessions sentinel (active view only) is view-dependent.
+pub fn run(
+    terminal: &mut DefaultTerminal,
+    active: &[PathBuf],
+    archived: &[PathBuf],
+) -> Result<PickerOutcome> {
+    // Picker-local mutable copies: actions like unregister / delete /
+    // archive change the lists in place without re-entering the outer
+    // run loop. `workspaces` is always the *currently shown* bucket;
+    // `hidden` is the other one. Toggling `A` swaps them.
+    let mut workspaces: Vec<PathBuf> = active.to_vec();
+    let mut hidden: Vec<PathBuf> = archived.to_vec();
+    let mut view = PickerView::Active;
     let mut state = ListState::default();
     state.select(Some(0));
 
@@ -138,15 +159,21 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
     let mut search: Option<crate::tui::find::SearchState> = None;
     let mut status = StatusLine::default();
     // Live-session count per workspace, used to render a "2 live"
-    // badge next to each row. Probed on picker entry (cheap: at
-    // most one mpx invocation per distinct mpx across all
-    // workspaces) and refreshed on Ctrl+R for the power user.
-    let mut live_counts = compute_live_counts(&workspaces);
+    // badge next to each row. Probed over both buckets so counts are
+    // correct in either view; refreshed on Ctrl+R for the power user.
+    let mut live_counts = {
+        let mut all = workspaces.clone();
+        all.extend(hidden.iter().cloned());
+        compute_live_counts(&all)
+    };
 
     loop {
         // Auto-age the status line so messages don't sit forever.
         status.age_out();
-        let total = workspaces.len() + 1; // +1 for the "live sessions" row
+        let has_sentinel = view == PickerView::Active;
+        // `.max(1)` keeps the wrap-around nav math (`% total`,
+        // `total - 1`) panic-free when the archived view is empty.
+        let total = (workspaces.len() + usize::from(has_sentinel)).max(1);
         terminal.draw(|frame| {
             render(
                 frame,
@@ -158,6 +185,7 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
                 &mut search,
                 &status.text,
                 &live_counts,
+                view,
             )
         })?;
 
@@ -401,10 +429,78 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             // "move right into the thing you're looking at").
             (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
                 let sel = state.selected().unwrap_or(0);
-                if sel == workspaces.len() {
+                if has_sentinel && sel == workspaces.len() {
                     return Ok(PickerOutcome::LiveBrowse);
                 }
-                return Ok(PickerOutcome::Workspace(workspaces[sel].clone()));
+                if let Some(p) = workspaces.get(sel) {
+                    return Ok(PickerOutcome::Workspace(p.clone()));
+                }
+            }
+            // a → archive the highlighted workspace (active view) or
+            // unarchive it (archived view). Non-destructive + instant:
+            // archiving just hides the row from the default list so
+            // long registries don't bury the workspaces you actually
+            // use. The file + its registration both stay put.
+            (KeyCode::Char('a'), _) => {
+                let sel = state.selected().unwrap_or(0);
+                if has_sentinel && sel == workspaces.len() {
+                    status.set("a: the live-sessions row can't be archived".into());
+                    continue;
+                }
+                let Some(path) = workspaces.get(sel).cloned() else {
+                    continue;
+                };
+                let archive = view == PickerView::Active;
+                match crate::config::set_workspace_archived(&path, archive) {
+                    Ok(()) => {
+                        // Move the row from the shown bucket to the
+                        // hidden one and keep the selection in range.
+                        workspaces.remove(sel);
+                        hidden.push(path.clone());
+                        clamp_selection_view(&workspaces, &mut state, has_sentinel);
+                        let name = read_workspace_name(&path)
+                            .unwrap_or_else(|| path.display().to_string());
+                        if archive {
+                            status.set(format!(
+                                "archived {name:?} — press A to view archived"
+                            ));
+                        } else {
+                            status.set(format!("unarchived {name:?}"));
+                            // If the archived view just emptied, pop
+                            // back to the active list automatically.
+                            if workspaces.is_empty() {
+                                std::mem::swap(&mut workspaces, &mut hidden);
+                                view = PickerView::Active;
+                                state.select(Some(0));
+                            }
+                        }
+                    }
+                    Err(e) => status.set(format!("archive failed: {e:#}")),
+                }
+            }
+            // A → toggle between the active list and the archived
+            // list. Refuses to switch to an empty archived view.
+            (KeyCode::Char('A'), _) => {
+                match view {
+                    PickerView::Active => {
+                        if hidden.is_empty() {
+                            status.set(
+                                "A: no archived workspaces yet — press a to archive one".into(),
+                            );
+                        } else {
+                            std::mem::swap(&mut workspaces, &mut hidden);
+                            view = PickerView::Archived;
+                            state.select(Some(0));
+                            status.set("archived view — a to unarchive, A to go back".into());
+                        }
+                    }
+                    PickerView::Archived => {
+                        std::mem::swap(&mut workspaces, &mut hidden);
+                        view = PickerView::Active;
+                        state.select(Some(0));
+                        status.clear();
+                    }
+                }
             }
             (KeyCode::Char('d'), _) => {
                 if let Some(path) = selected_workspace(&workspaces, &state) {
@@ -485,10 +581,12 @@ pub fn run(terminal: &mut DefaultTerminal, workspaces: &[PathBuf]) -> Result<Pic
             }
             (KeyCode::Enter, _) => {
                 let sel = state.selected().unwrap_or(0);
-                if sel == workspaces.len() {
+                if has_sentinel && sel == workspaces.len() {
                     return Ok(PickerOutcome::LiveBrowse);
                 }
-                return Ok(PickerOutcome::Workspace(workspaces[sel].clone()));
+                if let Some(p) = workspaces.get(sel) {
+                    return Ok(PickerOutcome::Workspace(p.clone()));
+                }
             }
             _ => {}
         }
@@ -853,6 +951,19 @@ fn clamp_selection(workspaces: &[PathBuf], state: &mut ListState) {
     }
 }
 
+/// Like [`clamp_selection`] but aware of whether the current view
+/// shows the live-sessions sentinel. The archived view has no
+/// sentinel, so its row count is exactly `workspaces.len()`.
+fn clamp_selection_view(workspaces: &[PathBuf], state: &mut ListState, has_sentinel: bool) {
+    let total = workspaces.len() + usize::from(has_sentinel);
+    let sel = state.selected().unwrap_or(0);
+    if total == 0 {
+        state.select(Some(0));
+    } else {
+        state.select(Some(sel.min(total - 1)));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut Frame<'_>,
@@ -864,7 +975,9 @@ fn render(
     search: &mut Option<crate::tui::find::SearchState>,
     status: &Option<String>,
     live_counts: &std::collections::HashMap<PathBuf, usize>,
+    view: PickerView,
 ) {
+    let archived_view = view == PickerView::Archived;
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -877,12 +990,21 @@ fn render(
         ])
         .split(area);
 
-    let title = Paragraph::new(" portagenty  ·  pick a workspace ")
+    let title_text = if archived_view {
+        " portagenty  ·  archived workspaces "
+    } else {
+        " portagenty  ·  pick a workspace "
+    };
+    let title = Paragraph::new(title_text)
         .style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_widget(title, chunks[0]);
 
-    let hint = Paragraph::new(" No workspace in this directory — choose one of your registered workspaces, or browse live sessions. ")
-        .style(Style::default().add_modifier(Modifier::DIM));
+    let hint_text = if archived_view {
+        " Archived workspaces — hidden from the main list. a unarchives the highlighted one; A returns to the main list. "
+    } else {
+        " No workspace in this directory — choose one of your registered workspaces, or browse live sessions. "
+    };
+    let hint = Paragraph::new(hint_text).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(hint, chunks[1]);
 
     // Width budget for each row so long paths don't run past the
@@ -986,23 +1108,34 @@ fn render(
             ]));
         }
     }
-    // Sentinel row: live browse.
-    items.push(ListItem::new(Line::from(vec![
-        Span::raw(" "),
-        Span::styled("…", Style::default().add_modifier(Modifier::DIM)),
-        Span::raw("  "),
-        Span::styled(
-            "live sessions on this machine",
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::DIM),
-        ),
-        Span::raw("   "),
-        Span::styled(
-            "(no workspace — just attach to what's running)",
+    // Empty-state line for the archived view (the active view always
+    // has at least the sentinel row, so it's never empty).
+    if archived_view && items.is_empty() {
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            "  (no archived workspaces — press A to go back)",
             Style::default().add_modifier(Modifier::DIM),
-        ),
-    ])));
+        )])));
+    }
+    // Sentinel row: live browse. Active view only — the archived view
+    // is a plain list with no "attach to anything live" affordance.
+    if !archived_view {
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("…", Style::default().add_modifier(Modifier::DIM)),
+            Span::raw("  "),
+            Span::styled(
+                "live sessions on this machine",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                "(no workspace — just attach to what's running)",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])));
+    }
 
     let list = List::new(items)
         .highlight_style(
@@ -1046,54 +1179,38 @@ fn render(
             ],
         );
         let sep = Style::default().fg(Color::DarkGray);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" ─── ", sep),
-                Span::styled(
-                    "n ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("new  ", Style::default().add_modifier(Modifier::DIM)),
-                Span::styled(
-                    "d ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("unreg  ", Style::default().add_modifier(Modifier::DIM)),
-                Span::styled(
-                    "D ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("delete  ", Style::default().add_modifier(Modifier::DIM)),
-                Span::styled(
-                    "X ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("kill-all  ", Style::default().add_modifier(Modifier::DIM)),
-                Span::styled(
-                    "r ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("reveal  ", Style::default().add_modifier(Modifier::DIM)),
-                Span::styled(
-                    "R ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("rename", Style::default().add_modifier(Modifier::DIM)),
-            ])),
-            chunks[4],
-        );
+        let key = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let lbl = Style::default().add_modifier(Modifier::DIM);
+        // Line 2 = workspace actions, view-dependent. The archived
+        // view trims to the actions that make sense there.
+        let actions: &[(&str, &str)] = if archived_view {
+            &[
+                ("a", "unarchive  "),
+                ("A", "back  "),
+                ("d", "unreg  "),
+                ("D", "delete  "),
+                ("r", "reveal"),
+            ]
+        } else {
+            &[
+                ("n", "new  "),
+                ("a", "archive  "),
+                ("A", "archived  "),
+                ("d", "unreg  "),
+                ("D", "delete  "),
+                ("X", "kill-all  "),
+                ("r", "reveal  "),
+                ("R", "rename"),
+            ]
+        };
+        let mut spans: Vec<Span> = vec![Span::styled(" ─── ", sep)];
+        for (k, l) in actions {
+            spans.push(Span::styled(format!("{k} "), key));
+            spans.push(Span::styled(*l, lbl));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), chunks[4]);
     }
 
     if let Some(p) = pending {
