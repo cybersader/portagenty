@@ -129,6 +129,10 @@ pub struct RawSession {
     /// wraps the command in `env KEY=VAL ...`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Optional human-readable note describing the session. Carried
+    /// through to `domain::Session` verbatim; display-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Read a TOML file and parse it into `T`. Preserves the path in the
@@ -212,6 +216,40 @@ command = "cargo nextest run"
         assert_eq!(w.projects.len(), 2);
         assert_eq!(w.sessions.len(), 2);
         assert_eq!(w.sessions[0].cwd, "~/code/portagenty");
+    }
+
+    #[test]
+    fn load_workspace_session_description() {
+        let src = r#"
+name = "ws"
+
+[[session]]
+name = "claude"
+cwd = "."
+command = "claude"
+description = "main coding agent"
+"#;
+        let f = write_tmp("ws-desc", src);
+        let w: WorkspaceFile = load_toml(f.path()).unwrap();
+        assert_eq!(
+            w.sessions[0].description.as_deref(),
+            Some("main coding agent")
+        );
+    }
+
+    #[test]
+    fn description_absent_deserializes_as_none() {
+        let src = r#"
+name = "ws"
+
+[[session]]
+name = "claude"
+cwd = "."
+command = "claude"
+"#;
+        let f = write_tmp("ws-nodesc", src);
+        let w: WorkspaceFile = load_toml(f.path()).unwrap();
+        assert_eq!(w.sessions[0].description, None);
     }
 
     #[test]

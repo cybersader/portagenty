@@ -568,6 +568,90 @@ fn edit_changes_command_in_place() {
 }
 
 #[test]
+fn add_writes_description_when_given() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    pa_cmd()
+        .args(["init", "ws"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+    let ws_path = tmp.child("ws.portagenty.toml");
+
+    pa_cmd()
+        .args([
+            "add",
+            "claude",
+            "-c",
+            "claude",
+            "--description",
+            "main agent — feature work",
+        ])
+        .arg("--workspace")
+        .arg(ws_path.path())
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(ws_path.path()).unwrap();
+    assert!(
+        after.contains(r#"description = "main agent — feature work""#),
+        "description not written: {after}"
+    );
+}
+
+#[test]
+fn edit_sets_then_clears_description() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    // Set it.
+    pa_cmd()
+        .args(["edit", "claude", "--description", "the coding agent", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .success();
+    let after = std::fs::read_to_string(&ws_path).unwrap();
+    assert!(
+        after.contains(r#"description = "the coding agent""#),
+        "description not set: {after}"
+    );
+
+    // Clear it with an empty string.
+    pa_cmd()
+        .args(["edit", "claude", "--description", "", "-w"])
+        .arg(&ws_path)
+        .assert()
+        .success();
+    let after = std::fs::read_to_string(&ws_path).unwrap();
+    assert!(
+        !after.contains("description ="),
+        "description not cleared: {after}"
+    );
+    // The session itself is intact.
+    assert!(after.contains(r#"name = "claude""#));
+}
+
+#[test]
+fn edit_description_conflicts_with_other_field_flags() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_demo_workspace(&tmp);
+
+    pa_cmd()
+        .args([
+            "edit",
+            "claude",
+            "--command",
+            "x",
+            "--description",
+            "y",
+            "-w",
+        ])
+        .arg(&ws_path)
+        .assert()
+        .failure()
+        .stderr(contains("at most one of"));
+}
+
+#[test]
 fn edit_can_rename_a_session() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_demo_workspace(&tmp);

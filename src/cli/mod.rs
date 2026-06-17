@@ -161,6 +161,12 @@ pub enum Command {
         #[arg(long = "kind", value_enum)]
         kind: Option<AddKindArg>,
 
+        /// Optional human-readable note describing what the session
+        /// is for. Display-only; shown dimmed next to the name in
+        /// the TUI.
+        #[arg(long = "description")]
+        description: Option<String>,
+
         /// Explicit workspace file. Walks up from cwd otherwise.
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<PathBuf>,
@@ -177,9 +183,9 @@ pub enum Command {
         workspace: Option<PathBuf>,
     },
     /// Change session fields without opening an editor. Pass at
-    /// most one of --command / --cwd / --kind / --rename per call;
-    /// --env KEY=VAL and --unset-env KEY are repeatable and stack
-    /// freely with each other and with one field flag. Comments
+    /// most one of --command / --cwd / --kind / --rename / --description
+    /// per call; --env KEY=VAL and --unset-env KEY are repeatable and
+    /// stack freely with each other and with one field flag. Comments
     /// and formatting elsewhere in the file stay untouched.
     Edit {
         /// Name of the session to edit.
@@ -201,6 +207,11 @@ pub enum Command {
         /// workspace already has this name.
         #[arg(long = "rename")]
         rename: Option<String>,
+
+        /// Set the session's description note. Pass an empty string
+        /// (`--description ""`) to clear it.
+        #[arg(long = "description")]
+        description: Option<String>,
 
         /// Set or update an env var on the session. Format is
         /// `KEY=VAL`. Repeatable. Combinable with other --env /
@@ -901,6 +912,7 @@ pub fn add(
     command: &str,
     cwd: Option<&str>,
     kind: Option<AddKindArg>,
+    description: Option<&str>,
     workspace: Option<&PathBuf>,
 ) -> Result<()> {
     // Find the workspace file.
@@ -948,6 +960,9 @@ pub fn add(
             crate::domain::SessionKind::Other => "other",
         };
         block.push_str(&format!("kind = \"{kind_str}\"\n"));
+    }
+    if let Some(desc) = description.filter(|d| !d.is_empty()) {
+        block.push_str(&format!("description = {}\n", toml_basic_string(desc)));
     }
 
     // Read existing contents so we preserve everything (comments,
@@ -1073,33 +1088,35 @@ pub fn edit(
     cwd: Option<&str>,
     kind: Option<AddKindArg>,
     rename: Option<&str>,
+    description: Option<&str>,
     env_set: &[String],
     env_unset: &[String],
     workspace: Option<&PathBuf>,
 ) -> Result<()> {
-    // Of the field-replacement flags (command/cwd/kind/rename) at
-    // most one can apply per invocation — picking which TOML field
-    // got the user's intent shouldn't be a guessing game. env-set
-    // and env-unset are independent and stack freely with each
-    // other and with one field flag.
+    // Of the field-replacement flags (command/cwd/kind/rename/
+    // description) at most one can apply per invocation — picking
+    // which TOML field got the user's intent shouldn't be a guessing
+    // game. env-set and env-unset are independent and stack freely
+    // with each other and with one field flag.
     let field_flags = [
         command.is_some(),
         cwd.is_some(),
         kind.is_some(),
         rename.is_some(),
+        description.is_some(),
     ]
     .iter()
     .filter(|b| **b)
     .count();
     if field_flags > 1 {
         return Err(anyhow!(
-            "pa edit takes at most one of --command / --cwd / --kind / --rename per call \
-             (use additional --env / --unset-env alongside them as needed)"
+            "pa edit takes at most one of --command / --cwd / --kind / --rename / --description \
+             per call (use additional --env / --unset-env alongside them as needed)"
         ));
     }
     if field_flags == 0 && env_set.is_empty() && env_unset.is_empty() {
         return Err(anyhow!(
-            "pa edit needs at least one of --command / --cwd / --kind / --rename / --env / --unset-env"
+            "pa edit needs at least one of --command / --cwd / --kind / --rename / --description / --env / --unset-env"
         ));
     }
 
@@ -1116,6 +1133,7 @@ pub fn edit(
         cwd: cwd.map(str::to_string),
         kind: kind.map(crate::domain::SessionKind::from),
         rename: rename.map(str::to_string),
+        description: description.map(str::to_string),
         env_set: env_pairs,
         env_unset: env_unset.to_vec(),
     };
@@ -1137,6 +1155,9 @@ pub struct EditOp {
     pub cwd: Option<String>,
     pub kind: Option<crate::domain::SessionKind>,
     pub rename: Option<String>,
+    /// New description. `Some("")` clears it (removes the key);
+    /// `Some(text)` sets it; `None` leaves it untouched.
+    pub description: Option<String>,
     /// Env entries to set/overwrite. Order doesn't matter; the on-
     /// disk env table is a TOML map.
     pub env_set: Vec<(String, String)>,
@@ -1220,6 +1241,15 @@ pub(crate) fn edit_session_in_file(path: &std::path::Path, name: &str, op: &Edit
     }
     if let Some(new_name) = &op.rename {
         table["name"] = toml_edit::value(new_name.as_str());
+    }
+    if let Some(desc) = &op.description {
+        // Empty string clears the note (drops the key); any other
+        // value sets it.
+        if desc.is_empty() {
+            table.remove("description");
+        } else {
+            table["description"] = toml_edit::value(desc.as_str());
+        }
     }
 
     // env: applied AFTER the field changes so unset/set are

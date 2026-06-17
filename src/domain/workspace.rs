@@ -114,6 +114,7 @@ mod tests {
                 command: "claude".into(),
                 kind: None,
                 env: std::collections::BTreeMap::new(),
+                description: None,
             }],
         };
         let encoded = toml::to_string(&w).unwrap();

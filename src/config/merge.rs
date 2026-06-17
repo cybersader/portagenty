@@ -82,6 +82,7 @@ fn to_session(rs: &RawSession, cwd_base: &Path) -> Result<Session> {
         command: rs.command.clone(),
         kind: rs.kind,
         env: rs.env.clone(),
+        description: rs.description.clone(),
     })
 }
 
@@ -164,6 +165,7 @@ mod tests {
             command: cmd.into(),
             kind: None,
             env: std::collections::BTreeMap::new(),
+            description: None,
         }
     }
 

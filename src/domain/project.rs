@@ -54,6 +54,7 @@ mod tests {
                 command: "cargo nextest run".into(),
                 kind: None,
                 env: std::collections::BTreeMap::new(),
+                description: None,
             }],
         };
         let encoded = toml::to_string(&p).expect("serialize");

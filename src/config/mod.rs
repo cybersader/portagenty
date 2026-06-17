@@ -964,10 +964,11 @@ mod previous_paths_tests {
         // list_registered_workspaces still includes archived (so
         // resolve-by-id / protocol can still open them).
         assert!(
-            list_registered_workspaces()
-                .unwrap()
-                .iter()
-                .any(|rp| rp.canonicalize().ok().as_deref() == Some(&canon)),
+            list_registered_workspaces().unwrap().iter().any(|rp| rp
+                .canonicalize()
+                .ok()
+                .as_deref()
+                == Some(&canon)),
             "archived workspace dropped from full registry list"
         );
 

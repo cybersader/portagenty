@@ -462,6 +462,7 @@ mod tests {
             command: "claude --resume".into(),
             kind: None,
             env: std::collections::BTreeMap::new(),
+            description: None,
         };
         let layout = render_layout(&s);
         assert!(layout.contains(r#"cwd="/home/u/code""#));
@@ -477,6 +478,7 @@ mod tests {
             command: r#"echo "hi""#.into(),
             kind: None,
             env: std::collections::BTreeMap::new(),
+            description: None,
         };
         let layout = render_layout(&s);
         assert!(
@@ -497,6 +499,7 @@ mod tests {
             command: "claude".into(),
             kind: None,
             env,
+            description: None,
         };
         let layout = render_layout(&s);
         assert!(
@@ -523,6 +526,7 @@ mod tests {
             command: "claude".into(),
             kind: None,
             env: std::collections::BTreeMap::new(),
+            description: None,
         };
         let layout = render_layout(&s);
         assert!(
@@ -547,6 +551,7 @@ mod tests {
             command: "bash".into(),
             kind: None,
             env: std::collections::BTreeMap::new(),
+            description: None,
         };
         let layout = render_layout(&s);
         assert!(
@@ -567,6 +572,7 @@ mod tests {
             command: "bash".into(),
             kind: None,
             env: std::collections::BTreeMap::new(),
+            description: None,
         };
         let layout = render_layout(&s);
         assert!(
@@ -583,6 +589,7 @@ mod tests {
             command: "claude".into(),
             kind: None,
             env: std::collections::BTreeMap::new(),
+            description: None,
         };
         let layout = render_layout(&s);
         assert!(

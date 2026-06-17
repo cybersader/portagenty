@@ -40,6 +40,7 @@ name = "claude"                               # required
 cwd = "~/code/portagenty"                     # required, supports ~, ${VAR}, relative
 command = "claude"                            # required
 kind = "claude-code"                          # optional; see below
+description = "main coding agent"             # optional; shown dimmed in the TUI
 env = { ANTHROPIC_LOG = "debug" }             # optional; per-session env vars
 
 [[session]]
@@ -104,6 +105,12 @@ selection order + `pa claim`'s default session.
 - **`kind`** (optional) — one of `claude-code`, `opencode`,
   `editor`, `dev-server`, `shell`, `other`. Drives the TUI's per-row
   glyph (display-only in v1.x).
+- **`description`** (optional) — a human-readable note about what
+  the session is for. Display-only — never affects launch. Shown
+  dimmed in the TUI: in the detail column on wide terminals (in
+  place of the raw command) and on the indented second line in
+  narrow / Termux mode. Set it with `pa add --description "…"` or
+  `pa edit <name> --description "…"` (empty string clears it).
 - **`env`** (optional) — string-to-string map. Applied via `tmux
   -e KEY=VAL` (tmux) or `env KEY=VAL ... bash -c "<cmd>"` in the
   generated layout (zellij). Iteration order is alphabetical for

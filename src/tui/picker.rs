@@ -351,8 +351,7 @@ pub fn run(
                         // waiting for Ctrl+R. Other actions don't
                         // touch live mpx state, so spare them the
                         // probe cost (~100ms per distinct mpx).
-                        let was_kill =
-                            matches!(action, PickerPending::KillAllSessions { .. });
+                        let was_kill = matches!(action, PickerPending::KillAllSessions { .. });
                         let msg = perform_picker_action(action, &mut workspaces, &mut state);
                         status.set(msg);
                         if was_kill {
@@ -461,9 +460,7 @@ pub fn run(
                         let name = read_workspace_name(&path)
                             .unwrap_or_else(|| path.display().to_string());
                         if archive {
-                            status.set(format!(
-                                "archived {name:?} — press A to view archived"
-                            ));
+                            status.set(format!("archived {name:?} — press A to view archived"));
                         } else {
                             status.set(format!("unarchived {name:?}"));
                             // If the archived view just emptied, pop
@@ -480,28 +477,24 @@ pub fn run(
             }
             // A → toggle between the active list and the archived
             // list. Refuses to switch to an empty archived view.
-            (KeyCode::Char('A'), _) => {
-                match view {
-                    PickerView::Active => {
-                        if hidden.is_empty() {
-                            status.set(
-                                "A: no archived workspaces yet — press a to archive one".into(),
-                            );
-                        } else {
-                            std::mem::swap(&mut workspaces, &mut hidden);
-                            view = PickerView::Archived;
-                            state.select(Some(0));
-                            status.set("archived view — a to unarchive, A to go back".into());
-                        }
-                    }
-                    PickerView::Archived => {
+            (KeyCode::Char('A'), _) => match view {
+                PickerView::Active => {
+                    if hidden.is_empty() {
+                        status.set("A: no archived workspaces yet — press a to archive one".into());
+                    } else {
                         std::mem::swap(&mut workspaces, &mut hidden);
-                        view = PickerView::Active;
+                        view = PickerView::Archived;
                         state.select(Some(0));
-                        status.clear();
+                        status.set("archived view — a to unarchive, A to go back".into());
                     }
                 }
-            }
+                PickerView::Archived => {
+                    std::mem::swap(&mut workspaces, &mut hidden);
+                    view = PickerView::Active;
+                    state.select(Some(0));
+                    status.clear();
+                }
+            },
             (KeyCode::Char('d'), _) => {
                 if let Some(path) = selected_workspace(&workspaces, &state) {
                     pending = Some(PickerPending::Unregister(path));
@@ -528,7 +521,8 @@ pub fn run(
                 let Some(path) = selected_workspace(&workspaces, &state) else {
                     status.set(
                         "X: live-sessions row has no workspace — \
-                         use `x` from inside the session list for ad-hoc kills".into(),
+                         use `x` from inside the session list for ad-hoc kills"
+                            .into(),
                     );
                     continue;
                 };
@@ -829,9 +823,7 @@ fn perform_kill_all_sessions(
         crate::domain::Multiplexer::Wezterm => None,
     };
     let Some(mux) = mux else {
-        return format!(
-            "X: workspace {ws_display_name:?} mpx isn't supported — nothing killed"
-        );
+        return format!("X: workspace {ws_display_name:?} mpx isn't supported — nothing killed");
     };
     let mut killed = 0usize;
     let mut failed: Vec<String> = Vec::new();
@@ -995,8 +987,7 @@ fn render(
     } else {
         " portagenty  ·  pick a workspace "
     };
-    let title = Paragraph::new(title_text)
-        .style(Style::default().add_modifier(Modifier::REVERSED));
+    let title = Paragraph::new(title_text).style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_widget(title, chunks[0]);
 
     let hint_text = if archived_view {

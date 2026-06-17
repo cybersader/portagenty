@@ -416,7 +416,14 @@ impl App {
                             (cmd_trimmed, None)
                         };
                     if let Some(ws_path) = self.workspace.file_path.clone() {
-                        match crate::cli::add(st.name.trim(), command, None, kind, Some(&ws_path)) {
+                        match crate::cli::add(
+                            st.name.trim(),
+                            command,
+                            None,
+                            kind,
+                            None,
+                            Some(&ws_path),
+                        ) {
                             Ok(()) => {
                                 let name = st.name.clone();
                                 let note = if cmd_trimmed.is_empty() {
@@ -521,7 +528,8 @@ impl App {
             if let Ok(ws) = crate::config::load(&opts) {
                 self.workspace = ws;
                 let live = self.mux.list_sessions().unwrap_or_default();
-                self.rows = crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
+                self.rows =
+                    crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
             }
         }
     }
@@ -603,7 +611,8 @@ impl App {
                     // tracked row (if any) falls back to NotStarted;
                     // untracked rows vanish entirely.
                     let live = self.mux.list_sessions().unwrap_or_default();
-                    self.rows = crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
+                    self.rows =
+                        crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
                     if self.rows.is_empty() {
                         self.list_state.select(None);
                     } else {
@@ -629,7 +638,11 @@ impl App {
                         // reappears as an Untracked row after rebuild.
                         self.workspace.sessions.retain(|s| s.name != name);
                         let live = self.mux.list_sessions().unwrap_or_default();
-                        self.rows = crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
+                        self.rows = crate::tui::view::build_rows(
+                            &self.workspace,
+                            &live,
+                            self.untracked_scope,
+                        );
                         // Keep selection in-bounds.
                         if self.rows.is_empty() {
                             self.list_state.select(None);
@@ -698,7 +711,11 @@ impl App {
                     Ok(reloaded) => {
                         self.workspace = reloaded;
                         let live = self.mux.list_sessions().unwrap_or_default();
-                        self.rows = crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
+                        self.rows = crate::tui::view::build_rows(
+                            &self.workspace,
+                            &live,
+                            self.untracked_scope,
+                        );
                         if !self.rows.is_empty() {
                             let sel = self.list_state.selected().unwrap_or(0);
                             self.list_state.select(Some(sel.min(self.rows.len() - 1)));
@@ -856,8 +873,11 @@ impl App {
                                     {
                                         self.workspace = reloaded;
                                         let live = self.mux.list_sessions().unwrap_or_default();
-                                        self.rows =
-                                            crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
+                                        self.rows = crate::tui::view::build_rows(
+                                            &self.workspace,
+                                            &live,
+                                            self.untracked_scope,
+                                        );
                                     }
                                     self.set_status(format!("cwd updated for {sn:?}"));
                                 }
@@ -1353,11 +1373,20 @@ fn row_list_item(
         _ => format!("[{}]", row.state.label()),
     };
 
+    // Human description note, when the session declared one. Only
+    // tracked rows carry a `session`; untracked rows never have one.
+    // Empty descriptions are treated as absent.
+    let description = row
+        .session
+        .as_ref()
+        .and_then(|s| s.description.as_deref())
+        .filter(|d| !d.is_empty());
+
     // Narrow: render each row as a two-line "card". Line 1 is the
     // essentials (marker + name + status tag). Line 2 is a dim,
-    // indented detail line showing command and/or cwd. User never has
-    // to guess what a cramped column means because the detail line
-    // calls each piece out explicitly.
+    // indented detail line. When the session has a description it
+    // takes the detail line (it's the human "what is this"); else we
+    // fall back to the technical `command · path`.
     if width < 60 {
         let line1 = {
             let mut s: Vec<Span<'static>> = Vec::with_capacity(8);
@@ -1378,23 +1407,32 @@ fn row_list_item(
             ));
             Line::from(s)
         };
-        // Detail line: indent under the name, show "cmd · path" with
+        // Detail line: indent under the name. A description wins the
+        // line (dim italic); otherwise show "cmd · path" with
         // tolerable middle-truncation so it always fits the width.
-        let cmd = row.command_display.clone();
-        let path = compact_path(&row.cwd_display);
         let detail_budget = (width as usize).saturating_sub(6).max(10);
-        let raw_detail = if cmd == "(unknown)" {
-            path
-        } else if path == "(unknown)" || path.is_empty() {
-            cmd
-        } else {
-            format!("{cmd}  ·  {path}")
+        let (raw_detail, detail_style) = match description {
+            Some(d) => (
+                d.to_string(),
+                Style::default()
+                    .add_modifier(Modifier::DIM)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            None => {
+                let cmd = row.command_display.clone();
+                let path = compact_path(&row.cwd_display);
+                let text = if cmd == "(unknown)" {
+                    path
+                } else if path == "(unknown)" || path.is_empty() {
+                    cmd
+                } else {
+                    format!("{cmd}  ·  {path}")
+                };
+                (text, Style::default().add_modifier(Modifier::DIM))
+            }
         };
         let detail = pad_or_truncate(&raw_detail, detail_budget);
-        let line2 = Line::from(vec![
-            Span::raw("    "),
-            Span::styled(detail, Style::default().add_modifier(Modifier::DIM)),
-        ]);
+        let line2 = Line::from(vec![Span::raw("    "), Span::styled(detail, detail_style)]);
         return ListItem::new(vec![line1, line2]);
     }
 
@@ -1411,24 +1449,34 @@ fn row_list_item(
     }
     let name_cell = pad_or_truncate(&row.display_name, name_col);
     spans.push(Span::styled(name_cell, name_style));
+    // The detail column shows the description when present (dim
+    // italic — it's the human note), else the raw command (dim). Same
+    // fixed-width cell either way, so columns stay aligned whether or
+    // not a row is annotated.
+    let (detail_text, detail_style) = match description {
+        Some(d) => (
+            d.to_string(),
+            Style::default()
+                .add_modifier(Modifier::DIM)
+                .add_modifier(Modifier::ITALIC),
+        ),
+        None => (
+            row.command_display.clone(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    };
     if width >= 80 && cwd_col >= 8 {
         spans.push(Span::raw("  "));
         let cwd_cell = pad_or_truncate(&compact_path(&row.cwd_display), cwd_col);
         spans.push(Span::raw(cwd_cell));
         spans.push(Span::raw("  "));
-        let cmd_cell = pad_or_truncate(&row.command_display, cmd_col.max(4));
-        spans.push(Span::styled(
-            cmd_cell,
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+        let cmd_cell = pad_or_truncate(&detail_text, cmd_col.max(4));
+        spans.push(Span::styled(cmd_cell, detail_style));
     } else {
-        // 60..80: no cwd column; command and status only.
+        // 60..80: no cwd column; detail and status only.
         spans.push(Span::raw("  "));
-        let cmd_cell = pad_or_truncate(&row.command_display, 24);
-        spans.push(Span::styled(
-            cmd_cell,
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+        let cmd_cell = pad_or_truncate(&detail_text, 24);
+        spans.push(Span::styled(cmd_cell, detail_style));
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
@@ -1746,6 +1794,7 @@ mod tests {
                     command: "true".into(),
                     kind: None,
                     env: std::collections::BTreeMap::new(),
+                    description: None,
                 })
                 .collect(),
         }
@@ -1879,6 +1928,7 @@ mod tests {
                 command: "claude --resume".into(),
                 kind: None,
                 env: std::collections::BTreeMap::new(),
+                description: None,
             }],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
@@ -2344,6 +2394,7 @@ mod tests {
                     command: "c".into(),
                     kind,
                     env: std::collections::BTreeMap::new(),
+                    description: None,
                 })
                 .collect(),
         }

@@ -202,6 +202,7 @@ mod tests {
             command: cmd.into(),
             kind: None,
             env: BTreeMap::new(),
+            description: None,
         }
     }
 
@@ -216,6 +217,7 @@ mod tests {
             command: cmd.into(),
             kind: None,
             env: m,
+            description: None,
         }
     }
 

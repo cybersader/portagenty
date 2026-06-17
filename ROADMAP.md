@@ -60,6 +60,11 @@ Explicitly **not** in v1:
    (claude-code / opencode / editor / dev-server / shell / other).
    Currently display-only — the TUI shows a one-letter color-coded
    glyph (C / O / E / D) next to the state marker.
+9a. **Session `description`.** Optional human note on a session
+   (`description = "…"`). Display-only; shown dimmed in the TUI —
+   in the detail column on wide terminals (replacing the raw
+   command) and on the indented second line in narrow mode. Set via
+   `pa add --description` / `pa edit --description` (empty clears).
 10a. **Per-session env vars.** `env` field on sessions threaded
    through the merge into the launch path. tmux uses `-e KEY=VAL`
    per entry; zellij wraps `bash -c "<cmd>"` in `env KEY=VAL ...`

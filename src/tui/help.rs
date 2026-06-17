@@ -118,7 +118,10 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
                 "X",
                 "kill ALL live sessions under this workspace (destructive — confirms first)",
             ));
-            lines.push(row("a", "archive workspace (hide from this list; reversible)"));
+            lines.push(row(
+                "a",
+                "archive workspace (hide from this list; reversible)",
+            ));
             lines.push(row("A", "toggle the archived-workspaces view"));
             lines.push(row(
                 "r",

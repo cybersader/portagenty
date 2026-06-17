@@ -75,6 +75,11 @@ pub struct Session {
     /// workspace files).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Optional human-readable note describing what this session is
+    /// for. Display-only — never affects launch behavior. Shown
+    /// dimmed next to the session name in the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[cfg(test)]
@@ -89,6 +94,7 @@ mod tests {
             command: "claude".into(),
             kind: None,
             env: std::collections::BTreeMap::new(),
+            description: None,
         };
         let encoded = toml::to_string(&s).expect("serialize");
         assert!(
@@ -115,6 +121,7 @@ mod tests {
                 command: "c".into(),
                 kind: Some(kind),
                 env: BTreeMap::new(),
+                description: None,
             };
             let encoded = toml::to_string(&s).unwrap();
             assert!(
@@ -172,6 +179,7 @@ command = "claude"
             command: "claude".into(),
             kind: None,
             env,
+            description: None,
         };
         let encoded = toml::to_string(&s).unwrap();
         assert!(
@@ -196,6 +204,7 @@ command = "claude"
             command: "c".into(),
             kind: None,
             env: BTreeMap::new(),
+            description: None,
         };
         let encoded = toml::to_string(&s).unwrap();
         assert!(

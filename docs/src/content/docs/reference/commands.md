@@ -243,10 +243,11 @@ editing TOML manually, especially from a phone keyboard.
 | `-c`, `--command <cmd>` | — (required) | Command to run |
 | `--cwd <path>` | `.` | Working directory |
 | `--kind <...>` | none | `claude-code`, `opencode`, `editor`, `dev-server`, `shell`, or `other` |
+| `--description <text>` | none | Human note shown dimmed in the TUI |
 | `-w`, `--workspace <path>` | walk-up | Explicit workspace file |
 
 ```sh
-pa add claude -c "claude --resume" --kind claude-code
+pa add claude -c "claude --resume" --kind claude-code --description "main agent"
 pa add dev -c "bun run dev" --cwd ./app --kind dev-server
 pa add tests -c "cargo nextest run"
 ```
@@ -274,8 +275,10 @@ pa rm tests -w ~/code/my.portagenty.toml
 ## `pa edit <session>`
 
 Change one field on an existing session without opening an editor.
-Pass exactly one change flag; passing zero or more than one errors
-with guidance.
+Pass exactly one **field** change flag (`--command` / `--cwd` /
+`--kind` / `--rename` / `--description`); `--env` / `--unset-env`
+are repeatable and stack freely alongside one field flag. Passing
+zero changes, or more than one field flag, errors with guidance.
 
 | Flag | What |
 |---|---|
@@ -284,6 +287,7 @@ with guidance.
 | `--cwd <path>` | Replace the cwd |
 | `--kind <...>` | Replace the kind hint |
 | `--rename <new-name>` | Rename (errors on collision with an existing session) |
+| `--description <text>` | Set the description note (empty string clears it) |
 | `--env KEY=VAL` | Set an env var (repeatable) |
 | `--unset-env KEY` | Remove an env var (repeatable) |
 | `-w`, `--workspace <path>` | Explicit workspace file (walk-up otherwise) |
@@ -293,6 +297,8 @@ pa edit claude --command "claude --resume"
 pa edit dev --cwd ./new-app
 pa edit my-session --kind claude-code
 pa edit old-name --rename new-name
+pa edit claude --description "main coding agent"
+pa edit claude --description ""        # clears the note
 pa edit claude --env ANTHROPIC_MODEL=opus --env DEBUG=1
 pa edit claude --unset-env DEBUG
 ```

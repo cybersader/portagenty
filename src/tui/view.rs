@@ -216,6 +216,7 @@ mod tests {
                     command: cmd.into(),
                     kind: None,
                     env: std::collections::BTreeMap::new(),
+                    description: None,
                 })
                 .collect(),
         }
@@ -236,6 +237,7 @@ mod tests {
                     command: "c".into(),
                     kind,
                     env: std::collections::BTreeMap::new(),
+                    description: None,
                 })
                 .collect(),
         }
@@ -307,7 +309,11 @@ mod tests {
 
     #[test]
     fn untracked_live_session_becomes_untracked_row() {
-        let rows = build_rows(&ws(vec![]), &live_untracked(&["random-tmux-session"]), UntrackedScope::All);
+        let rows = build_rows(
+            &ws(vec![]),
+            &live_untracked(&["random-tmux-session"]),
+            UntrackedScope::All,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SessionState::Untracked);
         assert_eq!(rows[0].display_name, "random-tmux-session");
@@ -348,7 +354,11 @@ mod tests {
 
     #[test]
     fn untracked_rows_show_placeholder_for_unknown_command() {
-        let rows = build_rows(&ws(vec![]), &live_untracked(&["mystery"]), UntrackedScope::All);
+        let rows = build_rows(
+            &ws(vec![]),
+            &live_untracked(&["mystery"]),
+            UntrackedScope::All,
+        );
         assert_eq!(rows[0].command_display, "(unknown)");
         assert_eq!(rows[0].cwd_display, "(unknown)");
     }
@@ -405,7 +415,11 @@ mod tests {
 
     #[test]
     fn untracked_row_always_has_no_kind() {
-        let rows = build_rows(&ws(vec![]), &live_untracked(&["mystery"]), UntrackedScope::All);
+        let rows = build_rows(
+            &ws(vec![]),
+            &live_untracked(&["mystery"]),
+            UntrackedScope::All,
+        );
         assert_eq!(rows[0].kind, None);
     }
 
