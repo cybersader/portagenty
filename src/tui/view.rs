@@ -77,11 +77,37 @@ pub struct SessionRow {
     pub attached_clients: Option<u32>,
 }
 
+/// Which live mpx sessions count as "untracked" rows for this view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntrackedScope {
+    /// Only surface untracked sessions whose mpx name starts with
+    /// this workspace's sanitized prefix (`<workspace>-…`). These are
+    /// "leaked siblings" — sessions `pa` created for this workspace
+    /// but that no longer match a TOML declaration (e.g. a renamed or
+    /// removed session whose mpx session is still alive). Unrelated
+    /// machine-wide sessions stay out of the list. The default for a
+    /// real workspace.
+    WorkspacePrefix,
+    /// Surface every untracked live session on the machine. Used only
+    /// by the picker's "live sessions on this machine" browse mode,
+    /// whose whole purpose is attaching to anything running.
+    All,
+}
+
 /// Build the row list from a loaded workspace plus the mpx's current
 /// sessions. Tracked rows (workspace-defined) come first in the same
 /// order the workspace declared them; untracked rows follow, sorted
 /// alphabetically by name for determinism.
-pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow> {
+///
+/// `scope` controls which live sessions become untracked rows — see
+/// [`UntrackedScope`]. A real workspace passes `WorkspacePrefix` so
+/// the list stays scoped to it; the live-browse pseudo-workspace
+/// passes `All`.
+pub fn build_rows(
+    workspace: &Workspace,
+    live: &[SessionInfo],
+    scope: UntrackedScope,
+) -> Vec<SessionRow> {
     let mut rows: Vec<SessionRow> = Vec::with_capacity(workspace.sessions.len() + live.len());
 
     // Tracked rows first. Each row looks up its live counterpart to
@@ -110,23 +136,48 @@ pub fn build_rows(workspace: &Workspace, live: &[SessionInfo]) -> Vec<SessionRow
         });
     }
 
-    // Untracked rows: anything in live that didn't correspond to a
-    // workspace session.
+    // Untracked rows: live sessions with no workspace counterpart.
+    // In WorkspacePrefix scope (the default), only sessions sharing
+    // this workspace's `<name>-` prefix qualify — so unrelated
+    // machine-wide sessions don't clutter every workspace's list.
     let tracked_mpx_names: std::collections::HashSet<String> = workspace
         .sessions
         .iter()
         .map(|s| workspace_session_name(&workspace.name, &s.name))
         .collect();
+    // `workspace_session_name(name, "")` is `sanitize(name) + "-"`;
+    // trim + re-add the trailing dash so the prefix is exact.
+    let prefix = format!(
+        "{}-",
+        workspace_session_name(&workspace.name, "").trim_end_matches('-')
+    );
     let mut untracked: Vec<&SessionInfo> = live
         .iter()
         .filter(|s| !tracked_mpx_names.contains(&s.name))
+        .filter(|s| match scope {
+            UntrackedScope::All => true,
+            UntrackedScope::WorkspacePrefix => s.name.starts_with(&prefix),
+        })
         .collect();
     untracked.sort_by(|a, b| a.name.cmp(&b.name));
 
     for info in untracked {
+        // In WorkspacePrefix scope, strip the workspace prefix for
+        // display so a leaked `myproj-oldname` reads as `oldname`,
+        // matching how tracked rows show the bare session name. The
+        // mpx_name keeps the real name so attach/kill still target
+        // the right session.
+        let display_name = match scope {
+            UntrackedScope::WorkspacePrefix => info
+                .name
+                .strip_prefix(&prefix)
+                .unwrap_or(&info.name)
+                .to_string(),
+            UntrackedScope::All => info.name.clone(),
+        };
         rows.push(SessionRow {
             mpx_name: info.name.clone(),
-            display_name: info.name.clone(),
+            display_name,
             state: SessionState::Untracked,
             session: None,
             cwd_display: info
@@ -219,7 +270,11 @@ mod tests {
 
     #[test]
     fn tracked_row_is_not_started_when_mpx_has_no_match() {
-        let rows = build_rows(&ws(vec![("claude", "c")]), &[]);
+        let rows = build_rows(
+            &ws(vec![("claude", "c")]),
+            &[],
+            UntrackedScope::WorkspacePrefix,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SessionState::NotStarted);
         assert_eq!(rows[0].display_name, "claude");
@@ -227,7 +282,11 @@ mod tests {
 
     #[test]
     fn tracked_row_is_live_when_mpx_reports_sanitized_name() {
-        let rows = build_rows(&ws(vec![("claude", "c")]), &live(&["claude"]));
+        let rows = build_rows(
+            &ws(vec![("claude", "c")]),
+            &live(&["claude"]),
+            UntrackedScope::WorkspacePrefix,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SessionState::Live);
     }
@@ -235,7 +294,11 @@ mod tests {
     #[test]
     fn tracked_row_is_live_when_mpx_has_sanitized_form_of_a_raw_name() {
         // Raw workspace name has spaces; mpx has the sanitized form.
-        let rows = build_rows(&ws(vec![("has spaces", "c")]), &live(&["has_spaces"]));
+        let rows = build_rows(
+            &ws(vec![("has spaces", "c")]),
+            &live(&["has_spaces"]),
+            UntrackedScope::WorkspacePrefix,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SessionState::Live);
         assert_eq!(rows[0].display_name, "has spaces");
@@ -244,7 +307,7 @@ mod tests {
 
     #[test]
     fn untracked_live_session_becomes_untracked_row() {
-        let rows = build_rows(&ws(vec![]), &live_untracked(&["random-tmux-session"]));
+        let rows = build_rows(&ws(vec![]), &live_untracked(&["random-tmux-session"]), UntrackedScope::All);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SessionState::Untracked);
         assert_eq!(rows[0].display_name, "random-tmux-session");
@@ -257,7 +320,11 @@ mod tests {
         // bare names ("stranger", "another" = untracked).
         let mut all_live = live(&["claude"]); // "x-claude"
         all_live.extend(live_untracked(&["stranger", "another"]));
-        let rows = build_rows(&ws(vec![("claude", "c"), ("tests", "t")]), &all_live);
+        let rows = build_rows(
+            &ws(vec![("claude", "c"), ("tests", "t")]),
+            &all_live,
+            UntrackedScope::All,
+        );
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].display_name, "claude");
         assert_eq!(rows[0].state, SessionState::Live);
@@ -270,14 +337,18 @@ mod tests {
 
     #[test]
     fn tracked_rows_preserve_workspace_declaration_order() {
-        let rows = build_rows(&ws(vec![("zzz", "z"), ("aaa", "a"), ("mmm", "m")]), &[]);
+        let rows = build_rows(
+            &ws(vec![("zzz", "z"), ("aaa", "a"), ("mmm", "m")]),
+            &[],
+            UntrackedScope::WorkspacePrefix,
+        );
         let names: Vec<&str> = rows.iter().map(|r| r.display_name.as_str()).collect();
         assert_eq!(names, vec!["zzz", "aaa", "mmm"]);
     }
 
     #[test]
     fn untracked_rows_show_placeholder_for_unknown_command() {
-        let rows = build_rows(&ws(vec![]), &live_untracked(&["mystery"]));
+        let rows = build_rows(&ws(vec![]), &live_untracked(&["mystery"]), UntrackedScope::All);
         assert_eq!(rows[0].command_display, "(unknown)");
         assert_eq!(rows[0].cwd_display, "(unknown)");
     }
@@ -289,7 +360,7 @@ mod tests {
             cwd: Some(PathBuf::from("/home/u/dev")),
             attached: Some(0),
         }];
-        let rows = build_rows(&ws(vec![]), &info);
+        let rows = build_rows(&ws(vec![]), &info, UntrackedScope::All);
         assert_eq!(rows[0].cwd_display, "/home/u/dev");
     }
 
@@ -325,6 +396,7 @@ mod tests {
                 ("dev", Some(SessionKind::DevServer)),
             ]),
             &[],
+            UntrackedScope::WorkspacePrefix,
         );
         assert_eq!(rows[0].kind, Some(SessionKind::ClaudeCode));
         assert_eq!(rows[1].kind, None);
@@ -333,7 +405,47 @@ mod tests {
 
     #[test]
     fn untracked_row_always_has_no_kind() {
-        let rows = build_rows(&ws(vec![]), &live_untracked(&["mystery"]));
+        let rows = build_rows(&ws(vec![]), &live_untracked(&["mystery"]), UntrackedScope::All);
         assert_eq!(rows[0].kind, None);
+    }
+
+    #[test]
+    fn workspace_prefix_scope_hides_unrelated_machine_sessions() {
+        // The bug fix: a real workspace must NOT show every live mpx
+        // session on the machine. Only sessions under its own prefix
+        // (here "x-…") count as untracked rows.
+        let mut all_live = live(&["claude"]); // "x-claude" → tracked
+        all_live.extend(live_untracked(&[
+            "some-other-workspace-shell", // unrelated → hidden
+            "manual-tmux-thing",          // unrelated → hidden
+            "x-leftover",                 // our prefix → shown
+        ]));
+        let rows = build_rows(
+            &ws(vec![("claude", "c")]),
+            &all_live,
+            UntrackedScope::WorkspacePrefix,
+        );
+        // 1 tracked (claude) + 1 prefixed untracked (leftover).
+        assert_eq!(rows.len(), 2, "unrelated sessions leaked: {rows:?}");
+        assert_eq!(rows[0].display_name, "claude");
+        assert_eq!(rows[0].state, SessionState::Live);
+        // Untracked sibling shows with its prefix stripped, but the
+        // mpx_name keeps the real session name for attach/kill.
+        assert_eq!(rows[1].display_name, "leftover");
+        assert_eq!(rows[1].mpx_name, "x-leftover");
+        assert_eq!(rows[1].state, SessionState::Untracked);
+    }
+
+    #[test]
+    fn all_scope_still_shows_every_session_for_live_browse() {
+        // The picker's live-browse pseudo-workspace relies on All
+        // scope to surface everything running.
+        let rows = build_rows(
+            &ws(vec![]),
+            &live_untracked(&["alpha", "beta", "gamma"]),
+            UntrackedScope::All,
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.state == SessionState::Untracked));
     }
 }

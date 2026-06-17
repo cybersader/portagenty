@@ -260,6 +260,8 @@ At startup and on TUI refresh, each active adapter is asked for its live session
 
 This bridges the gap between "what portagenty thinks is going on" and "what's actually running." It's how someone who started a tmux session outside portagenty still gets it in their TUI.
 
+**Scoping.** Untracked rows in a *workspace* view are scoped to that workspace's sanitized `<name>-` prefix — only sessions `pa` created for this workspace (but that no longer match a TOML declaration, e.g. a renamed/removed session whose mpx session is still alive) show up. Unrelated machine-wide sessions are deliberately excluded so opening one workspace doesn't list every tmux/zellij session on the box. The prefix-stripped name is shown for readability; the real mpx name is retained for attach/kill. To browse *every* live session regardless of workspace, use the picker's **"live sessions on this machine"** row (a pseudo-workspace that runs in `UntrackedScope::All` mode). See `tui::view::UntrackedScope`.
+
 ---
 
 ## 10. Termux and small-screen TUI constraints

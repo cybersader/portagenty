@@ -103,6 +103,12 @@ pub struct App {
     /// first name, then command. Enter advances or commits; Esc
     /// cancels.
     adding_session: Option<AddSessionState>,
+    /// Which live mpx sessions show up as untracked rows. Real
+    /// workspaces scope to their own `<name>-` prefix so unrelated
+    /// machine sessions don't clutter the list; the live-browse
+    /// pseudo-workspace shows everything. Decided once at
+    /// construction from whether the workspace has a file on disk.
+    untracked_scope: crate::tui::view::UntrackedScope,
 }
 
 /// Two-stage state for the "add new session" modal.
@@ -164,7 +170,16 @@ impl App {
     /// (no I/O at construction time) and lets tests drive any
     /// rendering state they want without mockall expectations.
     pub fn new(workspace: Workspace, mux: Box<dyn Multiplexer>, live: Vec<SessionInfo>) -> Self {
-        let rows = build_rows(&workspace, &live);
+        // A real workspace (loaded from a file) scopes untracked rows
+        // to its own prefix; the live-browse pseudo-workspace (no
+        // file on disk) shows every live session so you can attach to
+        // anything running.
+        let untracked_scope = if workspace.file_path.is_some() {
+            crate::tui::view::UntrackedScope::WorkspacePrefix
+        } else {
+            crate::tui::view::UntrackedScope::All
+        };
+        let rows = build_rows(&workspace, &live, untracked_scope);
         let mut list_state = ListState::default();
         if !rows.is_empty() {
             list_state.select(Some(0));
@@ -183,6 +198,7 @@ impl App {
             browsing_cwd: None,
             browsing: None,
             adding_session: None,
+            untracked_scope,
         }
     }
 
@@ -505,7 +521,7 @@ impl App {
             if let Ok(ws) = crate::config::load(&opts) {
                 self.workspace = ws;
                 let live = self.mux.list_sessions().unwrap_or_default();
-                self.rows = crate::tui::view::build_rows(&self.workspace, &live);
+                self.rows = crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
             }
         }
     }
@@ -587,7 +603,7 @@ impl App {
                     // tracked row (if any) falls back to NotStarted;
                     // untracked rows vanish entirely.
                     let live = self.mux.list_sessions().unwrap_or_default();
-                    self.rows = crate::tui::view::build_rows(&self.workspace, &live);
+                    self.rows = crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
                     if self.rows.is_empty() {
                         self.list_state.select(None);
                     } else {
@@ -613,7 +629,7 @@ impl App {
                         // reappears as an Untracked row after rebuild.
                         self.workspace.sessions.retain(|s| s.name != name);
                         let live = self.mux.list_sessions().unwrap_or_default();
-                        self.rows = crate::tui::view::build_rows(&self.workspace, &live);
+                        self.rows = crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
                         // Keep selection in-bounds.
                         if self.rows.is_empty() {
                             self.list_state.select(None);
@@ -682,7 +698,7 @@ impl App {
                     Ok(reloaded) => {
                         self.workspace = reloaded;
                         let live = self.mux.list_sessions().unwrap_or_default();
-                        self.rows = crate::tui::view::build_rows(&self.workspace, &live);
+                        self.rows = crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
                         if !self.rows.is_empty() {
                             let sel = self.list_state.selected().unwrap_or(0);
                             self.list_state.select(Some(sel.min(self.rows.len() - 1)));
@@ -841,7 +857,7 @@ impl App {
                                         self.workspace = reloaded;
                                         let live = self.mux.list_sessions().unwrap_or_default();
                                         self.rows =
-                                            crate::tui::view::build_rows(&self.workspace, &live);
+                                            crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
                                     }
                                     self.set_status(format!("cwd updated for {sn:?}"));
                                 }
