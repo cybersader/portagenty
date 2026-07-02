@@ -184,10 +184,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str) {
 }
 
 /// Break `text` into lines no longer than `width` chars, splitting
-/// on whitespace where possible. Pure utility — exposed for use by
-/// the confirm modal sizer; could move to a `tui::wrap` module
-/// later if other callers want it.
-fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+/// on whitespace where possible. Pure utility — used by the confirm
+/// modal sizer and the session-list expand-on-select detail lines.
+/// Could move to a `tui::text` module later if more callers want it.
+pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }

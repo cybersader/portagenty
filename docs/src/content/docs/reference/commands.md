@@ -76,12 +76,27 @@ reachable by `pa <path>` and `pa://` links.
 | `e` | Edit session (name / cwd / command / kind / env) |
 | `d` | Delete session from workspace TOML (with confirm) |
 | `x` | Kill a live mpx session (with confirm) |
+| `z` | Toggle expand-on-select (see below) |
 | `m` | Switch workspace multiplexer (tmux ↔ zellij) |
 | `t` | Open the file tree rooted at the workspace's directory |
 | `o` | Open a plain shell at the workspace's directory (exits pa) |
 | `?` | Help overlay |
 | `Esc` / `q` / `Ctrl+Q` | Back to workspace picker |
 | `Ctrl+C` | Exit `pa` directly |
+
+### Expand-on-select
+
+The highlighted session row expands in place to show its full
+**description**, its **real command**, and its **cwd** on dim,
+labeled lines (`desc ▸` / `cmd ▸` / `cwd ▸`). Collapsed rows stay
+one line, so the list stays scannable and only one row is ever tall.
+
+This is also how you see the real command on an **annotated** row:
+when a session has a `description`, the COMMAND column shows the
+note instead of the command, so the `cmd ▸` expansion line is where
+the actual launch command lives. The description is capped at 3
+wrapped lines. Press `z` to toggle the whole behavior off for
+maximum-density scanning (session-local; on by default).
 
 ### Find overlay (triggered by `n` in picker or `e → c` in session list)
 

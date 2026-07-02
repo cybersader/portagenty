@@ -65,6 +65,17 @@ Explicitly **not** in v1:
    in the detail column on wide terminals (replacing the raw
    command) and on the indented second line in narrow mode. Set via
    `pa add --description` / `pa edit --description` (empty clears).
+9b. **Expand-on-select (session list).** The highlighted row expands
+   in place to show full `desc ▸ / cmd ▸ / cwd ▸` on dim labeled
+   lines; collapsed rows stay one line so only one row is ever tall.
+   `z` toggles it (session-local, on by default). Fixes the 9a
+   regression where an annotated row's COMMAND cell hides the real
+   command — the `cmd ▸` line is where it reappears. Description
+   capped at 3 wrapped lines. Reuses the multi-line-ListItem idiom
+   the narrow card already used + `wrap_to_width`. Design panel
+   (14-agent workflow) picked this over a master-detail pane (the
+   DESIGN §10 two-pane, kept as the wide-desktop follow-on) and
+   always-wrap.
 10a. **Per-session env vars.** `env` field on sessions threaded
    through the merge into the launch path. tmux uses `-e KEY=VAL`
    per entry; zellij wraps `bash -c "<cmd>"` in `env KEY=VAL ...`

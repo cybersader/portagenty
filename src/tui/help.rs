@@ -179,6 +179,10 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("e", "edit session field (rename/cwd/cmd/kind/env)"));
             lines.push(row("d", "delete the session (edits TOML)"));
             lines.push(row("x", "kill the live mpx session"));
+            lines.push(row(
+                "z",
+                "toggle expand-on-select (full desc/cmd/cwd on the highlighted row)",
+            ));
             lines.push(row("m", "switch workspace multiplexer (tmux ↔ zellij)"));
             lines.push(Line::raw(""));
             lines.push(heading(" Coming soon"));

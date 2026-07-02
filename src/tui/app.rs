@@ -109,6 +109,11 @@ pub struct App {
     /// pseudo-workspace shows everything. Decided once at
     /// construction from whether the workspace has a file on disk.
     untracked_scope: crate::tui::view::UntrackedScope,
+    /// When true, the highlighted row expands in place to show its
+    /// full description, real command, and cwd on dim labeled lines.
+    /// Default on; `z` toggles it off for max-density scanning.
+    /// Session-local (not persisted) for now.
+    expand_selected: bool,
 }
 
 /// Two-stage state for the "add new session" modal.
@@ -199,6 +204,7 @@ impl App {
             browsing: None,
             adding_session: None,
             untracked_scope,
+            expand_selected: true,
         }
     }
 
@@ -986,6 +992,18 @@ impl App {
                 self.open_file_tree();
                 Action::None
             }
+            // `z` → toggle expand-on-select. When on (default), the
+            // highlighted row shows full desc/cmd/cwd; off is max-
+            // density one-line scanning.
+            (KeyCode::Char('z'), _) => {
+                self.expand_selected = !self.expand_selected;
+                self.set_status(if self.expand_selected {
+                    "expand-on-select: on"
+                } else {
+                    "expand-on-select: off"
+                });
+                Action::None
+            }
             // `q` in the session list closes this view and goes back
             // to the workspace picker (home screen). `Ctrl+Q` matches
             // for symmetry. `Ctrl+C` still hard-quits the app for the
@@ -1215,6 +1233,13 @@ impl App {
                     ),
                     Span::styled("kill  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
+                        "z ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("fold  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
                         "m ",
                         Style::default()
                             .fg(Color::Cyan)
@@ -1302,10 +1327,26 @@ impl App {
         let cwd_col = (remaining * 55 / 100).min(40);
         let cmd_col = remaining.saturating_sub(cwd_col + 2);
 
+        // Only the highlighted row expands (when the feature is on),
+        // so at most one row is ever multi-line beyond its base form.
+        let selected = self.list_state.selected();
+        let expand = self.expand_selected;
         let items: Vec<ListItem> = self
             .rows
             .iter()
-            .map(|r| row_list_item(r, name_col, width, cwd_col, cmd_col, kind_space > 0))
+            .enumerate()
+            .map(|(i, r)| {
+                let expanded = expand && Some(i) == selected;
+                row_list_item(
+                    r,
+                    name_col,
+                    width,
+                    cwd_col,
+                    cmd_col,
+                    kind_space > 0,
+                    expanded,
+                )
+            })
             .collect();
 
         let list = List::new(items)
@@ -1320,6 +1361,7 @@ impl App {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_list_item(
     row: &SessionRow,
     name_col: usize,
@@ -1327,6 +1369,7 @@ fn row_list_item(
     cwd_col: usize,
     cmd_col: usize,
     reserve_kind_space: bool,
+    expanded: bool,
 ) -> ListItem<'static> {
     // State marker (● ○ ?) — color encodes Live/NotStarted/Untracked.
     // The session name picks up the same hue (not full color) so the
@@ -1433,7 +1476,11 @@ fn row_list_item(
         };
         let detail = pad_or_truncate(&raw_detail, detail_budget);
         let line2 = Line::from(vec![Span::raw("    "), Span::styled(detail, detail_style)]);
-        return ListItem::new(vec![line1, line2]);
+        let mut lines = vec![line1, line2];
+        if expanded {
+            lines.extend(expansion_lines(row, description, width));
+        }
+        return ListItem::new(lines);
     }
 
     // Wide: single-line aligned table matching the column header.
@@ -1497,7 +1544,93 @@ fn row_list_item(
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
-    ListItem::new(Line::from(spans))
+    let mut lines = vec![Line::from(spans)];
+    if expanded {
+        lines.extend(expansion_lines(row, description, width));
+    }
+    ListItem::new(lines)
+}
+
+/// Detail lines appended beneath the highlighted row when
+/// expand-on-select is on. Reveals the full (wrapped) description,
+/// the REAL command — which an annotated row's COMMAND cell hides —
+/// and the cwd, each behind a dim left-gutter label (`desc ▸` /
+/// `cmd ▸` / `cwd ▸`). Only ever rendered on the selected row, which
+/// always carries the highlight background, so the description text
+/// is left un-dimmed for legibility on that saturated background;
+/// the technical cmd/cwd stay dim. Bounded: the description is capped
+/// at 3 wrapped lines so a short terminal can't clip a tall item.
+fn expansion_lines(row: &SessionRow, description: Option<&str>, width: u16) -> Vec<Line<'static>> {
+    // 5 indent + 4 label + " ▸ " = 12 cols before the value starts.
+    const VALUE_INDENT: usize = 12;
+    const MAX_DESC_LINES: usize = 3;
+    let value_w = (width as usize).saturating_sub(VALUE_INDENT).max(8);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let plain = Style::default();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if let Some(desc) = description {
+        let wrapped = crate::tui::confirm::wrap_to_width(desc, value_w);
+        let shown = wrapped.len().min(MAX_DESC_LINES);
+        for (i, chunk) in wrapped.iter().take(shown).enumerate() {
+            let mut text = chunk.clone();
+            // Mark truncation if the description ran past the cap.
+            if i + 1 == shown && wrapped.len() > MAX_DESC_LINES {
+                text = clip_end(&format!("{text} …"), value_w);
+            }
+            if i == 0 {
+                lines.push(labeled_detail_line("desc", text, plain));
+            } else {
+                lines.push(detail_continuation_line(text, plain));
+            }
+        }
+    }
+    // The real command — the one an annotated COMMAND cell overrides.
+    lines.push(labeled_detail_line(
+        "cmd",
+        clip_end(&row.command_display, value_w),
+        dim,
+    ));
+    lines.push(labeled_detail_line(
+        "cwd",
+        clip_end(&compact_path(&row.cwd_display), value_w),
+        dim,
+    ));
+    lines
+}
+
+/// First line of a labeled detail field: `     desc ▸ <value>`.
+fn labeled_detail_line(label: &str, value: String, value_style: Style) -> Line<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    Line::from(vec![
+        Span::raw("     "),
+        Span::styled(format!("{label:<4}"), dim),
+        Span::styled(" ▸ ", dim),
+        Span::styled(value, value_style),
+    ])
+}
+
+/// Wrapped-description continuation line, aligned under the value.
+fn detail_continuation_line(value: String, value_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("            "), // 12 spaces = VALUE_INDENT
+        Span::styled(value, value_style),
+    ])
+}
+
+/// Truncate `s` to `width` chars, appending `…` when it overflows.
+/// End-truncation (not middle) — cheap and fine for detail values.
+fn clip_end(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = s.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
 
 /// Centered two-field input modal for adding a new session. Stage
@@ -1878,6 +2011,87 @@ mod tests {
         let _ = render_to_backend(&mut app, 80, 3);
     }
 
+    fn workspace_with_description(desc: &str, cmd: &str) -> Workspace {
+        Workspace {
+            name: "ws".into(),
+            id: None,
+            file_path: None,
+            multiplexer: MpxEnum::Tmux,
+            projects: vec![],
+            sessions: vec![Session {
+                name: "agent".into(),
+                cwd: PathBuf::from("/home/u/work/api"),
+                command: cmd.into(),
+                kind: None,
+                env: std::collections::BTreeMap::new(),
+                description: Some(desc.into()),
+            }],
+        }
+    }
+
+    fn full_screen(t: &Terminal<TestBackend>, h: u16) -> String {
+        (0..h).map(|y| line_at(t, y)).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn selected_row_expands_to_show_description_and_real_command() {
+        // The regression the description feature introduced: an
+        // annotated row's COMMAND cell shows the note, hiding the real
+        // command. Expand-on-select must surface both.
+        let ws = workspace_with_description(
+            "run the nightly eval sweep and do not kill it",
+            "claude --resume --dangerously-skip-permissions",
+        );
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let t = render_to_backend(&mut app, 100, 16);
+        let screen = full_screen(&t, 16);
+        assert!(
+            screen.contains("nightly eval sweep"),
+            "full description not expanded:\n{screen}"
+        );
+        assert!(
+            screen.contains("cmd"),
+            "cmd label missing from expansion:\n{screen}"
+        );
+        assert!(
+            screen.contains("claude --resume"),
+            "real command still hidden:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn z_toggles_expansion_off() {
+        let ws = workspace_with_description(
+            "some long note about what this session is for",
+            "claude --resume --dangerously-skip-permissions",
+        );
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.handle_key(KeyCode::Char('z'), KeyModifiers::NONE);
+        let t = render_to_backend(&mut app, 100, 16);
+        let screen = full_screen(&t, 16);
+        // With expansion off, the real command (only visible in the
+        // expansion when a description overrides the COMMAND cell) is
+        // gone again.
+        assert!(
+            !screen.contains("--dangerously-skip-permissions"),
+            "expansion still rendered after z:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn expansion_survives_short_terminal_without_panic() {
+        // Bounded expansion (<=3 desc lines + cmd + cwd) must not
+        // panic even when the item is taller than the viewport.
+        let ws = workspace_with_description(
+            "a very long description that will wrap across several lines when the terminal \
+             is wide enough to show it but the terminal here is short so clipping applies",
+            "claude",
+        );
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        let _ = render_to_backend(&mut app, 40, 5);
+        let _ = render_to_backend(&mut app, 100, 6);
+    }
+
     fn line_at(t: &Terminal<TestBackend>, y: u16) -> String {
         let buf = t.backend().buffer();
         let w = buf.area().width;
@@ -1932,6 +2146,9 @@ mod tests {
             }],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        // This test asserts the collapsed single-line column layout;
+        // turn off expand-on-select so row Y-coords are stable.
+        app.expand_selected = false;
         let terminal = render_to_backend(&mut app, 100, 5);
 
         let body = line_at(&terminal, first_body_row(100));
@@ -2326,6 +2543,9 @@ mod tests {
             Box::new(MockMultiplexer::new()),
             vec![live_session("s0"), live_session_bare("extra")],
         );
+        // Asserts one-line-per-row ordering; disable expand-on-select
+        // so the selected row doesn't push the others down.
+        app.expand_selected = false;
         let terminal = render_to_backend(&mut app, 100, 10);
         // Body begins at first_body_row. Three rows expected in order:
         // row N   = s0 (live ●), N+1 = s1 (not-started ○),
@@ -2413,6 +2633,9 @@ mod tests {
             ("notype", None),
         ]);
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        // One glyph row per session — disable expand-on-select so the
+        // selected row's detail lines don't shift the rows below.
+        app.expand_selected = false;
         let terminal = render_to_backend(&mut app, 120, 12);
 
         // Body begins at first_body_row(120); seven rows follow.
