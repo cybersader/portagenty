@@ -136,6 +136,10 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
                 "r",
                 "reveal: show file path + option to open a shell there",
             ));
+            lines.push(row(
+                "M",
+                "toggle mouse (wheel scroll · click select · dbl-click open) — off by default; on disables native text-copy",
+            ));
         }
         HelpContext::SessionList => {
             lines.push(heading(" Session list — navigation"));

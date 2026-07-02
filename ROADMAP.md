@@ -156,6 +156,19 @@ real projects:
   display preference (`archived = true` on the global `[[workspace]]`
   entry) — it never touches the workspace TOML and archived
   workspaces stay reachable by path / `pa://`.
+- **Picker organization: tags + filter + mouse.** `/` incremental
+  fuzzy filter (name/path/tag, keeps recency order); `t` edits the
+  committable `tags = [...]` TOML field (chips render on rows); `f`
+  cycles a single-tag view filter; workspaces also inherit their
+  registered projects' `[[project]]` tags (ROADMAP item 4). `M`
+  toggles opt-in mouse in the picker (wheel scroll / click select /
+  double-click open; `[ui] mouse` machine-local flag, off by default
+  because capture disables native text-copy; picker-only so the
+  session list keeps native selection). Built over a filtered-view
+  (`visible` index) model so every row action still targets the
+  right workspace when filtered. Design chosen by a 14-agent
+  workflow (pin+sort and section-grouping deferred; the latter is
+  the only option needing an index-model refactor).
 - **Workspace scaffolder extracted.** `crate::scaffold::create_at`
   is the single source of truth for filename sanitization, TOML
   body rendering, and global registration. `pa init`, the

@@ -11,12 +11,38 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     DefaultTerminal,
 };
+
+/// RAII: disables terminal mouse capture on drop, so every exit path
+/// out of the picker (including a `?` early-return or an unwinding
+/// panic) leaves the terminal clean — no stray scroll escape codes in
+/// the user's shell afterwards. Harmless if capture was never on.
+struct MouseCaptureGuard;
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    }
+}
+
+/// Enable or disable terminal mouse capture. Best-effort — a failure
+/// just means the terminal doesn't support it and keyboard nav (the
+/// guaranteed path) is unaffected.
+fn set_mouse_capture(on: bool) {
+    let _ = if on {
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+    } else {
+        crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+    };
+}
 
 /// What the picker returned.
 #[derive(Debug, Clone)]
@@ -192,6 +218,17 @@ pub fn run(
     // either is active.
     let mut tag_filter: Option<String> = None;
     let mut text_filter: Option<String> = None;
+    // Opt-in mouse. Capture is enabled only while the picker is shown
+    // (this loop) so the session list keeps the terminal's native
+    // click-drag text selection of its commands/paths. `M` toggles it
+    // live + persists. The guard disables capture on every return.
+    let mut mouse_on = crate::config::ui_mouse_enabled();
+    if mouse_on {
+        set_mouse_capture(true);
+    }
+    let _mouse_guard = MouseCaptureGuard;
+    // (row index, instant) of the last left-click, for double-click.
+    let mut last_click: Option<(usize, std::time::Instant)> = None;
     // Live-session count per workspace, used to render a "2 live"
     // badge next to each row. Probed over both buckets so counts are
     // correct in either view; refreshed on Ctrl+R for the power user.
@@ -250,7 +287,64 @@ pub fn run(
         if !event::poll(std::time::Duration::from_millis(250))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let ev = event::read()?;
+        // Mouse events only arrive while capture is on. Wheel scrolls
+        // the selection; left-click selects the row under the cursor;
+        // a second click on the same row within 400ms opens it. Modals
+        // ignore mouse (keyboard-only), so we skip when an overlay is
+        // up. Hit-test assumes uniform rows per width tier (1 line at
+        // ≥70 cols, else a 2-line card) below the title + hint rows.
+        if let Event::Mouse(me) = ev {
+            let modal_up = help_open || info.is_some() || pending.is_some() || search.is_some();
+            if mouse_on && !modal_up {
+                match me.kind {
+                    MouseEventKind::ScrollDown => {
+                        let sel = state.selected().unwrap_or(0);
+                        state.select(Some((sel + 1) % total));
+                    }
+                    MouseEventKind::ScrollUp => {
+                        let sel = state.selected().unwrap_or(0);
+                        state.select(Some(if sel == 0 { total - 1 } else { sel - 1 }));
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let w = terminal.size().map(|s| s.width).unwrap_or(80);
+                        let row_h: usize = if w >= 70 { 1 } else { 2 };
+                        const LIST_TOP: u16 = 2; // title + hint rows
+                        if me.row >= LIST_TOP {
+                            let disp = state.offset() + (me.row - LIST_TOP) as usize / row_h;
+                            if disp < total {
+                                let now = std::time::Instant::now();
+                                let is_double = last_click.is_some_and(|(idx, t)| {
+                                    idx == disp
+                                        && now.duration_since(t)
+                                            < std::time::Duration::from_millis(400)
+                                });
+                                state.select(Some(disp));
+                                if is_double {
+                                    last_click = None;
+                                    if has_sentinel && disp == visible.len() {
+                                        return Ok(PickerOutcome::LiveBrowse);
+                                    }
+                                    if let Some(p) = selected_workspace(
+                                        &workspaces,
+                                        &visible,
+                                        &state,
+                                        has_sentinel,
+                                    ) {
+                                        return Ok(PickerOutcome::Workspace(p));
+                                    }
+                                } else {
+                                    last_click = Some((disp, now));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        let Event::Key(key) = ev else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -714,6 +808,21 @@ pub fn run(
             }
             (KeyCode::Char('e'), _) => {
                 status.set("e: in-TUI workspace editing is coming soon".into());
+            }
+            // M → toggle opt-in mouse (wheel-scroll + click-select +
+            // double-click-open), persisted machine-locally. Default
+            // off because capture disables the terminal's own
+            // click-drag copy of the paths shown in rows. Picker-only:
+            // the session list keeps native text selection.
+            (KeyCode::Char('M'), _) => {
+                mouse_on = !mouse_on;
+                set_mouse_capture(mouse_on);
+                let _ = crate::config::set_ui_mouse(mouse_on);
+                status.set(if mouse_on {
+                    "mouse: on — wheel scrolls · click selects · dbl-click opens".into()
+                } else {
+                    "mouse: off — native text-selection restored".into()
+                });
             }
             (KeyCode::Char('R'), _) => {
                 if let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)

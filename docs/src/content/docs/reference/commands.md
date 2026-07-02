@@ -83,6 +83,23 @@ Two more ways to cut through a long list:
 A workspace also inherits any tags its registered projects carry in
 the global `[[project]]` registry (see the schema reference).
 
+### Mouse (opt-in)
+
+Press `M` in the picker to toggle **mouse mode** (persisted as
+`[ui] mouse = true` in your global config). When on:
+
+- **wheel** scrolls the selection,
+- **left-click** selects the row under the cursor,
+- **double-click** (same row, <400ms) opens it.
+
+Off by default, and picker-only on purpose: enabling terminal mouse
+capture **disables your terminal's own click-drag text selection**
+of the paths shown in rows, so the session list is deliberately left
+mouse-free (native copy keeps working there). Capture is only active
+while the picker is on screen. Keyboard navigation is always the
+guaranteed path — mouse is never required (and Android/Termux report
+mouse poorly, so don't rely on it there).
+
 ### Session list
 
 | Key | Action |
