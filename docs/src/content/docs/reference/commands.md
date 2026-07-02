@@ -39,6 +39,9 @@ pressing `Esc` from the session list.
 | `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `PgDn` / `PgUp` | 10-row jumps |
 | `n` | Find a folder + scaffold a new workspace |
+| `/` | Filter: type to fuzzy-match name / path / tag; `Esc` clears |
+| `f` | Cycle the tag filter (none → tag → … → none) |
+| `t` | Edit the highlighted workspace's tags (comma-separated) |
 | `R` | Rename workspace (edits TOML `name` field) |
 | `r` | Reveal workspace path (auto-copies; press `o` inside to open shell there) |
 | `a` | Archive workspace — hide it from this list (reversible). In the archived view, `a` unarchives instead. |
@@ -60,6 +63,25 @@ per-machine display preference (stored as `archived = true` on the
 `[[workspace]]` entry in your global config); it never touches the
 workspace TOML or its files, and archived workspaces are still
 reachable by `pa <path>` and `pa://` links.
+
+### Filtering + tags
+
+Two more ways to cut through a long list:
+
+- **`/` filter** — start typing to fuzzy-match the list live by name,
+  path, and tags (case-insensitive subsequence). The recency order is
+  preserved (it filters, it doesn't re-rank). `Enter` opens the
+  highlighted match; `Esc` clears the query then exits filter mode.
+  `Ctrl+F` is an alias for `/`.
+- **`t` tags** — tag the highlighted workspace with a comma-separated
+  list; it's written to the committable `tags = [...]` field in the
+  workspace TOML (so tags travel with the file). Tags show as dim
+  `#chip`s on each row.
+- **`f` tag-filter** — cycle a single-tag view filter (none → most
+  common tag → … → none). The title bar shows the active `#tag`.
+
+A workspace also inherits any tags its registered projects carry in
+the global `[[project]]` registry (see the schema reference).
 
 ### Session list
 

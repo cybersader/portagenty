@@ -28,6 +28,10 @@ multiplexer = "tmux"                          # or "zellij"
 # Optional — projects this workspace covers. Paths accept ~ and ${VAR}.
 projects = ["~/code/portagenty", "./cyberbase"]
 
+# Optional — tags for organizing the picker (filter / grouping).
+# Committable; set them in-TUI with `t` or here by hand.
+tags = ["rust", "agentic"]
+
 # Optional (auto-maintained) — historical locations the workspace
 # lived at before it was moved. pa auto-appends on walk-up
 # re-registration; external tools (portaconv) read this to bridge
@@ -69,6 +73,15 @@ with a clear "use tmux or zellij" message; see
 Paths to project roots. Resolved against the workspace file's
 directory for relative entries; `~` expands to `$HOME`; `${VAR}`
 expands to the env var.
+
+### `tags`
+Free-form strings for organizing the workspace picker. Committable —
+they travel with the file. Drives the picker's `#chip`s, the `/`
+filter, and the `f` tag-filter. Set them in-TUI (`t` on a picker row)
+or here by hand. At load time a workspace also **inherits** the tags
+of any of its `projects` that are registered with `tags` in the
+global `[[project]]` table (own tags first, then project tags,
+de-duplicated).
 
 ### `previous_paths`
 Historical on-disk locations this workspace lived at before. **You

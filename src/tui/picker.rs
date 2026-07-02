@@ -94,6 +94,10 @@ enum PickerPending {
     /// Rename the workspace's display name. Holds the file path and
     /// the user's in-progress input. Enter commits, Esc cancels.
     Rename { path: PathBuf, input: String },
+    /// Edit the workspace's tags (comma-separated). Holds the file
+    /// path + in-progress input, seeded with the current tags. Enter
+    /// writes the TOML `tags` array; Esc cancels.
+    EditTags { path: PathBuf, input: String },
     /// Kill every live mpx session belonging to this workspace.
     /// Triggered by `X` in the picker. Holds the workspace's display
     /// name (for the prompt title), the resolved multiplexer (to
@@ -128,6 +132,25 @@ enum PickerView {
     Archived,
 }
 
+/// Everything `render` needs, bundled to avoid a dozen positional
+/// args. Borrows only; the picker owns the state.
+struct RenderCtx<'a> {
+    workspaces: &'a [PathBuf],
+    /// Indices into `workspaces` that pass the active filters, in
+    /// display order.
+    visible: &'a [usize],
+    meta: &'a std::collections::HashMap<PathBuf, WsMeta>,
+    help_open: bool,
+    pending: &'a Option<PickerPending>,
+    info: &'a Option<InfoModal>,
+    status: &'a Option<String>,
+    live_counts: &'a std::collections::HashMap<PathBuf, usize>,
+    view: PickerView,
+    tag_filter: Option<&'a str>,
+    text_filter: Option<&'a str>,
+    has_sentinel: bool,
+}
+
 /// Run the picker inside an already-initialized ratatui terminal.
 /// Terminal init + restore stay with the caller so a single
 /// `ratatui::init()` handles both the picker and the session-list
@@ -158,6 +181,17 @@ pub fn run(
     let mut info: Option<InfoModal> = None;
     let mut search: Option<crate::tui::find::SearchState> = None;
     let mut status = StatusLine::default();
+    // Per-workspace name + tags, resolved once (refreshed after a tag
+    // edit) so render + filtering never re-read the TOML per frame.
+    let mut meta = build_meta(&[&workspaces, &hidden]);
+    // Organizing filters over the shown list. `tag_filter` is a
+    // persistent single-tag view filter (cycled with `f`).
+    // `text_filter` is the incremental `/` fuzzy filter: `Some(query)`
+    // means filter mode is active (query may be empty), `None` means
+    // not filtering. Both narrow `visible`; the sentinel hides while
+    // either is active.
+    let mut tag_filter: Option<String> = None;
+    let mut text_filter: Option<String> = None;
     // Live-session count per workspace, used to render a "2 live"
     // badge next to each row. Probed over both buckets so counts are
     // correct in either view; refreshed on Ctrl+R for the power user.
@@ -170,24 +204,41 @@ pub fn run(
     loop {
         // Auto-age the status line so messages don't sit forever.
         status.age_out();
-        let has_sentinel = view == PickerView::Active;
+        let filtering = tag_filter.is_some() || text_filter.is_some();
+        // The live-sessions sentinel only shows in the unfiltered
+        // active view — filtering is about finding a workspace.
+        let has_sentinel = view == PickerView::Active && !filtering;
+        let visible = compute_visible(
+            &workspaces,
+            &meta,
+            tag_filter.as_deref(),
+            text_filter.as_deref(),
+        );
         // `.max(1)` keeps the wrap-around nav math (`% total`,
-        // `total - 1`) panic-free when the archived view is empty.
-        let total = (workspaces.len() + usize::from(has_sentinel)).max(1);
-        terminal.draw(|frame| {
-            render(
-                frame,
-                &workspaces,
-                &mut state,
-                help_open,
-                &pending,
-                &info,
-                &mut search,
-                &status.text,
-                &live_counts,
-                view,
-            )
-        })?;
+        // `total - 1`) panic-free when the visible list is empty.
+        let total = (visible.len() + usize::from(has_sentinel)).max(1);
+        // Keep the selection in range as the visible set changes.
+        {
+            let sel = state.selected().unwrap_or(0);
+            if sel >= total {
+                state.select(Some(total - 1));
+            }
+        }
+        let rctx = RenderCtx {
+            workspaces: &workspaces,
+            visible: &visible,
+            meta: &meta,
+            help_open,
+            pending: &pending,
+            info: &info,
+            status: &status.text,
+            live_counts: &live_counts,
+            view,
+            tag_filter: tag_filter.as_deref(),
+            text_filter: text_filter.as_deref(),
+            has_sentinel,
+        };
+        terminal.draw(|frame| render(frame, &mut state, &mut search, rctx))?;
 
         // Drain background walker results + advance the breadcrumb
         // animation each render tick — even without a key press.
@@ -280,87 +331,142 @@ pub fn run(
         // outcome so the outer driver opens its session TUI right
         // away (per DESIGN §12: "scaffold + open immediately").
         if let Some(action) = pending.take() {
-            // Rename has its own input flow — divert keys into the
-            // input field instead of routing through the y/N confirm.
-            if let PickerPending::Rename { path, mut input } = action {
-                match key.code {
-                    KeyCode::Esc => {
-                        status.set("rename cancelled".into());
-                    }
-                    KeyCode::Enter => match crate::workspace_edit::set_name(&path, &input) {
-                        Ok(_) => status.set(format!("renamed to {input:?}")),
-                        Err(e) => status.set(format!("rename failed: {e:#}")),
-                    },
-                    KeyCode::Backspace => {
-                        input.pop();
-                        pending = Some(PickerPending::Rename { path, input });
-                    }
-                    // Ctrl+H aliases Backspace — most terminals send
-                    // Ctrl+H when Ctrl+Backspace is pressed, and ASCII
-                    // 8 is historically both. Without this, Ctrl+Bksp
-                    // inserted a literal 'h' instead of deleting.
-                    KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        input.pop();
-                        pending = Some(PickerPending::Rename { path, input });
-                    }
-                    // Ctrl+W: delete previous word (readline-style).
-                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Strip trailing spaces then the next word.
-                        while input.ends_with(' ') {
-                            input.pop();
+            // Rename + EditTags have their own text-input flow — divert
+            // keys into the input field instead of routing through the
+            // y/N confirm. On Enter they commit (differently); on Esc
+            // they cancel; all other keys edit the shared input buffer.
+            match action {
+                PickerPending::Rename { path, mut input } => {
+                    match key.code {
+                        KeyCode::Esc => status.set("rename cancelled".into()),
+                        KeyCode::Enter => match crate::workspace_edit::set_name(&path, &input) {
+                            Ok(_) => {
+                                meta = build_meta(&[&workspaces, &hidden]);
+                                status.set(format!("renamed to {input:?}"));
+                            }
+                            Err(e) => status.set(format!("rename failed: {e:#}")),
+                        },
+                        _ => {
+                            edit_text_input(&mut input, key.code, key.modifiers);
+                            pending = Some(PickerPending::Rename { path, input });
                         }
-                        while input.chars().last().is_some_and(|c| !c.is_whitespace()) {
-                            input.pop();
-                        }
-                        pending = Some(PickerPending::Rename { path, input });
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        input.clear();
-                        pending = Some(PickerPending::Rename { path, input });
-                    }
-                    // Ignore any other Ctrl+<letter> combos so they
-                    // don't get pushed into the input as raw chars.
-                    KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        pending = Some(PickerPending::Rename { path, input });
-                    }
-                    KeyCode::Char(ch) => {
-                        input.push(ch);
-                        pending = Some(PickerPending::Rename { path, input });
-                    }
-                    _ => {
-                        pending = Some(PickerPending::Rename { path, input });
-                    }
+                    continue;
                 }
-                continue;
+                PickerPending::EditTags { path, mut input } => {
+                    match key.code {
+                        KeyCode::Esc => status.set("tag edit cancelled".into()),
+                        KeyCode::Enter => {
+                            let tags = crate::workspace_edit::parse_tags_input(&input);
+                            match crate::workspace_edit::set_tags(&path, &tags) {
+                                Ok(_) => {
+                                    // Refresh meta so chips + filters
+                                    // reflect the new tags immediately.
+                                    meta = build_meta(&[&workspaces, &hidden]);
+                                    status.set(if tags.is_empty() {
+                                        "tags cleared".into()
+                                    } else {
+                                        format!("tags: {}", tags.join(", "))
+                                    });
+                                }
+                                Err(e) => status.set(format!("tag edit failed: {e:#}")),
+                            }
+                        }
+                        _ => {
+                            edit_text_input(&mut input, key.code, key.modifiers);
+                            pending = Some(PickerPending::EditTags { path, input });
+                        }
+                    }
+                    continue;
+                }
+                // Confirm-style actions (Unregister / DeleteFile /
+                // ScaffoldAt / KillAllSessions) route through the y/N
+                // classifier.
+                other => match crate::tui::confirm::classify(key.code) {
+                    crate::tui::confirm::ConfirmKey::Confirm => {
+                        if let PickerPending::ScaffoldAt(dir) = &other {
+                            match perform_scaffold_at(dir) {
+                                Ok(new_path) => {
+                                    return Ok(PickerOutcome::Workspace(new_path));
+                                }
+                                Err(e) => {
+                                    status.set(format!("scaffold failed: {e:#}"));
+                                }
+                            }
+                        } else {
+                            // Re-probe live counts after a kill so the
+                            // badge column reflects reality without
+                            // waiting for Ctrl+R. Other actions don't
+                            // touch live mpx state, so spare them the
+                            // probe cost (~100ms per distinct mpx).
+                            let was_kill = matches!(other, PickerPending::KillAllSessions { .. });
+                            let msg = perform_picker_action(other, &mut workspaces, &mut state);
+                            status.set(msg);
+                            if was_kill {
+                                live_counts = compute_live_counts(&workspaces);
+                            }
+                        }
+                    }
+                    crate::tui::confirm::ConfirmKey::Cancel => {
+                        status.set("cancelled".into());
+                    }
+                },
             }
-
-            match crate::tui::confirm::classify(key.code) {
-                crate::tui::confirm::ConfirmKey::Confirm => {
-                    if let PickerPending::ScaffoldAt(dir) = &action {
-                        match perform_scaffold_at(dir) {
-                            Ok(new_path) => {
-                                return Ok(PickerOutcome::Workspace(new_path));
-                            }
-                            Err(e) => {
-                                status.set(format!("scaffold failed: {e:#}"));
-                            }
-                        }
+            continue;
+        }
+        // Text-filter (`/`) input mode: keys type into the query and
+        // narrow the list live. Only nav + open + exit keys are
+        // special; everything else edits the query. Runs before the
+        // main keymap so `a`/`d`/`n`/etc. become literal query chars
+        // while filtering.
+        if let Some(mut query) = text_filter.take() {
+            match key.code {
+                KeyCode::Esc => {
+                    // First Esc with a query clears it (stay in filter
+                    // mode); an empty-query Esc exits filter mode.
+                    if query.is_empty() {
+                        // text_filter stays None → exit.
+                        state.select(Some(0));
                     } else {
-                        // Re-probe live counts after a kill so the
-                        // badge column reflects reality without
-                        // waiting for Ctrl+R. Other actions don't
-                        // touch live mpx state, so spare them the
-                        // probe cost (~100ms per distinct mpx).
-                        let was_kill = matches!(action, PickerPending::KillAllSessions { .. });
-                        let msg = perform_picker_action(action, &mut workspaces, &mut state);
-                        status.set(msg);
-                        if was_kill {
-                            live_counts = compute_live_counts(&workspaces);
-                        }
+                        query.clear();
+                        text_filter = Some(query);
+                        state.select(Some(0));
                     }
                 }
-                crate::tui::confirm::ConfirmKey::Cancel => {
-                    status.set("cancelled".into());
+                KeyCode::Enter | KeyCode::Right => {
+                    if has_sentinel && state.selected() == Some(visible.len()) {
+                        return Ok(PickerOutcome::LiveBrowse);
+                    }
+                    if let Some(p) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
+                    {
+                        return Ok(PickerOutcome::Workspace(p));
+                    }
+                    text_filter = Some(query); // no match under cursor
+                }
+                KeyCode::Up => {
+                    let sel = state.selected().unwrap_or(0);
+                    state.select(Some(if sel == 0 { total - 1 } else { sel - 1 }));
+                    text_filter = Some(query);
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let sel = state.selected().unwrap_or(0);
+                    state.select(Some(if sel == 0 { total - 1 } else { sel - 1 }));
+                    text_filter = Some(query);
+                }
+                KeyCode::Down => {
+                    let sel = state.selected().unwrap_or(0);
+                    state.select(Some((sel + 1) % total));
+                    text_filter = Some(query);
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let sel = state.selected().unwrap_or(0);
+                    state.select(Some((sel + 1) % total));
+                    text_filter = Some(query);
+                }
+                _ => {
+                    edit_text_input(&mut query, key.code, key.modifiers);
+                    text_filter = Some(query);
+                    state.select(Some(0));
                 }
             }
             continue;
@@ -371,11 +477,14 @@ pub fn run(
             }
             (KeyCode::Char('q'), _) => return Ok(PickerOutcome::Quit),
             (KeyCode::Esc, _) => {
-                // Two-stage Esc: dismiss a status line first, then
-                // exit pa on the second press. Prevents an
-                // accidental Esc from quitting after a stray action.
+                // Esc precedence: dismiss a status line, then clear an
+                // active tag filter, then exit pa. Each stage prevents
+                // an accidental Esc from quitting with state still up.
                 if status.text.is_some() {
                     status.clear();
+                } else if tag_filter.is_some() {
+                    tag_filter = None;
+                    state.select(Some(0));
                 } else {
                     return Ok(PickerOutcome::Quit);
                 }
@@ -427,12 +536,53 @@ pub fn run(
             // `l` / Right → open highlighted workspace (vim-style
             // "move right into the thing you're looking at").
             (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
-                let sel = state.selected().unwrap_or(0);
-                if has_sentinel && sel == workspaces.len() {
+                if has_sentinel && state.selected() == Some(visible.len()) {
                     return Ok(PickerOutcome::LiveBrowse);
                 }
-                if let Some(p) = workspaces.get(sel) {
-                    return Ok(PickerOutcome::Workspace(p.clone()));
+                if let Some(p) = selected_workspace(&workspaces, &visible, &state, has_sentinel) {
+                    return Ok(PickerOutcome::Workspace(p));
+                }
+            }
+            // / → enter incremental fuzzy filter mode over the shown
+            // workspaces (name + path + tags). Keeps recency order.
+            (KeyCode::Char('/'), _) => {
+                text_filter = Some(String::new());
+                state.select(Some(0));
+            }
+            (KeyCode::Char('f'), m) if m.contains(KeyModifiers::CONTROL) => {
+                text_filter = Some(String::new());
+                state.select(Some(0));
+            }
+            // f → cycle the single-tag view filter: none → tag1 → … →
+            // none. A no-op (with a hint) when nothing is tagged.
+            (KeyCode::Char('f'), _) => {
+                let tags = distinct_tags(&workspaces, &meta);
+                if tags.is_empty() {
+                    status.set("f: no tags yet — press t to tag the highlighted workspace".into());
+                } else {
+                    tag_filter = cycle_tag_filter(tag_filter.as_deref(), &tags);
+                    state.select(Some(0));
+                    match &tag_filter {
+                        Some(t) => status.set(format!("filter: #{t}")),
+                        None => status.set("filter cleared".into()),
+                    }
+                }
+            }
+            // t → edit the highlighted workspace's tags (comma-
+            // separated). Writes the committable TOML `tags` array.
+            (KeyCode::Char('t'), _) => {
+                if let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
+                {
+                    let current = meta
+                        .get(&path)
+                        .map(|m| m.tags.join(", "))
+                        .unwrap_or_default();
+                    pending = Some(PickerPending::EditTags {
+                        path,
+                        input: current,
+                    });
+                } else {
+                    status.set("t: live-sessions row can't be tagged".into());
                 }
             }
             // a → archive the highlighted workspace (active view) or
@@ -441,22 +591,18 @@ pub fn run(
             // long registries don't bury the workspaces you actually
             // use. The file + its registration both stay put.
             (KeyCode::Char('a'), _) => {
-                let sel = state.selected().unwrap_or(0);
-                if has_sentinel && sel == workspaces.len() {
+                let Some(ws_idx) = selected_ws_index(&visible, &state, has_sentinel) else {
                     status.set("a: the live-sessions row can't be archived".into());
                     continue;
-                }
-                let Some(path) = workspaces.get(sel).cloned() else {
-                    continue;
                 };
+                let path = workspaces[ws_idx].clone();
                 let archive = view == PickerView::Active;
                 match crate::config::set_workspace_archived(&path, archive) {
                     Ok(()) => {
                         // Move the row from the shown bucket to the
                         // hidden one and keep the selection in range.
-                        workspaces.remove(sel);
+                        workspaces.remove(ws_idx);
                         hidden.push(path.clone());
-                        clamp_selection_view(&workspaces, &mut state, has_sentinel);
                         let name = read_workspace_name(&path)
                             .unwrap_or_else(|| path.display().to_string());
                         if archive {
@@ -477,6 +623,7 @@ pub fn run(
             }
             // A → toggle between the active list and the archived
             // list. Refuses to switch to an empty archived view.
+            // Clears any active filter so the swapped-in view is fresh.
             (KeyCode::Char('A'), _) => match view {
                 PickerView::Active => {
                     if hidden.is_empty() {
@@ -484,6 +631,8 @@ pub fn run(
                     } else {
                         std::mem::swap(&mut workspaces, &mut hidden);
                         view = PickerView::Archived;
+                        tag_filter = None;
+                        text_filter = None;
                         state.select(Some(0));
                         status.set("archived view — a to unarchive, A to go back".into());
                     }
@@ -491,12 +640,15 @@ pub fn run(
                 PickerView::Archived => {
                     std::mem::swap(&mut workspaces, &mut hidden);
                     view = PickerView::Active;
+                    tag_filter = None;
+                    text_filter = None;
                     state.select(Some(0));
                     status.clear();
                 }
             },
             (KeyCode::Char('d'), _) => {
-                if let Some(path) = selected_workspace(&workspaces, &state) {
+                if let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
+                {
                     pending = Some(PickerPending::Unregister(path));
                 } else {
                     status.set(
@@ -505,7 +657,8 @@ pub fn run(
                 }
             }
             (KeyCode::Char('D'), _) => {
-                if let Some(path) = selected_workspace(&workspaces, &state) {
+                if let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
+                {
                     pending = Some(PickerPending::DeleteFile(path));
                 } else {
                     status.set("D: nothing to delete — live-sessions row isn't a workspace".into());
@@ -518,7 +671,8 @@ pub fn run(
             // live sessions short-circuits to a status message, no
             // confirm needed (nothing to confirm).
             (KeyCode::Char('X'), _) => {
-                let Some(path) = selected_workspace(&workspaces, &state) else {
+                let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
+                else {
                     status.set(
                         "X: live-sessions row has no workspace — \
                          use `x` from inside the session list for ad-hoc kills"
@@ -545,7 +699,8 @@ pub fn run(
                 }
             }
             (KeyCode::Char('r'), _) => {
-                if let Some(path) = selected_workspace(&workspaces, &state) {
+                if let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
+                {
                     info = Some(build_reveal_modal(&path));
                 } else {
                     status.set("r: live-sessions row has no file path".into());
@@ -561,7 +716,8 @@ pub fn run(
                 status.set("e: in-TUI workspace editing is coming soon".into());
             }
             (KeyCode::Char('R'), _) => {
-                if let Some(path) = selected_workspace(&workspaces, &state) {
+                if let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
+                {
                     // Seed input with current display name so the user
                     // can tweak instead of retyping from scratch.
                     let current_name = read_workspace_name(&path).unwrap_or_default();
@@ -574,12 +730,11 @@ pub fn run(
                 }
             }
             (KeyCode::Enter, _) => {
-                let sel = state.selected().unwrap_or(0);
-                if has_sentinel && sel == workspaces.len() {
+                if has_sentinel && state.selected() == Some(visible.len()) {
                     return Ok(PickerOutcome::LiveBrowse);
                 }
-                if let Some(p) = workspaces.get(sel) {
-                    return Ok(PickerOutcome::Workspace(p.clone()));
+                if let Some(p) = selected_workspace(&workspaces, &visible, &state, has_sentinel) {
+                    return Ok(PickerOutcome::Workspace(p));
                 }
             }
             _ => {}
@@ -682,16 +837,59 @@ fn chunked_path(s: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-/// Resolve the currently-selected row to a workspace PathBuf, or
-/// `None` when the live-sessions sentinel is selected. All the
-/// row-action keys share this guard so the sentinel is handled
-/// consistently.
-fn selected_workspace(workspaces: &[PathBuf], state: &ListState) -> Option<PathBuf> {
-    let sel = state.selected()?;
-    if sel >= workspaces.len() {
-        return None;
+/// Apply one readline-style edit key to `input`: Backspace, Ctrl+H
+/// (alias), Ctrl+W (word), Ctrl+U (clear), or a printable char.
+/// Other Ctrl+<letter> combos are ignored so they don't insert
+/// literal chars. Shared by the rename + tag-edit modals and the
+/// `/` filter input.
+fn edit_text_input(input: &mut String, code: KeyCode, mods: KeyModifiers) {
+    match code {
+        KeyCode::Backspace => {
+            input.pop();
+        }
+        KeyCode::Char('h') if mods.contains(KeyModifiers::CONTROL) => {
+            input.pop();
+        }
+        KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
+            while input.ends_with(' ') {
+                input.pop();
+            }
+            while input.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                input.pop();
+            }
+        }
+        KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+            input.clear();
+        }
+        KeyCode::Char(_) if mods.contains(KeyModifiers::CONTROL) => {}
+        KeyCode::Char(ch) => input.push(ch),
+        _ => {}
     }
-    workspaces.get(sel).cloned()
+}
+
+/// Map the selected display row to an index into `workspaces`, going
+/// through the visible-filter map. Returns `None` for the
+/// live-sessions sentinel row or an out-of-range selection.
+fn selected_ws_index(visible: &[usize], state: &ListState, has_sentinel: bool) -> Option<usize> {
+    let sel = state.selected()?;
+    if has_sentinel && sel == visible.len() {
+        return None; // sentinel row
+    }
+    visible.get(sel).copied()
+}
+
+/// Resolve the currently-selected row to a workspace PathBuf, or
+/// `None` when the live-sessions sentinel (or no row) is selected.
+/// All the row-action keys share this guard so the sentinel is
+/// handled consistently, filtered or not.
+fn selected_workspace(
+    workspaces: &[PathBuf],
+    visible: &[usize],
+    state: &ListState,
+    has_sentinel: bool,
+) -> Option<PathBuf> {
+    let idx = selected_ws_index(visible, state, has_sentinel)?;
+    workspaces.get(idx).cloned()
 }
 
 /// Execute a confirmed picker action and mutate the row list + state
@@ -736,9 +934,10 @@ fn perform_picker_action(
         // success we exit the picker entirely, returning the new
         // workspace as the outcome. Reaching this arm is a bug.
         PickerPending::ScaffoldAt(_) => "scaffold path took the wrong branch (bug)".into(),
-        // Rename has its own input-divert flow in the main loop, so
-        // this arm is also unreachable in practice.
+        // Rename + EditTags have their own input-divert flow in the
+        // main loop, so these arms are unreachable in practice.
         PickerPending::Rename { .. } => "rename path took the wrong branch (bug)".into(),
+        PickerPending::EditTags { .. } => "tag-edit path took the wrong branch (bug)".into(),
     }
 }
 
@@ -855,6 +1054,163 @@ fn read_workspace_name(path: &std::path::Path) -> Option<String> {
     doc.get("name")?.as_str().map(|s| s.to_string())
 }
 
+/// Per-workspace picker metadata, resolved once per picker entry (and
+/// after tag edits) so render + filter don't re-read the TOML on
+/// every frame. `name` falls back to the filename stem.
+#[derive(Debug, Clone, Default)]
+struct WsMeta {
+    name: String,
+    tags: Vec<String>,
+}
+
+/// Read a workspace's display name + own `tags` from its TOML in one
+/// pass. Missing/unparseable files fall back to the filename stem and
+/// empty tags. Uses the workspace's *own* tags (not the project-tag
+/// union that `merge` computes) — those are what the picker's `t`
+/// editor writes and what the user manages directly.
+fn read_workspace_meta(path: &std::path::Path) -> WsMeta {
+    let fallback_name = || {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_suffix(".portagenty"))
+            .unwrap_or_else(|| path.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+            .to_string()
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return WsMeta {
+            name: fallback_name(),
+            tags: vec![],
+        };
+    };
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return WsMeta {
+            name: fallback_name(),
+            tags: vec![],
+        };
+    };
+    let name = doc
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(fallback_name);
+    let tags = doc
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    WsMeta { name, tags }
+}
+
+/// Build the path → metadata map over every workspace in both the
+/// shown and hidden buckets, so a `A` view swap or a filter never
+/// needs a re-read.
+fn build_meta(all: &[&[PathBuf]]) -> std::collections::HashMap<PathBuf, WsMeta> {
+    let mut map = std::collections::HashMap::new();
+    for list in all {
+        for p in *list {
+            map.entry(p.clone())
+                .or_insert_with(|| read_workspace_meta(p));
+        }
+    }
+    map
+}
+
+/// Case-insensitive fuzzy subsequence test: every non-space char of
+/// `needle` must appear in `hay` in order. Empty needle always
+/// matches. Keeps the picker's recency order (we filter, we don't
+/// re-rank) so rows don't jump around as you type.
+fn fuzzy_match(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let hay = hay.to_lowercase();
+    let needle = needle.to_lowercase();
+    let mut hc = hay.chars();
+    'outer: for nc in needle.chars() {
+        if nc == ' ' {
+            continue;
+        }
+        for c in hc.by_ref() {
+            if c == nc {
+                continue 'outer;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// Indices into `workspaces` that pass the active tag + text filters,
+/// in original (recency) order. A `None` tag filter and empty query
+/// pass everything.
+fn compute_visible(
+    workspaces: &[PathBuf],
+    meta: &std::collections::HashMap<PathBuf, WsMeta>,
+    tag_filter: Option<&str>,
+    query: Option<&str>,
+) -> Vec<usize> {
+    (0..workspaces.len())
+        .filter(|&i| {
+            let m = meta.get(&workspaces[i]);
+            let tag_ok = match tag_filter {
+                None => true,
+                Some(t) => m.is_some_and(|m| m.tags.iter().any(|x| x == t)),
+            };
+            if !tag_ok {
+                return false;
+            }
+            match query {
+                None | Some("") => true,
+                Some(q) => {
+                    let name = m.map(|m| m.name.as_str()).unwrap_or("");
+                    let path = workspaces[i].to_string_lossy();
+                    let tags = m.map(|m| m.tags.join(" ")).unwrap_or_default();
+                    let hay = format!("{name} {path} {tags}");
+                    fuzzy_match(&hay, q)
+                }
+            }
+        })
+        .collect()
+}
+
+/// The distinct tags present across the shown workspaces, ordered by
+/// frequency (desc) then alphabetically — the order `f` cycles.
+fn distinct_tags(
+    workspaces: &[PathBuf],
+    meta: &std::collections::HashMap<PathBuf, WsMeta>,
+) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for p in workspaces {
+        if let Some(m) = meta.get(p) {
+            for t in &m.tags {
+                *counts.entry(t.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut tags: Vec<(String, usize)> = counts.into_iter().collect();
+    tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    tags.into_iter().map(|(t, _)| t).collect()
+}
+
+/// Advance the tag filter through: none → first → … → last → none.
+/// Skips a stale filter (a tag no longer present) by restarting.
+fn cycle_tag_filter(current: Option<&str>, tags: &[String]) -> Option<String> {
+    if tags.is_empty() {
+        return None;
+    }
+    match current {
+        None => Some(tags[0].clone()),
+        Some(cur) => match tags.iter().position(|t| t == cur) {
+            Some(i) if i + 1 < tags.len() => Some(tags[i + 1].clone()),
+            _ => None, // past the end (or stale) → back to unfiltered
+        },
+    }
+}
+
 /// Run the scaffold at `dir` for a fresh workspace. The display
 /// name is the directory's basename; multiplexer comes from the
 /// machine default (or tmux). Returns the new workspace file path
@@ -943,88 +1299,105 @@ fn clamp_selection(workspaces: &[PathBuf], state: &mut ListState) {
     }
 }
 
-/// Like [`clamp_selection`] but aware of whether the current view
-/// shows the live-sessions sentinel. The archived view has no
-/// sentinel, so its row count is exactly `workspaces.len()`.
-fn clamp_selection_view(workspaces: &[PathBuf], state: &mut ListState, has_sentinel: bool) {
-    let total = workspaces.len() + usize::from(has_sentinel);
-    let sel = state.selected().unwrap_or(0);
-    if total == 0 {
-        state.select(Some(0));
-    } else {
-        state.select(Some(sel.min(total - 1)));
+/// Up-to-`max` dim `#tag` chips, with a `+N` overflow marker.
+fn tag_chip_spans(tags: &[String], max: usize) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let chip = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+    for (i, t) in tags.iter().enumerate() {
+        if i >= max {
+            out.push(Span::styled(
+                format!(" +{}", tags.len() - max),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            break;
+        }
+        out.push(Span::raw(" "));
+        out.push(Span::styled(format!("#{t}"), chip));
     }
+    out
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut Frame<'_>,
-    workspaces: &[PathBuf],
     state: &mut ListState,
-    help_open: bool,
-    pending: &Option<PickerPending>,
-    info: &Option<InfoModal>,
     search: &mut Option<crate::tui::find::SearchState>,
-    status: &Option<String>,
-    live_counts: &std::collections::HashMap<PathBuf, usize>,
-    view: PickerView,
+    ctx: RenderCtx,
 ) {
-    let archived_view = view == PickerView::Archived;
+    let archived_view = ctx.view == PickerView::Archived;
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // title
-            Constraint::Length(1), // spacer/hint
+            Constraint::Length(1), // spacer/hint (or filter input)
             Constraint::Min(0),    // list
             Constraint::Length(1), // footer line 1
             Constraint::Length(1), // footer line 2
         ])
         .split(area);
 
-    let title_text = if archived_view {
-        " portagenty  ·  archived workspaces "
-    } else {
-        " portagenty  ·  pick a workspace "
+    // Title — appends a filter indicator when a tag filter is active.
+    let title_text = match ctx.tag_filter {
+        Some(t) => format!(" portagenty  ·  #{t} "),
+        None if archived_view => " portagenty  ·  archived workspaces ".to_string(),
+        None => " portagenty  ·  pick a workspace ".to_string(),
     };
     let title = Paragraph::new(title_text).style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_widget(title, chunks[0]);
 
-    let hint_text = if archived_view {
-        " Archived workspaces — hidden from the main list. a unarchives the highlighted one; A returns to the main list. "
+    // Hint / filter row.
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let cyan = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    if let Some(q) = ctx.text_filter {
+        // Incremental `/` filter input line.
+        let line = Line::from(vec![
+            Span::styled(" /", cyan),
+            Span::styled(q.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("▏", cyan.add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw("   "),
+            Span::styled(
+                format!("matched {} of {}", ctx.visible.len(), ctx.workspaces.len()),
+                dim,
+            ),
+            Span::raw("  ·  "),
+            Span::styled("Esc to clear", dim),
+        ]);
+        frame.render_widget(Paragraph::new(line), chunks[1]);
+    } else if let Some(t) = ctx.tag_filter {
+        let line = Line::from(vec![
+            Span::raw(" filter: "),
+            Span::styled(format!("#{t}"), cyan),
+            Span::styled(format!("  ({} shown)", ctx.visible.len()), dim),
+            Span::raw("   "),
+            Span::styled("f cycles · Esc clears", dim),
+        ]);
+        frame.render_widget(Paragraph::new(line), chunks[1]);
     } else {
-        " No workspace in this directory — choose one of your registered workspaces, or browse live sessions. "
-    };
-    let hint = Paragraph::new(hint_text).style(Style::default().add_modifier(Modifier::DIM));
-    frame.render_widget(hint, chunks[1]);
+        let hint_text = if archived_view {
+            " Archived workspaces — hidden from the main list. a unarchives; A returns to the main list. "
+        } else {
+            " Pick a workspace, or browse live sessions.  / filter · f tag-filter · t tag · a archive "
+        };
+        frame.render_widget(Paragraph::new(hint_text).style(dim), chunks[1]);
+    }
 
-    // Width budget for each row so long paths don't run past the
-    // viewport. On narrow terminals we drop the path and show only
-    // the name + relative-time hint — the full path belongs in help
-    // or details, not in a row that'd truncate awkwardly.
     let row_width = chunks[2].width as usize;
-    let mut items: Vec<ListItem> = Vec::with_capacity(workspaces.len() + 1);
-    for path in workspaces {
-        // Prefer the TOML's `name` field (user-authored display name)
-        // over the filename stem. Falls back to the filename if the
-        // file is missing, unparseable, or has no `name` set.
-        let toml_name = read_workspace_name(path);
-        let fallback = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_suffix(".portagenty"))
-            .unwrap_or_else(|| path.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
-            .to_string();
-        let label_owned = toml_name.unwrap_or(fallback);
-        let label = label_owned.as_str();
+    let mut items: Vec<ListItem> = Vec::with_capacity(ctx.visible.len() + 1);
+    for &idx in ctx.visible {
+        let path = &ctx.workspaces[idx];
+        let m = ctx.meta.get(path);
+        let label = m
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| read_workspace_meta(path).name);
+        let tags: &[String] = m.map(|m| m.tags.as_slice()).unwrap_or(&[]);
         let dir = path
             .parent()
             .map(|p| compact_path(&p.display().to_string()))
             .unwrap_or_default();
         let relative = crate::state::relative_time(crate::state::last_launch_for_workspace(path));
-        // Live-session badge for this workspace, if any.
-        // Color-coded: green `●N live` when > 0, nothing otherwise.
-        let live_n = live_counts.get(path).copied().unwrap_or(0);
+        let live_n = ctx.live_counts.get(path).copied().unwrap_or(0);
         let live_badge: Option<Span<'static>> = if live_n > 0 {
             Some(Span::styled(
                 format!("● {live_n} live"),
@@ -1037,82 +1410,71 @@ fn render(
         };
 
         if row_width >= 70 {
-            // Wide: name · path · live · time. Path middle-truncates
-            // to fit; live badge only shown if > 0.
             let name_budget = label.chars().count().min(22);
-            // Remaining after: gutter(6) + name + sep(3) + time(12)
-            // + live-badge-slot(10) + pad(2). We reserve the live
-            // slot even if this row is 0-live so columns stay aligned
-            // across rows.
             let used = 6 + name_budget + 3 + 12 + 10 + 2;
             let path_budget = row_width.saturating_sub(used).clamp(10, 50);
             let mut spans = vec![
                 Span::raw(" "),
                 Span::styled("●", Style::default().fg(Color::Cyan)),
                 Span::raw("  "),
-                Span::styled(
-                    label.to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("   "),
-                Span::styled(
-                    truncate_middle(&dir, path_budget),
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
+                Span::styled(truncate_middle(&dir, path_budget), dim),
                 Span::raw("   "),
-                Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(relative, dim),
             ];
             if let Some(b) = live_badge {
                 spans.push(Span::raw("   "));
                 spans.push(b);
             }
+            // Tag chips ride the trailing flex region so the fixed
+            // columns above never shift.
+            spans.extend(tag_chip_spans(tags, 3));
             items.push(ListItem::new(Line::from(spans)));
         } else {
-            // Narrow / Termux portrait: two-line card. Line 1 name +
-            // relative time (+ live badge if any); line 2 indented
-            // dim path with middle truncation so it can't overflow.
             let path_budget = row_width.saturating_sub(6).max(10);
             let mut line1 = vec![
                 Span::raw(" "),
                 Span::styled("●", Style::default().fg(Color::Cyan)),
                 Span::raw("  "),
-                Span::styled(
-                    label.to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
-                Span::styled(relative, Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(relative, dim),
             ];
             if let Some(b) = live_badge {
                 line1.push(Span::raw("  "));
                 line1.push(b);
             }
+            line1.extend(tag_chip_spans(tags, 2));
             items.push(ListItem::new(vec![
                 Line::from(line1),
                 Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(
-                        truncate_middle(&dir, path_budget),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
+                    Span::styled(truncate_middle(&dir, path_budget), dim),
                 ]),
             ]));
         }
     }
-    // Empty-state line for the archived view (the active view always
-    // has at least the sentinel row, so it's never empty).
-    if archived_view && items.is_empty() {
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            "  (no archived workspaces — press A to go back)",
-            Style::default().add_modifier(Modifier::DIM),
-        )])));
+    // Empty-state line when nothing is visible (filtered or empty
+    // archived view). The unfiltered active view always has the
+    // sentinel, so it's never empty.
+    if items.is_empty() {
+        let msg = if ctx.text_filter.is_some() || ctx.tag_filter.is_some() {
+            "  (no matches — Esc to clear the filter)"
+        } else if archived_view {
+            "  (no archived workspaces — press A to go back)"
+        } else {
+            ""
+        };
+        if !msg.is_empty() {
+            items.push(ListItem::new(Line::from(vec![Span::styled(msg, dim)])));
+        }
     }
-    // Sentinel row: live browse. Active view only — the archived view
-    // is a plain list with no "attach to anything live" affordance.
-    if !archived_view {
+    // Sentinel row: live browse (unfiltered active view only).
+    if ctx.has_sentinel {
         items.push(ListItem::new(Line::from(vec![
             Span::raw(" "),
-            Span::styled("…", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("…", dim),
             Span::raw("  "),
             Span::styled(
                 "live sessions on this machine",
@@ -1121,10 +1483,7 @@ fn render(
                     .add_modifier(Modifier::DIM),
             ),
             Span::raw("   "),
-            Span::styled(
-                "(no workspace — just attach to what's running)",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
+            Span::styled("(no workspace — just attach to what's running)", dim),
         ])));
     }
 
@@ -1138,7 +1497,7 @@ fn render(
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, chunks[2], state);
 
-    if let Some(s) = status {
+    if let Some(s) = ctx.status {
         let line = Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -1148,15 +1507,11 @@ fn render(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(
-                "(Esc dismisses)",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
+            Span::styled("(Esc dismisses)", dim),
         ]);
         frame.render_widget(Paragraph::new(line), chunks[3]);
         frame.render_widget(Paragraph::new(""), chunks[4]);
     } else {
-        // 2-line footer. Line 1: primary. Line 2: workspace actions.
         use crate::tui::footer::Entry;
         crate::tui::footer::render(
             frame,
@@ -1165,17 +1520,13 @@ fn render(
                 Entry::new("q", "quit"),
                 Entry::new("?", "help"),
                 Entry::new("Enter/l", "open"),
+                Entry::new("/", "filter"),
                 Entry::new("j/k", "nav"),
-                Entry::new("g/G", "top/btm"),
             ],
         );
         let sep = Style::default().fg(Color::DarkGray);
-        let key = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-        let lbl = Style::default().add_modifier(Modifier::DIM);
-        // Line 2 = workspace actions, view-dependent. The archived
-        // view trims to the actions that make sense there.
+        let key = cyan;
+        let lbl = dim;
         let actions: &[(&str, &str)] = if archived_view {
             &[
                 ("a", "unarchive  "),
@@ -1187,12 +1538,13 @@ fn render(
         } else {
             &[
                 ("n", "new  "),
+                ("f", "tag  "),
+                ("t", "edit-tags  "),
                 ("a", "archive  "),
                 ("A", "archived  "),
                 ("d", "unreg  "),
                 ("D", "delete  "),
-                ("X", "kill-all  "),
-                ("r", "reveal  "),
+                ("X", "kill  "),
                 ("R", "rename"),
             ]
         };
@@ -1204,10 +1556,20 @@ fn render(
         frame.render_widget(Paragraph::new(Line::from(spans)), chunks[4]);
     }
 
-    if let Some(p) = pending {
+    if let Some(p) = ctx.pending {
         match p {
             PickerPending::Rename { path, input } => {
-                render_rename_modal(frame, area, path, input);
+                render_input_modal(frame, area, "Rename workspace", "name", path, input);
+            }
+            PickerPending::EditTags { path, input } => {
+                render_input_modal(
+                    frame,
+                    area,
+                    "Edit tags (comma-separated)",
+                    "tags",
+                    path,
+                    input,
+                );
             }
             _ => {
                 let (title, body) = picker_confirm_copy(p);
@@ -1216,18 +1578,15 @@ fn render(
         }
     }
 
-    if let Some(modal) = info {
+    if let Some(modal) = ctx.info {
         crate::tui::confirm::render_info(frame, area, &modal.title, modal.lines.clone());
     }
 
-    // Search overlay renders above all the picker rows but below
-    // the help / confirm overlays so help still wins if a user
-    // hits `?` from inside search.
     if let Some(s) = search.as_mut() {
         crate::tui::find::render(frame, area, s);
     }
 
-    if help_open {
+    if ctx.help_open {
         crate::tui::help::render_overlay(frame, area, crate::tui::help::HelpContext::Picker);
     }
 }
@@ -1300,9 +1659,11 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
                 ),
             )
         }
-        // Rename is drawn by its own modal; never routed through the
-        // y/N confirm path. Keep the arm for exhaustiveness.
-        PickerPending::Rename { .. } => (String::new(), String::new()),
+        // Rename + EditTags are drawn by their own input modal; never
+        // routed through the y/N confirm path. Arms kept exhaustive.
+        PickerPending::Rename { .. } | PickerPending::EditTags { .. } => {
+            (String::new(), String::new())
+        }
     }
 }
 
@@ -1342,11 +1703,19 @@ fn compact_path(p: &str) -> String {
     p.to_string()
 }
 
-/// Centered input modal for renaming a workspace. Mirrors the
-/// confirm-modal layout but with a text input line instead of a y/N
-/// prompt. Caller handles the key routing (Enter = commit, Esc =
-/// cancel); this just draws.
-fn render_rename_modal(frame: &mut Frame<'_>, area: Rect, path: &std::path::Path, input: &str) {
+/// Centered single-field text-input modal. Used by both the rename
+/// (`field_label = "name"`) and tag-edit (`field_label = "tags"`)
+/// flows. Caller handles key routing (Enter = commit, Esc = cancel);
+/// this just draws the box with `title`, the workspace's file stem,
+/// the labeled input, and a help line.
+fn render_input_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    field_label: &str,
+    path: &std::path::Path,
+    input: &str,
+) {
     let w = area.width;
     let h = area.height;
     let overlay_w = (w.saturating_sub(4)).clamp(40, 72);
@@ -1368,7 +1737,7 @@ fn render_rename_modal(frame: &mut Frame<'_>, area: Rect, path: &std::path::Path
         .unwrap_or("workspace");
 
     let block = Block::default()
-        .title(" Rename workspace ")
+        .title(format!(" {title} "))
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -1388,7 +1757,7 @@ fn render_rename_modal(frame: &mut Frame<'_>, area: Rect, path: &std::path::Path
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "  name: ",
+                format!("  {field_label}: "),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -1412,4 +1781,117 @@ fn render_rename_modal(frame: &mut Frame<'_>, area: Rect, path: &std::path::Path
     ];
 
     frame.render_widget(Paragraph::new(lines).block(block), region);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta_of(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<PathBuf, WsMeta> {
+        pairs
+            .iter()
+            .map(|(name, tags)| {
+                (
+                    PathBuf::from(format!("/ws/{name}.portagenty.toml")),
+                    WsMeta {
+                        name: name.to_string(),
+                        tags: tags.iter().map(|t| t.to_string()).collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fuzzy_match_is_case_insensitive_subsequence() {
+        assert!(fuzzy_match("retake-studio", "rst"));
+        assert!(fuzzy_match("Retake-Studio", "RETAKE"));
+        assert!(fuzzy_match("retake-studio", "")); // empty always matches
+        assert!(!fuzzy_match("retake-studio", "xyz"));
+        assert!(!fuzzy_match("abc", "abcd")); // needle longer / not present
+        assert!(fuzzy_match("a b c", "abc")); // spaces in needle ignored
+    }
+
+    #[test]
+    fn compute_visible_filters_by_tag_and_query() {
+        let ws: Vec<PathBuf> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|n| PathBuf::from(format!("/ws/{n}.portagenty.toml")))
+            .collect();
+        let meta = meta_of(&[
+            ("alpha", &["rust", "tui"]),
+            ("beta", &["rust"]),
+            ("gamma", &["python"]),
+        ]);
+        // No filters → everything.
+        assert_eq!(compute_visible(&ws, &meta, None, None).len(), 3);
+        // Tag filter #rust → alpha + beta (indices 0,1).
+        assert_eq!(compute_visible(&ws, &meta, Some("rust"), None), vec![0, 1]);
+        // Query "gam" → gamma only (index 2).
+        assert_eq!(compute_visible(&ws, &meta, None, Some("gam")), vec![2]);
+        // Both: #rust AND "alp" → alpha only.
+        assert_eq!(
+            compute_visible(&ws, &meta, Some("rust"), Some("alp")),
+            vec![0]
+        );
+        // Query matches the path too.
+        assert_eq!(compute_visible(&ws, &meta, None, Some("beta")), vec![1]);
+    }
+
+    #[test]
+    fn distinct_tags_ordered_by_frequency_then_alpha() {
+        let ws: Vec<PathBuf> = ["a", "b", "c"]
+            .iter()
+            .map(|n| PathBuf::from(format!("/ws/{n}.portagenty.toml")))
+            .collect();
+        let meta = meta_of(&[
+            ("a", &["rust", "zebra"]),
+            ("b", &["rust", "agentic"]),
+            ("c", &["rust"]),
+        ]);
+        // rust (3×) first; then agentic, zebra (1× each) alphabetically.
+        assert_eq!(distinct_tags(&ws, &meta), vec!["rust", "agentic", "zebra"]);
+    }
+
+    #[test]
+    fn cycle_tag_filter_walks_none_to_last_to_none() {
+        let tags = vec!["rust".to_string(), "tui".to_string()];
+        assert_eq!(cycle_tag_filter(None, &tags).as_deref(), Some("rust"));
+        assert_eq!(
+            cycle_tag_filter(Some("rust"), &tags).as_deref(),
+            Some("tui")
+        );
+        assert_eq!(cycle_tag_filter(Some("tui"), &tags), None); // past end → clear
+        assert_eq!(cycle_tag_filter(Some("stale"), &tags), None); // stale → clear
+        assert_eq!(cycle_tag_filter(None, &[]), None); // no tags → stays none
+    }
+
+    #[test]
+    fn selected_ws_index_maps_through_visible_and_sentinel() {
+        let visible = vec![2usize, 5, 7];
+        let mut state = ListState::default();
+        state.select(Some(1));
+        assert_eq!(selected_ws_index(&visible, &state, true), Some(5));
+        // Sentinel row (index == visible.len()) → None.
+        state.select(Some(3));
+        assert_eq!(selected_ws_index(&visible, &state, true), None);
+        // Without a sentinel, index 3 is out of range → None.
+        assert_eq!(selected_ws_index(&visible, &state, false), None);
+    }
+
+    #[test]
+    fn edit_text_input_handles_readline_keys() {
+        let mut s = String::from("rust, tui");
+        edit_text_input(&mut s, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(s, "rust, tu");
+        edit_text_input(&mut s, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(s, "rust, ");
+        edit_text_input(&mut s, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(s, "");
+        edit_text_input(&mut s, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(s, "x");
+        // Other Ctrl combos are ignored (don't insert a literal char).
+        edit_text_input(&mut s, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(s, "x");
+    }
 }

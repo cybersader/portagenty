@@ -111,6 +111,15 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(heading(" Workspace actions"));
             lines.push(Line::raw(""));
             lines.push(row("n", "find folder + scaffold new workspace"));
+            lines.push(row(
+                "/",
+                "filter: type to fuzzy-match name/path/tag (Esc clears)",
+            ));
+            lines.push(row("f", "cycle the tag filter (none → tag → … → none)"));
+            lines.push(row(
+                "t",
+                "edit the highlighted workspace's tags (comma-separated)",
+            ));
             lines.push(row("R", "rename workspace (edits TOML name)"));
             lines.push(row("d", "unregister from global index (file stays)"));
             lines.push(row("D", "delete workspace file (destructive)"));
