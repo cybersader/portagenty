@@ -241,16 +241,26 @@ pub fn run(
     loop {
         // Auto-age the status line so messages don't sit forever.
         status.age_out();
-        let filtering = tag_filter.is_some() || text_filter.is_some();
-        // The live-sessions sentinel only shows in the unfiltered
-        // active view — filtering is about finding a workspace.
-        let has_sentinel = view == PickerView::Active && !filtering;
-        let visible = compute_visible(
+        let mut visible = compute_visible(
             &workspaces,
             &meta,
             tag_filter.as_deref(),
             text_filter.as_deref(),
         );
+        // Auto-drop a tag filter that no longer matches anything —
+        // its sole holder was just untagged (`t`) or archived (`a`),
+        // so keeping the filter would strand the user on an empty
+        // "(no matches)" view. Only when a text query isn't also
+        // active: typing a query that matches nothing is normal.
+        if tag_filter.is_some() && text_filter.is_none() && visible.is_empty() {
+            tag_filter = None;
+            state.select(Some(0));
+            visible = compute_visible(&workspaces, &meta, None, None);
+        }
+        let filtering = tag_filter.is_some() || text_filter.is_some();
+        // The live-sessions sentinel only shows in the unfiltered
+        // active view — filtering is about finding a workspace.
+        let has_sentinel = view == PickerView::Active && !filtering;
         // `.max(1)` keeps the wrap-around nav math (`% total`,
         // `total - 1`) panic-free when the visible list is empty.
         let total = (visible.len() + usize::from(has_sentinel)).max(1);
@@ -528,9 +538,9 @@ pub fn run(
                     }
                 }
                 KeyCode::Enter | KeyCode::Right => {
-                    if has_sentinel && state.selected() == Some(visible.len()) {
-                        return Ok(PickerOutcome::LiveBrowse);
-                    }
+                    // The sentinel is always hidden while filtering
+                    // (has_sentinel is false here), so only a real
+                    // workspace match can open.
                     if let Some(p) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
                     {
                         return Ok(PickerOutcome::Workspace(p));
