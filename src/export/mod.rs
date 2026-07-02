@@ -192,6 +192,7 @@ mod tests {
             multiplexer: Multiplexer::Tmux,
             projects: vec![],
             sessions,
+            tags: vec![],
         }
     }
 

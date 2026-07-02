@@ -54,6 +54,12 @@ pub struct Workspace {
     /// `cwd` is absolute.
     #[serde(default)]
     pub sessions: Vec<Session>,
+
+    /// Organizing tags for the picker (filter / grouping). Threaded
+    /// from the workspace TOML's `tags` field, unioned with any tags
+    /// its registered projects carry. Order-preserved, de-duplicated.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[cfg(test)]
@@ -94,6 +100,7 @@ mod tests {
             multiplexer: Multiplexer::Tmux,
             projects: vec![],
             sessions: vec![],
+            tags: vec![],
         };
         let encoded = toml::to_string(&w).unwrap();
         let decoded: Workspace = toml::from_str(&encoded).unwrap();
@@ -116,6 +123,7 @@ mod tests {
                 env: std::collections::BTreeMap::new(),
                 description: None,
             }],
+            tags: vec![],
         };
         let encoded = toml::to_string(&w).unwrap();
         let decoded: Workspace = toml::from_str(&encoded).unwrap();

@@ -142,6 +142,34 @@ pub fn merge(
         .or(global.default_multiplexer)
         .unwrap_or_default();
 
+    // Tags: the workspace file's own tags first (committable,
+    // authoritative), then unioned with any tags carried by its
+    // registered projects in the global registry (ROADMAP item 4 —
+    // "tags are a picker-level perspective … threaded from the global
+    // registry"). Order-preserved, de-duplicated.
+    let mut tags: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for t in &workspace_file.tags {
+        if seen.insert(t.clone()) {
+            tags.push(t.clone());
+        }
+    }
+    for gp in &global.projects {
+        if gp.tags.is_empty() {
+            continue;
+        }
+        let Ok(gp_path) = resolve_path(&gp.path, ws_dir) else {
+            continue;
+        };
+        if projects.iter().any(|p| p == &gp_path) {
+            for t in &gp.tags {
+                if seen.insert(t.clone()) {
+                    tags.push(t.clone());
+                }
+            }
+        }
+    }
+
     Ok(Workspace {
         name: workspace_file.name.clone(),
         id: workspace_file.id.clone(),
@@ -149,6 +177,7 @@ pub fn merge(
         multiplexer,
         projects,
         sessions,
+        tags,
     })
 }
 
@@ -198,6 +227,41 @@ mod tests {
     }
 
     #[test]
+    fn merge_unions_workspace_tags_with_project_tags() {
+        use crate::config::files::GlobalProjectEntry;
+        let ws_path = PathBuf::from("/ws/example.portagenty.toml");
+        let global = GlobalFile {
+            projects: vec![
+                GlobalProjectEntry {
+                    path: "/p".into(),
+                    tags: vec!["rust".into(), "agentic".into()],
+                },
+                GlobalProjectEntry {
+                    // Not one of the workspace's projects — its tags
+                    // must NOT leak in.
+                    path: "/other".into(),
+                    tags: vec!["unrelated".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        let wf = WorkspaceFile {
+            name: "ex".into(),
+            id: None,
+            multiplexer: None,
+            projects: vec!["/p".into()],
+            previous_paths: vec![],
+            // Workspace's own tag first, plus a dup of a project tag.
+            tags: vec!["tui".into(), "rust".into()],
+            sessions: vec![],
+        };
+        let w = merge(&global, &wf, &ws_path, &PerProjectFiles::new()).unwrap();
+        // Own tags first (order-preserved), then project tags, deduped;
+        // unrelated project's tags excluded.
+        assert_eq!(w.tags, vec!["tui", "rust", "agentic"]);
+    }
+
+    #[test]
     fn merge_workspace_only() {
         let global = GlobalFile::default();
         let ws_path = PathBuf::from("/ws/example.portagenty.toml");
@@ -208,6 +272,7 @@ mod tests {
             projects: vec!["/p".into()],
             previous_paths: vec![],
             sessions: vec![session("s1", "/abs", "echo 1")],
+            tags: vec![],
         };
         let per_project = PerProjectFiles::new();
         let w = merge(&global, &wf, &ws_path, &per_project).unwrap();
@@ -229,6 +294,7 @@ mod tests {
             projects: vec!["/p".into()],
             previous_paths: vec![],
             sessions: vec![session("shared", "/abs", "workspace-version")],
+            tags: vec![],
         };
         let mut per_project = PerProjectFiles::new();
         per_project.insert(
@@ -260,6 +326,7 @@ mod tests {
             projects: vec![],
             previous_paths: vec![],
             sessions: vec![],
+            tags: vec![],
         };
 
         // Workspace override wins over global default.
@@ -300,6 +367,7 @@ mod tests {
             projects: vec!["/real/project".into()],
             previous_paths: vec![],
             sessions: vec![],
+            tags: vec![],
         };
         let mut per_project = PerProjectFiles::new();
         per_project.insert(

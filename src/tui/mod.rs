@@ -354,6 +354,7 @@ fn synthetic_browse_workspace() -> Result<crate::domain::Workspace> {
         multiplexer: mpx,
         projects: vec![],
         sessions: vec![],
+        tags: vec![],
     })
 }
 

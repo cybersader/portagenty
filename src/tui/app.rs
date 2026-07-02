@@ -1930,6 +1930,7 @@ mod tests {
                     description: None,
                 })
                 .collect(),
+            tags: vec![],
         }
     }
 
@@ -2026,6 +2027,7 @@ mod tests {
                 env: std::collections::BTreeMap::new(),
                 description: Some(desc.into()),
             }],
+            tags: vec![],
         }
     }
 
@@ -2144,6 +2146,7 @@ mod tests {
                 env: std::collections::BTreeMap::new(),
                 description: None,
             }],
+            tags: vec![],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         // This test asserts the collapsed single-line column layout;
@@ -2617,6 +2620,7 @@ mod tests {
                     description: None,
                 })
                 .collect(),
+            tags: vec![],
         }
     }
 
@@ -2815,6 +2819,7 @@ mod tests {
             multiplexer: MpxEnum::Tmux,
             projects: vec![],
             sessions: vec![],
+            tags: vec![],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         let action = app.handle_key(KeyCode::Char('o'), KeyModifiers::NONE);
@@ -2846,6 +2851,7 @@ mod tests {
             multiplexer: MpxEnum::Tmux,
             projects: vec![],
             sessions: vec![],
+            tags: vec![],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         assert!(app.browsing.is_none());
@@ -2873,6 +2879,7 @@ mod tests {
             multiplexer: MpxEnum::Tmux,
             projects: vec![],
             sessions: vec![],
+            tags: vec![],
         };
         let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
         app.handle_key(KeyCode::Char('t'), KeyModifiers::NONE);

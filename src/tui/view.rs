@@ -219,6 +219,7 @@ mod tests {
                     description: None,
                 })
                 .collect(),
+            tags: vec![],
         }
     }
 
@@ -240,6 +241,7 @@ mod tests {
                     description: None,
                 })
                 .collect(),
+            tags: vec![],
         }
     }
 

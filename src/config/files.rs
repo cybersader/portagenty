@@ -31,6 +31,25 @@ pub struct GlobalFile {
     /// Known workspace files. Populates the TUI home screen.
     #[serde(default, rename = "workspace")]
     pub workspaces: Vec<GlobalWorkspaceEntry>,
+
+    /// Machine-local TUI preferences (`[ui]` table). Additive; absent
+    /// section deserializes to defaults.
+    #[serde(default)]
+    pub ui: UiSettings,
+}
+
+/// The `[ui]` table in the global config. Machine-local, not
+/// committed. Holds preferences that shouldn't live in the
+/// committable workspace TOML.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct UiSettings {
+    /// When true, the TUI captures the mouse: click-to-select,
+    /// double-click-to-open, scroll-wheel navigation. Off by default
+    /// because capture disables the terminal's own click-drag text
+    /// selection of the paths shown in rows. Toggled live with `m`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mouse: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +101,12 @@ pub struct WorkspaceFile {
     /// merge time against the workspace file's own directory.
     #[serde(default)]
     pub projects: Vec<String>,
+
+    /// Free-form tags for organizing the workspace picker (filter /
+    /// grouping perspectives). Committable — travels with the file.
+    /// Additive; absent → empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 
     /// Historical on-disk locations this workspace has lived at
     /// before. Auto-appended by `pa` when walk-up detects the

@@ -404,6 +404,54 @@ pub fn archived_workspaces() -> Result<std::collections::HashSet<PathBuf>> {
     Ok(out)
 }
 
+/// Read the machine-local `[ui] mouse` preference. `false` when the
+/// config or the flag is absent (mouse is off by default).
+pub fn ui_mouse_enabled() -> bool {
+    let Ok(path) = global_config_path() else {
+        return false;
+    };
+    if !path.is_file() {
+        return false;
+    }
+    load_toml::<GlobalFile>(&path)
+        .map(|g| g.ui.mouse)
+        .unwrap_or(false)
+}
+
+/// Persist the `[ui] mouse` preference, preserving the rest of the
+/// global config via toml_edit. Creates the file + parent dir if
+/// needed. Best-effort — a write failure is surfaced to the caller.
+pub fn set_ui_mouse(enabled: bool) -> Result<()> {
+    let cfg_path = global_config_path()?;
+    let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .with_context(|| format!("parsing existing global config {}", cfg_path.display()))?;
+    if !doc.contains_key("ui") {
+        doc["ui"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let ui = doc["ui"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("global config has a non-table 'ui' field"))?;
+    if enabled {
+        ui["mouse"] = toml_edit::value(true);
+    } else {
+        // Clear the flag so the section stays tidy when off (and drop
+        // an emptied `[ui]` table entirely).
+        ui.remove("mouse");
+        if ui.is_empty() {
+            doc.remove("ui");
+        }
+    }
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&cfg_path, doc.to_string())
+        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    Ok(())
+}
+
 /// Set (or clear) the `archived` flag on a registered workspace,
 /// matched by path. Idempotent; preserves all other fields/comments
 /// via toml_edit. If the workspace isn't registered yet, it's added
@@ -939,6 +987,22 @@ mod previous_paths_tests {
             .filter(|rp| rp.canonicalize().ok().as_deref() == Some(&p))
             .collect();
         assert_eq!(matches.len(), 1, "row count drifted: {regged:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn ui_mouse_round_trips_and_stays_tidy_when_off() {
+        let _s = Sandbox::new();
+        assert!(!ui_mouse_enabled(), "default should be off");
+        set_ui_mouse(true).unwrap();
+        assert!(ui_mouse_enabled(), "enable didn't stick");
+        let cfg = fs::read_to_string(global_config_path().unwrap()).unwrap();
+        assert!(cfg.contains("[ui]") && cfg.contains("mouse"), "cfg: {cfg}");
+        set_ui_mouse(false).unwrap();
+        assert!(!ui_mouse_enabled(), "disable didn't stick");
+        let cfg = fs::read_to_string(global_config_path().unwrap()).unwrap();
+        // Emptied [ui] table is dropped so the file stays tidy.
+        assert!(!cfg.contains("mouse"), "mouse key lingered: {cfg}");
     }
 
     #[test]
