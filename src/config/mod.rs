@@ -17,6 +17,48 @@ pub use files::{
 };
 pub use merge::{expand, resolve_path};
 
+/// Write `contents` to `path` atomically: serialize into a sibling temp file,
+/// fsync it, then `rename` onto the destination.
+///
+/// `rename(2)` within a directory is atomic, so a concurrent reader observes
+/// either the whole old file or the whole new one — never a partial write.
+/// This matters because several `pa` processes legitimately run at once (a
+/// picker in one pane, `pa launch` in another, an agent session in a third)
+/// and they all update the same global `config.toml`. With a plain
+/// `fs::write`, a reader that opened the file mid-write got a truncated TOML
+/// document and failed with a parse error such as `expected `.`, `=``.
+///
+/// A crash between write and rename leaves the original file intact; the
+/// temp file is cleaned up on the error path. Mirrors `state::save_to`.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // Unique per process so two concurrent writers never share a temp path.
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        // Durability is best-effort: a failed fsync shouldn't block the write.
+        let _ = file.sync_all();
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return write_result;
+    }
+    std::fs::rename(&tmp, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("renaming onto {}", path.display())
+    })?;
+    Ok(())
+}
+
 /// Read the current global default multiplexer, if any. Returns
 /// `None` when the global config file doesn't exist yet OR when it
 /// exists but doesn't pin a default.
@@ -49,12 +91,7 @@ pub fn set_global_default_multiplexer(mpx: crate::domain::Multiplexer) -> Result
         crate::domain::Multiplexer::Wezterm => "wezterm",
     };
     doc["default-multiplexer"] = toml_edit::value(wire);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(&path, doc.to_string())
-        .with_context(|| format!("writing {}", path.display()))?;
+    write_atomic(&path, &doc.to_string())?;
     Ok(())
 }
 
@@ -125,12 +162,7 @@ pub fn register_global_workspace(ws_path: &Path) -> Result<()> {
         }
     }
 
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(&cfg_path, doc.to_string())
-        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    write_atomic(&cfg_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -186,8 +218,7 @@ pub fn unregister_global_workspace(ws_path: &Path) -> Result<()> {
         }
     }
 
-    std::fs::write(&cfg_path, doc.to_string())
-        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    write_atomic(&cfg_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -300,8 +331,7 @@ pub fn reconcile_previous_paths_on_reregister(new_path: &Path) -> Result<Vec<Pat
             arr.remove(idx);
         }
     }
-    std::fs::write(&cfg_path, cfg_doc.to_string())
-        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    write_atomic(&cfg_path, &cfg_doc.to_string())?;
 
     Ok(newly_added)
 }
@@ -443,12 +473,7 @@ pub fn set_ui_mouse(enabled: bool) -> Result<()> {
             doc.remove("ui");
         }
     }
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(&cfg_path, doc.to_string())
-        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    write_atomic(&cfg_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -507,12 +532,7 @@ pub fn set_workspace_archived(ws_path: &Path, archived: bool) -> Result<()> {
         arr.push(t);
     }
 
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(&cfg_path, doc.to_string())
-        .with_context(|| format!("writing {}", cfg_path.display()))?;
+    write_atomic(&cfg_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -606,6 +626,81 @@ fn load_per_project_files(
 }
 
 #[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    #[test]
+    fn write_atomic_creates_parent_dirs_and_round_trips() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = tmp.path().join("deep/sub/config.toml");
+        write_atomic(&path, "name = \"demo\"\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name = \"demo\"\n");
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temp_file_behind() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        write_atomic(&path, "a = 1\n").unwrap();
+        let strays: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left temp files: {strays:?}");
+    }
+
+    #[test]
+    fn concurrent_writers_never_expose_a_partial_document() {
+        // The bug this guards: config writes used a plain fs::write, so a
+        // reader that opened the file mid-write saw a truncated TOML document
+        // and failed with `expected `.`, `=``. Several `pa` processes updating
+        // the global config at once is normal, so readers must only ever see a
+        // complete document.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = Arc::new(tmp.path().join("config.toml"));
+        // Long, differently-sized payloads so a torn write would be obvious.
+        let short = "default-multiplexer = \"tmux\"\n".to_string();
+        let long = format!(
+            "default-multiplexer = \"zellij\"\n{}",
+            (0..400)
+                .map(|i| format!("[[workspace]]\npath = \"/tmp/ws-{i}.portagenty.toml\"\n"))
+                .collect::<String>()
+        );
+        write_atomic(&path, &short).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let path = Arc::clone(&path);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut torn = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let raw = std::fs::read_to_string(&*path).unwrap_or_default();
+                    if raw.parse::<toml_edit::DocumentMut>().is_err() {
+                        torn += 1;
+                    }
+                }
+                torn
+            })
+        };
+
+        for i in 0..200 {
+            let body = if i % 2 == 0 { &short } else { &long };
+            write_atomic(&path, body).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let torn = reader.join().unwrap();
+        assert_eq!(torn, 0, "reader observed {torn} partial documents");
+    }
+}
+
+#[cfg(test)]
 mod default_mpx_tests {
     //! Round-trip + read tests for the global default-multiplexer
     //! helpers. Each test sandboxes XDG_CONFIG_HOME to a tempdir so
@@ -620,24 +715,15 @@ mod default_mpx_tests {
     /// pattern in `src/scaffold.rs`'s test module.
     struct TempXdg {
         _dir: assert_fs::TempDir,
-        previous: Option<std::ffi::OsString>,
+        _env: crate::test_env::EnvSandbox,
     }
     impl TempXdg {
         fn new() -> Self {
             let dir = assert_fs::TempDir::new().unwrap();
-            let previous = std::env::var_os("XDG_CONFIG_HOME");
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            let env = crate::test_env::EnvSandbox::new().set("XDG_CONFIG_HOME", dir.path());
             Self {
                 _dir: dir,
-                previous,
-            }
-        }
-    }
-    impl Drop for TempXdg {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(p) => std::env::set_var("XDG_CONFIG_HOME", p),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
+                _env: env,
             }
         }
     }
@@ -750,34 +836,19 @@ mod previous_paths_tests {
     struct Sandbox {
         _xdg: assert_fs::TempDir,
         _home: assert_fs::TempDir,
-        prev_xdg: Option<std::ffi::OsString>,
-        prev_home: Option<std::ffi::OsString>,
+        _env: crate::test_env::EnvSandbox,
     }
     impl Sandbox {
         fn new() -> Self {
             let xdg = assert_fs::TempDir::new().unwrap();
             let home = assert_fs::TempDir::new().unwrap();
-            let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-            let prev_home = std::env::var_os("HOME");
-            std::env::set_var("XDG_CONFIG_HOME", xdg.path());
-            std::env::set_var("HOME", home.path());
+            let env = crate::test_env::EnvSandbox::new()
+                .set("XDG_CONFIG_HOME", xdg.path())
+                .set("HOME", home.path());
             Self {
                 _xdg: xdg,
                 _home: home,
-                prev_xdg,
-                prev_home,
-            }
-        }
-    }
-    impl Drop for Sandbox {
-        fn drop(&mut self) {
-            match &self.prev_xdg {
-                Some(p) => std::env::set_var("XDG_CONFIG_HOME", p),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match &self.prev_home {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
+                _env: env,
             }
         }
     }
