@@ -293,29 +293,22 @@ mod tests {
 
     /// RAII guard pinning a tempdir as XDG_CONFIG_HOME so the
     /// registry write inside `create_at` doesn't leak into the real
-    /// user config during tests.
+    /// user config during tests. Wraps the shared `EnvSandbox`, which also
+    /// serializes against every other env-mutating test in the crate — this
+    /// guard restored correctly but did not serialize, so a concurrent test
+    /// could still observe the tempdir.
     struct TempXdg {
         _dir: assert_fs::TempDir,
-        previous: Option<std::ffi::OsString>,
+        _env: crate::test_env::EnvSandbox,
     }
 
     impl TempXdg {
         fn new() -> Self {
             let dir = assert_fs::TempDir::new().unwrap();
-            let previous = std::env::var_os("XDG_CONFIG_HOME");
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            let env = crate::test_env::EnvSandbox::new().set("XDG_CONFIG_HOME", dir.path());
             Self {
                 _dir: dir,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for TempXdg {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(p) => std::env::set_var("XDG_CONFIG_HOME", p),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
+                _env: env,
             }
         }
     }

@@ -197,15 +197,16 @@ mod tests {
 
     #[test]
     fn state_dir_uses_xdg_state_home_when_set() {
-        std::env::set_var("XDG_STATE_HOME", "/tmp/xdg-state");
+        let _env = crate::test_env::EnvSandbox::new().set("XDG_STATE_HOME", "/tmp/xdg-state");
         let d = state_dir().unwrap();
         assert_eq!(d, PathBuf::from("/tmp/xdg-state/portagenty"));
     }
 
     #[test]
     fn state_dir_falls_back_to_home_dot_local_state() {
-        std::env::remove_var("XDG_STATE_HOME");
-        std::env::set_var("HOME", "/home/test");
+        let _env = crate::test_env::EnvSandbox::new()
+            .unset("XDG_STATE_HOME")
+            .set("HOME", "/home/test");
         let d = state_dir().unwrap();
         assert_eq!(d, PathBuf::from("/home/test/.local/state/portagenty"));
     }

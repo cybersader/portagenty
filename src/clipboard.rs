@@ -92,14 +92,13 @@ mod tests {
 
     #[test]
     fn copy_returns_error_when_no_tools_present() {
-        // Wipe PATH for this thread's spawn — the candidate list
-        // can't resolve so we expect an Err with the install hint.
-        let saved = std::env::var_os("PATH");
-        std::env::set_var("PATH", "/nonexistent-dir-for-pa-clipboard-test");
+        // Wipe PATH for this spawn — the candidate list can't resolve so we
+        // expect an Err with the install hint. The sandbox restores PATH even
+        // if `copy` panics; a leaked broken PATH would break every later test
+        // that shells out.
+        let _env = crate::test_env::EnvSandbox::new()
+            .set("PATH", "/nonexistent-dir-for-pa-clipboard-test");
         let res = copy("hello");
-        if let Some(p) = saved {
-            std::env::set_var("PATH", p);
-        }
         let err = res.unwrap_err().to_string();
         assert!(err.contains("no clipboard tool"), "got: {err}");
     }

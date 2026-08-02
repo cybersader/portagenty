@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn default_rcfile_resolves_to_home_bashrc() {
-        std::env::set_var("HOME", "/home/test");
+        let _env = crate::test_env::EnvSandbox::new().set("HOME", "/home/test");
         let p = default_rcfile().unwrap();
         assert_eq!(p, PathBuf::from("/home/test/.bashrc"));
     }

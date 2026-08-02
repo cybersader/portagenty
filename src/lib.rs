@@ -19,6 +19,9 @@ pub mod state;
 pub mod tui;
 pub mod workspace_edit;
 
+#[cfg(test)]
+pub(crate) mod test_env;
+
 use cli::{Cli, Command};
 
 /// Entry point shared by the binary and integration tests. Dispatches the

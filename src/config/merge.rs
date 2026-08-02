@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn resolve_path_expands_tilde_and_joins_relative() {
-        std::env::set_var("HOME", "/home/test");
+        let _env = crate::test_env::EnvSandbox::new().set("HOME", "/home/test");
         let out = resolve_path("~/foo", Path::new("/irrelevant")).unwrap();
         assert_eq!(out, PathBuf::from("/home/test/foo"));
 
@@ -213,14 +213,14 @@ mod tests {
 
     #[test]
     fn resolve_path_expands_braced_vars() {
-        std::env::set_var("PA_TEST_VAR", "/x");
+        let _env = crate::test_env::EnvSandbox::new().set("PA_TEST_VAR", "/x");
         let out = resolve_path("${PA_TEST_VAR}/y", Path::new("/i")).unwrap();
         assert_eq!(out, PathBuf::from("/x/y"));
     }
 
     #[test]
     fn resolve_path_errors_on_unset_var() {
-        std::env::remove_var("PA_NOT_SET_XYZ");
+        let _env = crate::test_env::EnvSandbox::new().unset("PA_NOT_SET_XYZ");
         let err = resolve_path("${PA_NOT_SET_XYZ}/y", Path::new("/b")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("PA_NOT_SET_XYZ"), "{msg}");

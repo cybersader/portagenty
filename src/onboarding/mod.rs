@@ -334,7 +334,16 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// Run the wizard against a sandboxed state dir.
+    ///
+    /// The wizard writes an `.onboarded` sentinel into `$XDG_STATE_HOME`.
+    /// These tests used to inherit whatever that happened to be, which made
+    /// them fail when a sibling test had left `HOME=/home/test` (unwritable)
+    /// and, worse, write into the developer's real state dir otherwise.
+    /// Pinning it to a tempdir makes the tests hermetic in both directions.
     fn drive(input: &str) -> (OnboardOutcome, String) {
+        let state = assert_fs::TempDir::new().unwrap();
+        let _env = crate::test_env::EnvSandbox::new().set("XDG_STATE_HOME", state.path());
         let mut r = Cursor::new(input.as_bytes().to_vec());
         let mut w: Vec<u8> = Vec::new();
         // For test purposes we always treat as forced=false (it's
@@ -356,9 +365,6 @@ mod tests {
 
     #[test]
     fn option_3_returns_skipped() {
-        // NOTE: we don't assert on the sentinel write because the
-        // test shares the real $XDG_STATE_HOME with the user. The
-        // outcome is the contract.
         let (outcome, out) = drive("3\n");
         assert_eq!(outcome, OnboardOutcome::Skipped);
         assert!(out.contains("Skipped"));
