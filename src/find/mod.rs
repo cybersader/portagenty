@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 /// for displaying a small badge in the TUI ("from zoxide", etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
+    Exact,
     Recency,
     Zoxide,
     Locate,
@@ -50,6 +51,7 @@ impl Source {
     /// Short human label for the result row.
     pub fn label(&self) -> &'static str {
         match self {
+            Source::Exact => "exact",
             Source::Recency => "recent",
             Source::Zoxide => "zoxide",
             Source::Locate => "locate",
@@ -493,8 +495,8 @@ mod tests {
 
     #[test]
     fn expand_tilde_resolves_home_when_set() {
-        std::env::set_var("HOME", "/home/test");
+        let home = std::env::var("HOME").expect("test requires HOME");
         let p = expand_tilde("~/code/foo");
-        assert_eq!(p, PathBuf::from("/home/test/code/foo"));
+        assert_eq!(p, PathBuf::from(home).join("code/foo"));
     }
 }

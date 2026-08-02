@@ -136,10 +136,14 @@ real projects:
   (pre-built indexes), fd (live walk respecting .gitignore),
   stdlib walker (always-available fallback, depth-capped, with
   a hardcoded ignore list for .git / node_modules / target /
-  __pycache__ / .venv / dist / build). Results merged + deduped
-  on canonical path, then ranked by `nucleo` (Helix's pure-Rust
-  fuzzy matcher). Enter on a candidate either opens an existing
-  workspace there or pops a confirm to scaffold one — on
+  __pycache__ / .venv / dist / build). The live TUI caches scan
+  results, dedupes by raw path string, and re-ranks with `nucleo`
+  (Helix's pure-Rust fuzzy matcher) without blocking DrvFs
+  canonicalization. Typing an existing absolute or `~/` input pins
+  an `[exact]` row; `Ctrl+G` jumps directly to an existing absolute
+  directory. `→` drills into the highlighted directory's scope and
+  `←` moves to its parent. Enter on a candidate either opens an
+  existing workspace there or pops a confirm to scaffold one — on
   confirm, `crate::scaffold::create_at` writes the TOML, registers
   globally, and the picker exits with the new workspace as its
   outcome so the session TUI opens immediately.
@@ -265,9 +269,9 @@ real projects:
   `/mnt/c/Users/.../Documents` by scattered letters.
 - **Global search toggle (`Ctrl+R`).** In the find overlay,
   `Ctrl+R` switches between project-roots mode (default) and
-  global mode (all mount points on WSL, or `/` on native Linux).
-  Clean single-key toggle instead of the old auto-reroot-on-
-  absolute-path approach.
+  global mode (all mount points on WSL, or `/` on native Linux)
+  without clearing the current query. Clean single-key toggle
+  instead of the old auto-reroot-on-absolute-path approach.
 - **Portaconv integration (three-PR batch).** Portagenty-side of
   the conversation-extractor bridge landed in v1.x after portaconv
   (sibling crate `pconv`) hit v0.1. Three pieces:

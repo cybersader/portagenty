@@ -114,7 +114,7 @@ pa                        # open the TUI
 | **TUI** | Workspace picker home screen, session list, recency sort, color-coded state markers, kind glyphs, attached-client count, responsive 2-line footer, help overlay (`?`). |
 | **Navigation** | Android-back semantics (Esc = back one level). Arrow keys, vim keys (`j`/`k`), Alt+J/K. |
 | **Session management** | `pa init` / `add` / `rm` / `edit` from CLI. In-TUI editing (`e` key) for name, cwd, command, kind, env. |
-| **Find + scaffold** | `n` in picker: fuzzy-search folders (recency, zoxide, plocate, fd, stdlib walker, nucleo ranking). `Ctrl+R` toggles global search. `Ctrl+T` for tree browser. Scaffold on confirm. |
+| **Find + scaffold** | `n` in picker: fuzzy-search folders (recency, zoxide, indexed/live filesystem sources, nucleo ranking). Typing an existing absolute or `~/` path pins an `[exact]` row; `Ctrl+G` jumps directly to an absolute path. `→`/`←` narrow or widen the current scope, while `Ctrl+R` toggles local/global search without clearing the query. `Ctrl+T` opens the tree browser. Scaffold on confirm. |
 | **File tree in TUI** | `t` in session list opens a tree rooted at the workspace dir. `.` drills, Backspace pops up, `n` creates a new folder, `o` drops to a plain shell at the highlighted folder, `/` searches from here. |
 | **Add / rename / edit in TUI** | `a` adds a new session via a 2-stage modal. `R` renames the workspace (edits the TOML `name` field). `e` edits existing session fields. |
 | **Open in Terminal** | `o` in session list / tree mode / picker's reveal modal drops you into a plain shell at the chosen path — exits pa, no mpx, no session state. |

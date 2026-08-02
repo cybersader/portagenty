@@ -516,16 +516,26 @@ than just navigation. As of the find-folder commit chain
 Triggered by `n` in the picker. Implementation in `src/tui/find.rs`
 + `src/find/`. Behavior:
 
-1. Overlay opens centered. Empty input shows recents + zoxide
-   candidates immediately (instant, no FS walk).
-2. Each typed character re-runs the tier orchestrator: recents +
-   zoxide + plocate/locate/Everything CLI + fd + stdlib walker.
-   Each tier silently skips if its underlying tool isn't installed.
-3. Results are deduped on canonical path, then ranked against the
-   query by `nucleo` (smart-case + smart-normalization). Top N
-   surface. Zero-score entries are dropped so the list always has
-   meaningful matches.
-4. `Enter` on a highlighted candidate classifies:
+1. Overlay opens centered. Recency + zoxide seed the cache
+   synchronously so useful rows appear on the first frame.
+2. A bounded filesystem scan runs once in a background thread and
+   streams batches into the cache. Scope changes (`→` drills into the
+   highlighted directory; `←` moves to its parent) and tree
+   search-from-here restart that scan and clear the query. `Ctrl+R`
+   toggles local/global roots, restarts the scan, and preserves the
+   current query. Ordinary keystrokes never walk the filesystem.
+3. Each typed character re-ranks the cached paths with `nucleo`
+   (smart-case + smart-normalization). The hot path dedupes by raw
+   path string rather than canonicalizing: canonicalization on WSL
+   DrvFs previously froze the TUI for seconds.
+4. If the input is an existing absolute or `~/` directory, its
+   expanded path is pinned first with an `[exact]` badge and selected.
+   Background batches keep that row first but preserve a deliberate
+   manual selection elsewhere in the list. Nonexistent paths are
+   never synthesized. `Ctrl+G` is the explicit go-to-path action: it
+   accepts an existing absolute directory and immediately re-roots the
+   search there.
+5. `Enter` on the selected candidate classifies:
    - Folder already contains a `*.portagenty.toml` → picker exits
      with that workspace as the outcome (it'll open immediately).
    - Folder has no workspace → confirm modal: "scaffold a new
@@ -533,19 +543,14 @@ Triggered by `n` in the picker. Implementation in `src/tui/find.rs`
      with the dir's basename + machine-default mpx + no Claude
      session, registers globally, and the picker exits with the
      new workspace as the outcome.
-5. The new workspace's session TUI loads immediately (per the
+6. The new workspace's session TUI loads immediately (per the
    user-locked decision: no extra "open it now?" prompt).
 
-Special query forms:
-- Empty → recents + zoxide only, no walks.
-- Starts with `/` or `~/` → walk-from-prefix mode (stdlib walker
-  only, scoped to the nearest existing ancestor).
-
-Search backend tiers, fastest-first, all silent-skip if absent:
-recency (state.toml) → zoxide → plocate / locate / Everything CLI →
-fd → stdlib walker. All shell-outs run with a 1-second hard
-timeout. No new C deps; only `nucleo-matcher` was added (pure Rust,
-~50 KB).
+The `src/find/` subsystem contains recency, zoxide, locate-family,
+`fd`, and stdlib-walker probes. Each optional external backend
+silently skips when unavailable and shell-outs have a one-second
+hard timeout. The live TUI's responsiveness contract is cache once,
+then re-rank; it must not run those probes per keystroke.
 
 ### Tree browser (`Ctrl+T`)
 

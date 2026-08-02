@@ -576,7 +576,46 @@ fn render_new_folder_modal(
     input: &str,
     error: Option<&str>,
 ) {
-    use ratatui::widgets::{Block, Borders, Clear};
+    let root_display = compact_home(&root.display().to_string());
+    render_input_modal(
+        frame,
+        area,
+        "New folder",
+        "under",
+        &root_display,
+        "name",
+        input,
+        error,
+        "Enter to create · Esc to cancel",
+    );
+}
+
+fn render_go_to_path_modal(frame: &mut Frame<'_>, area: Rect, modal: &GoToPathModal) {
+    render_input_modal(
+        frame,
+        area,
+        "Go to path",
+        "scope",
+        "absolute directory",
+        "path",
+        &modal.input,
+        modal.error.as_deref(),
+        "Enter to go · Esc to cancel",
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_input_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    context_label: &str,
+    context: &str,
+    input_label: &str,
+    input: &str,
+    error: Option<&str>,
+    footer: &str,
+) {
     let w = area.width;
     let h = area.height;
     let overlay_w = w.saturating_sub(4).clamp(40, 72);
@@ -592,10 +631,8 @@ fn render_new_folder_modal(
     };
     frame.render_widget(Clear, region);
 
-    let root_display = compact_home(&root.display().to_string());
-
     let block = Block::default()
-        .title(" New folder ")
+        .title(format!(" {title} "))
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -606,13 +643,19 @@ fn render_new_folder_modal(
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("  under: ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(root_display, Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                format!("  {context_label}: "),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                context.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "  name: ",
+                format!("  {input_label}: "),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -640,7 +683,7 @@ fn render_new_folder_modal(
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Enter to create · Esc to cancel",
+        format!("  {footer}"),
         Style::default().add_modifier(Modifier::DIM),
     )));
 
@@ -677,6 +720,12 @@ pub enum SearchOutcome {
     /// the given directory. No session scaffolded, no mpx involved.
     /// Like "Open in Terminal" from a file manager.
     OpenShellAt(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RerankSelection {
+    Preserve,
+    PreferExact,
 }
 
 /// Mutable state for the search overlay. Lives inside
@@ -729,6 +778,8 @@ pub struct SearchState {
     /// showing the highlighted candidate's complete path with
     /// auto-copy. Any key dismisses.
     fullscreen_path: Option<FullscreenPath>,
+    /// When Some, Ctrl+G's direct-path input modal is open.
+    go_to_path: Option<GoToPathModal>,
     /// Current mode: search (default) or tree browser.
     pub mode: FindMode,
 }
@@ -739,6 +790,12 @@ pub struct SearchState {
 struct FullscreenPath {
     title: String,
     lines: Vec<Line<'static>>,
+}
+
+#[derive(Debug, Clone)]
+struct GoToPathModal {
+    input: String,
+    error: Option<String>,
 }
 
 impl std::fmt::Debug for SearchState {
@@ -787,9 +844,10 @@ impl Default for SearchState {
             anim_tick: 0,
             anim_offset: 0,
             fullscreen_path: None,
+            go_to_path: None,
             mode: FindMode::Search,
         };
-        s.rerank();
+        s.rerank(RerankSelection::Preserve);
         s
     }
 }
@@ -857,24 +915,34 @@ impl SearchState {
             }
         }
         if changed {
-            self.rerank();
+            self.rerank(RerankSelection::Preserve);
         }
     }
 
-    /// Re-rank `raw_dirs` against `self.input` via nucleo. This is
-    /// the ONLY place that touches the matcher — keystrokes just
-    /// call this, never the walker.
     /// Re-rank `raw_dirs` against `self.input` via nucleo. Runs on
-    /// the main thread so MUST be fast — no syscalls (canonicalize
-    /// on DrvFs was the old freeze; 5ms × 2500 paths = 12s blocked).
-    /// Dedup uses the raw path string instead.
-    fn rerank(&mut self) {
+    /// the main thread so MUST stay cheap: raw-string dedup avoids the
+    /// old DrvFs canonicalize freeze. The one intentional syscall is
+    /// `is_dir()` when the user has typed an absolute, `~/`, or
+    /// env-expanded absolute path so it can be pinned as an exact result.
+    fn rerank(&mut self, selection: RerankSelection) {
         // Stash the currently highlighted path so we can restore the
         // selection after rebuilding the candidate list. Without this,
         // every background-walker batch resets the cursor to index 0.
         let prev_selected_path = self.candidates.get(self.selected).map(|c| c.path.clone());
 
         let trimmed = self.input.trim();
+        let exact_path = if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+            let path = crate::find::expand_tilde(trimmed);
+            path.is_dir().then_some(path)
+        } else if trimmed.contains("${") {
+            crate::config::expand(trimmed)
+                .ok()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute() && path.is_dir())
+        } else {
+            None
+        };
+
         if trimmed.is_empty() {
             // Empty query: only show recency + zoxide candidates (the
             // first `recency_count` entries). Walker results are hidden
@@ -934,11 +1002,28 @@ impl SearchState {
             scored.truncate(self.opts.limit);
             self.candidates = scored;
         }
+
+        if let Some(ref path) = exact_path {
+            self.candidates.retain(|candidate| candidate.path != *path);
+            self.candidates.insert(
+                0,
+                Candidate {
+                    path: path.clone(),
+                    source: Source::Exact,
+                    score: i32::MAX,
+                },
+            );
+            self.candidates.truncate(self.opts.limit);
+        }
+
         // Restore selection: find the old path in the new list.
         // If gone, clamp to the same index or the end of the list.
         if self.candidates.is_empty() {
             self.selected = 0;
             self.list_state.select(None);
+        } else if exact_path.is_some() && selection == RerankSelection::PreferExact {
+            self.selected = 0;
+            self.list_state.select(Some(0));
         } else if let Some(ref prev) = prev_selected_path {
             if let Some(idx) = self.candidates.iter().position(|c| c.path == *prev) {
                 self.selected = idx;
@@ -975,7 +1060,7 @@ impl SearchState {
         }
         self.bg_rx = Some(spawn_bg_walk(self.opts.clone()));
         self.scanning = true;
-        self.rerank();
+        self.rerank(RerankSelection::Preserve);
     }
 
     fn highlighted(&self) -> Option<&Candidate> {
@@ -1008,10 +1093,90 @@ fn spawn_bg_walk(opts: FindOpts) -> mpsc::Receiver<Vec<PathBuf>> {
     rx
 }
 
+fn handle_go_to_path_key(
+    state: &mut SearchState,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> SearchOutcome {
+    let Some(mut modal) = state.go_to_path.take() else {
+        return SearchOutcome::Continue;
+    };
+    match code {
+        KeyCode::Esc => {}
+        KeyCode::Enter => {
+            let trimmed = modal.input.trim();
+            match crate::config::expand(trimmed) {
+                Ok(expanded) => {
+                    let path = PathBuf::from(expanded);
+                    if !path.is_absolute() {
+                        modal.error = Some("path must be absolute".into());
+                        state.go_to_path = Some(modal);
+                    } else if path.is_dir() {
+                        state.set_root(path);
+                    } else {
+                        modal.error = Some("directory does not exist".into());
+                        state.go_to_path = Some(modal);
+                    }
+                }
+                Err(e) => {
+                    modal.error = Some(e.to_string());
+                    state.go_to_path = Some(modal);
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            modal.input.pop();
+            modal.error = None;
+            state.go_to_path = Some(modal);
+        }
+        KeyCode::Char('h') if mods.contains(KeyModifiers::CONTROL) => {
+            modal.input.pop();
+            modal.error = None;
+            state.go_to_path = Some(modal);
+        }
+        KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+            modal.input.clear();
+            modal.error = None;
+            state.go_to_path = Some(modal);
+        }
+        KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
+            while modal.input.ends_with(' ') {
+                modal.input.pop();
+            }
+            while modal
+                .input
+                .chars()
+                .last()
+                .is_some_and(|c| !c.is_whitespace())
+            {
+                modal.input.pop();
+            }
+            modal.error = None;
+            state.go_to_path = Some(modal);
+        }
+        KeyCode::Char(_) if mods.contains(KeyModifiers::CONTROL) => {
+            state.go_to_path = Some(modal);
+        }
+        KeyCode::Char(ch) => {
+            modal.input.push(ch);
+            modal.error = None;
+            state.go_to_path = Some(modal);
+        }
+        _ => {
+            state.go_to_path = Some(modal);
+        }
+    }
+    SearchOutcome::Continue
+}
+
 /// Process a single key press. Returns the action the outer picker
 /// should take. Pure dispatch — the caller is responsible for the
 /// terminal redraw.
 pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) -> SearchOutcome {
+    if state.go_to_path.is_some() {
+        return handle_go_to_path_key(state, code, mods);
+    }
+
     // Full-path modal: any key dismisses. No passthrough.
     if state.fullscreen_path.is_some() {
         state.fullscreen_path = None;
@@ -1044,12 +1209,12 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => SearchOutcome::Cancel,
         (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
             state.input.clear();
-            state.rerank();
+            state.rerank(RerankSelection::PreferExact);
             SearchOutcome::Continue
         }
         (KeyCode::Backspace, _) => {
             state.input.pop();
-            state.rerank();
+            state.rerank(RerankSelection::PreferExact);
             SearchOutcome::Continue
         }
         // Ctrl+H aliases Backspace — many terminals send Ctrl+H when
@@ -1057,7 +1222,7 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         // literal 'h' into the input.
         (KeyCode::Char('h'), m) if m.contains(KeyModifiers::CONTROL) => {
             state.input.pop();
-            state.rerank();
+            state.rerank(RerankSelection::PreferExact);
             SearchOutcome::Continue
         }
         // Ctrl+W: delete previous word.
@@ -1073,7 +1238,7 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             {
                 state.input.pop();
             }
-            state.rerank();
+            state.rerank(RerankSelection::PreferExact);
             SearchOutcome::Continue
         }
         (KeyCode::Up, _) => {
@@ -1133,6 +1298,22 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             }
             SearchOutcome::Continue
         }
+        // Ctrl+G: enter an absolute path directly instead of waiting
+        // for it to appear in fuzzy-search results.
+        (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {
+            let root = state
+                .opts
+                .roots
+                .first()
+                .cloned()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("/"));
+            state.go_to_path = Some(GoToPathModal {
+                input: root.display().to_string(),
+                error: None,
+            });
+            SearchOutcome::Continue
+        }
         // Ctrl+R: toggle between project-roots search and global
         // search. Global mode walks from `/` (or `/mnt` on WSL) so
         // the user can find folders on any mount point without typing
@@ -1144,7 +1325,6 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
             } else {
                 crate::find::default_roots()
             };
-            state.input.clear();
             state.restart_walk();
             SearchOutcome::Continue
         }
@@ -1229,7 +1409,7 @@ pub fn handle_key(state: &mut SearchState, code: KeyCode, mods: KeyModifiers) ->
         }
         (KeyCode::Char(ch), _) => {
             state.input.push(ch);
-            state.rerank();
+            state.rerank(RerankSelection::PreferExact);
             SearchOutcome::Continue
         }
         _ => SearchOutcome::Continue,
@@ -1378,9 +1558,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                 let msg = if state.scanning {
                     "  scanning filesystem… results will appear as they're found"
                 } else if state.input.is_empty() {
-                    "  (no recents yet — type to search, Ctrl+T for tree, Ctrl+R for global)"
+                    "  (no recents — type a full path to jump, or Ctrl+R for global)"
                 } else {
-                    "  no matches — try Ctrl+R for global search, or Ctrl+T for tree"
+                    "  no matches — type a full path to jump, or Ctrl+R for global"
                 };
                 let empty = Paragraph::new(msg).style(Style::default().add_modifier(Modifier::DIM));
                 frame.render_widget(empty, chunks[2]);
@@ -1407,27 +1587,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                     Entry::new("Ctrl+T", "tree"),
                 ],
             );
-            // Secondary line: less-critical keys.
-            let sep = Style::default().fg(Color::DarkGray);
+            // Secondary line: direct navigation, ordered so the two
+            // scope-changing shortcuts survive clipping on narrow terminals.
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(" ─── ", sep),
+                    Span::raw(" "),
                     Span::styled(
-                        "→ ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("drill  ", Style::default().add_modifier(Modifier::DIM)),
-                    Span::styled(
-                        "← ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("up  ", Style::default().add_modifier(Modifier::DIM)),
-                    Span::styled(
-                        "Ctrl+F ",
+                        "Ctrl+G ",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -1440,9 +1606,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        if state.global_mode { "local" } else { "global" },
+                        if state.global_mode {
+                            "local  "
+                        } else {
+                            "global  "
+                        },
                         Style::default().add_modifier(Modifier::DIM),
                     ),
+                    Span::styled(
+                        "→/← ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("scope", Style::default().add_modifier(Modifier::DIM)),
                 ])),
                 chunks[4],
             );
@@ -1538,6 +1715,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &mut SearchState) {
     // Full-path modal renders on top of everything when active.
     if let Some(fp) = &state.fullscreen_path {
         crate::tui::confirm::render_info(frame, area, &fp.title, fp.lines.clone());
+    }
+    if let Some(modal) = &state.go_to_path {
+        render_go_to_path_modal(frame, area, modal);
     }
 }
 
@@ -2012,6 +2192,7 @@ mod tests {
             anim_tick: 0,
             anim_offset: 0,
             fullscreen_path: None,
+            go_to_path: None,
             mode: FindMode::Search,
         };
         s.list_state.select(Some(0));
@@ -2062,11 +2243,260 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_r_preserves_non_empty_input() {
+        let mut s = make_state("same query");
+
+        let _ = handle_key(&mut s, KeyCode::Char('r'), KeyModifiers::CONTROL);
+
+        assert_eq!(s.input, "same query");
+    }
+
+    #[test]
+    fn ctrl_r_reroots_to_global_roots() {
+        let mut s = make_state("query");
+        s.opts.roots = vec![PathBuf::from("/local-only")];
+
+        let _ = handle_key(&mut s, KeyCode::Char('r'), KeyModifiers::CONTROL);
+
+        // Assert the invariant, not the exact root list: global roots are
+        // derived from $HOME and mount points, and sibling tests mutate HOME
+        // process-globally, so snapshotting global_search_roots() here races.
+        assert!(s.global_mode);
+        assert!(!s.opts.roots.is_empty());
+        assert!(
+            !s.opts.roots.contains(&PathBuf::from("/local-only")),
+            "global toggle must leave the previous local root: {:?}",
+            s.opts.roots
+        );
+    }
+
+    #[test]
     fn enter_with_no_candidates_continues() {
         let mut s = make_state("");
         s.candidates.clear();
         let out = handle_key(&mut s, KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(out, SearchOutcome::Continue));
+    }
+
+    #[test]
+    fn exact_existing_path_is_pinned_selected_and_keeps_real_distractors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exact = tmp.path().join("mnt/c/Users/Cybersader");
+        let repeated = tmp.path().join("mnt/c/mnt/c/Users/Cybersader");
+        std::fs::create_dir_all(&exact).unwrap();
+        std::fs::create_dir_all(&repeated).unwrap();
+
+        let mut s = make_state(&exact.display().to_string());
+        s.raw_dirs = vec![repeated.clone()];
+        s.recency_count = 0;
+        s.candidates.clear();
+        s.rerank(RerankSelection::PreferExact);
+
+        assert_eq!(s.candidates[0].path, exact);
+        assert_eq!(s.candidates[0].source, Source::Exact);
+        assert_eq!(s.selected, 0);
+        assert!(
+            s.candidates
+                .iter()
+                .any(|candidate| candidate.path == repeated),
+            "real repeated-prefix directory should remain visible"
+        );
+    }
+
+    #[test]
+    fn exact_tilde_path_expands_to_home() {
+        // Read HOME rather than setting it: sibling tests mutate HOME
+        // process-globally, and writing it here would leak a temp path that
+        // outlives this test and break unrelated suites.
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        if !home.is_dir() {
+            // Another test left HOME pointing somewhere unreal; the exact-pin
+            // invariant is covered by the tempdir-based tests above.
+            return;
+        }
+        let exact = home;
+        let mut s = make_state("~/");
+        s.raw_dirs.clear();
+        s.recency_count = 0;
+        s.candidates.clear();
+        s.rerank(RerankSelection::PreferExact);
+
+        assert_eq!(s.candidates[0].path, exact);
+        assert_eq!(s.candidates[0].source, Source::Exact);
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn nonexistent_typed_path_is_not_synthesized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let mut s = make_state(&missing.display().to_string());
+        s.raw_dirs.clear();
+        s.recency_count = 0;
+        s.candidates.clear();
+
+        s.rerank(RerankSelection::PreferExact);
+
+        assert!(s.candidates.is_empty());
+        assert!(s.list_state.selected().is_none());
+    }
+
+    #[test]
+    fn background_rerank_preserves_manual_selection_below_exact_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exact = tmp.path().join("mnt/c/Users/Cybersader");
+        let repeated = tmp.path().join("mnt/c/mnt/c/Users/Cybersader");
+        std::fs::create_dir_all(&exact).unwrap();
+        std::fs::create_dir_all(&repeated).unwrap();
+
+        let mut s = make_state(&exact.display().to_string());
+        s.raw_dirs = vec![repeated.clone()];
+        s.recency_count = 0;
+        s.candidates.clear();
+        s.rerank(RerankSelection::PreferExact);
+        let repeated_idx = s
+            .candidates
+            .iter()
+            .position(|candidate| candidate.path == repeated)
+            .unwrap();
+        s.selected = repeated_idx;
+        s.list_state.select(Some(repeated_idx));
+
+        s.rerank(RerankSelection::Preserve);
+
+        assert_eq!(s.candidates[0].path, exact);
+        assert_eq!(s.candidates[s.selected].path, repeated);
+    }
+
+    #[test]
+    fn exact_path_with_dot_segments_and_trailing_slash_is_pinned_lexically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(target.join("child")).unwrap();
+        let typed = format!("{}/./child/../", target.display());
+        let expected = PathBuf::from(&typed);
+
+        let mut s = make_state(&typed);
+        s.raw_dirs.clear();
+        s.recency_count = 0;
+        s.candidates.clear();
+        s.rerank(RerankSelection::PreferExact);
+
+        assert_eq!(s.candidates[0].path, expected);
+        assert_eq!(s.candidates[0].source, Source::Exact);
+    }
+
+    #[test]
+    fn env_expanded_absolute_path_is_pinned() {
+        // Same reason as exact_tilde_path_expands_to_home — read, never write.
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        if !home.is_dir() {
+            return;
+        }
+        let mut s = make_state("${HOME}");
+        s.raw_dirs.clear();
+        s.recency_count = 0;
+        s.candidates.clear();
+        s.rerank(RerankSelection::PreferExact);
+
+        assert_eq!(s.candidates[0].path, home);
+        assert_eq!(s.candidates[0].source, Source::Exact);
+    }
+
+    #[test]
+    fn ctrl_g_opens_go_to_path_modal_prefilled_with_current_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = make_state("");
+        s.opts.roots = vec![tmp.path().to_path_buf()];
+
+        let out = handle_key(&mut s, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        assert!(matches!(out, SearchOutcome::Continue));
+        let modal = s.go_to_path.as_ref().expect("go-to-path modal");
+        assert_eq!(modal.input, tmp.path().display().to_string());
+        assert!(modal.error.is_none());
+    }
+
+    #[test]
+    fn go_to_path_valid_existing_directory_reroots_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_root = tmp.path().join("old");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(target.join("child")).unwrap();
+        let typed = format!("{}/./child/../", target.display());
+        let expected = PathBuf::from(&typed);
+        let mut s = make_state("query");
+        s.opts.roots = vec![old_root];
+
+        handle_key(&mut s, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        s.go_to_path.as_mut().unwrap().input = typed;
+        let out = handle_key(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(out, SearchOutcome::Continue));
+        assert!(s.go_to_path.is_none());
+        assert_eq!(s.opts.roots, vec![expected]);
+        assert!(s.input.is_empty());
+        assert!(s.scanning);
+    }
+
+    #[test]
+    fn go_to_path_nonexistent_directory_errors_without_rerooting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_root = tmp.path().join("old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let missing = tmp.path().join("missing");
+        let mut s = make_state("query");
+        s.opts.roots = vec![old_root.clone()];
+
+        handle_key(&mut s, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        s.go_to_path.as_mut().unwrap().input = missing.display().to_string();
+        handle_key(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(s.opts.roots, vec![old_root]);
+        assert_eq!(s.input, "query");
+        let modal = s.go_to_path.as_ref().expect("modal should stay open");
+        assert_eq!(modal.error.as_deref(), Some("directory does not exist"));
+    }
+
+    #[test]
+    fn go_to_path_esc_cancels_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut s = make_state("query");
+        s.opts.roots = vec![root.clone()];
+
+        handle_key(&mut s, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        s.go_to_path.as_mut().unwrap().input.push_str("/half-typed");
+        let out = handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(matches!(out, SearchOutcome::Continue));
+        assert!(s.go_to_path.is_none());
+        assert_eq!(s.opts.roots, vec![root]);
+        assert_eq!(s.input, "query");
+    }
+
+    #[test]
+    fn exact_pick_scaffolds_or_opens_existing_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(matches!(
+            classify_pick(&dir),
+            SearchOutcome::ScaffoldAt(path) if path == dir
+        ));
+
+        let workspace = dir.join("user-root.portagenty.toml");
+        std::fs::write(&workspace, "name = \"User root\"\n").unwrap();
+        assert!(matches!(
+            classify_pick(&dir),
+            SearchOutcome::OpenExisting(path) if path == workspace
+        ));
     }
 }
 

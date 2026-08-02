@@ -261,9 +261,14 @@ backends fire in order:
 5. **Stdlib walker** — always-available fallback (depth-capped,
    ignores `.git`, `node_modules`, `target`, etc.).
 
-Each tier is silently skipped when its tool isn't installed. Results
-are deduped and ranked by **nucleo** (Helix's pure-Rust fuzzy
-matcher). Enter on a candidate either opens an existing workspace
+Each tier is silently skipped when its tool isn't installed. The TUI
+caches discovered paths and re-ranks that cache with **nucleo**
+(Helix's pure-Rust fuzzy matcher), keeping filesystem work off the
+keystroke path. Type an existing absolute path or `~/...` directory to
+pin it first as an `[exact]` result. `Ctrl+G` jumps directly to an
+existing absolute directory. `→` drills into the highlighted folder's
+scope, `←` moves to its parent, and `Ctrl+R` toggles local/global search
+without clearing the current query. Enter opens an existing workspace
 there or scaffolds a new one with a confirm prompt.
 
 <div style="border: 2px solid var(--sl-color-blue); border-radius: 12px; padding: 1rem 1.25rem; margin: 1.5rem 0; background: var(--sl-color-blue-low);">
@@ -291,7 +296,7 @@ there or scaffolds a new one with a confirm prompt.
     </div>
   </div>
   <div style="border-top: 1px solid var(--sl-color-gray-5); margin-top: 0.75rem; padding-top: 0.6rem; text-align: center; font-size: 0.8rem; opacity: 0.7;">
-    dedup on canonical path → <strong>nucleo fuzzy rank</strong> → top N
+    cache + raw-path dedup → <strong>nucleo fuzzy rank</strong> → exact path pinned first
   </div>
 </div>
 
