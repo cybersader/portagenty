@@ -66,6 +66,7 @@ fn create_detached_then_list_and_has_session() {
         command: "sleep 60".into(),
         kind: None,
         env: std::collections::BTreeMap::new(),
+        description: None,
     };
     h.adapter.create_detached(&sess).expect("create_detached");
 
@@ -90,6 +91,7 @@ fn kill_is_idempotent() {
         command: "sleep 60".into(),
         kind: None,
         env: std::collections::BTreeMap::new(),
+        description: None,
     };
     h.adapter.create_detached(&sess).unwrap();
     assert!(h.adapter.has_session("beta").unwrap());
@@ -113,6 +115,7 @@ fn sanitization_round_trip_through_create_detached() {
         command: "sleep 60".into(),
         kind: None,
         env: std::collections::BTreeMap::new(),
+        description: None,
     };
     h.adapter.create_detached(&sess).unwrap();
 
@@ -134,6 +137,7 @@ fn create_detached_reports_cwd() {
         command: "sleep 60".into(),
         kind: None,
         env: std::collections::BTreeMap::new(),
+        description: None,
     };
     h.adapter.create_detached(&sess).unwrap();
 
@@ -166,6 +170,7 @@ fn create_detached_errors_when_cwd_missing() {
         command: "sleep 60".into(),
         kind: None,
         env: std::collections::BTreeMap::new(),
+        description: None,
     };
     let err = h.adapter.create_detached(&sess).unwrap_err();
     let msg = format!("{err:#}");

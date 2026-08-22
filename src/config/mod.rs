@@ -996,22 +996,19 @@ mod previous_paths_tests {
             second.is_empty(),
             "second pass should be a no-op: {second:?}"
         );
-        let new_raw = fs::read_to_string(&new_p).unwrap();
-        // Count occurrences of the old path — exactly one should be present.
-        let old_s = old_tmp.path().display().to_string();
-        let old_canonical = old_tmp
+        let workspace: WorkspaceFile = load_toml(&new_p).unwrap();
+        assert_eq!(
+            workspace.previous_paths.len(),
+            1,
+            "previous_paths duplicated: {workspace:?}"
+        );
+        let recorded = PathBuf::from(&workspace.previous_paths[0]);
+        let recorded_canonical = recorded.canonicalize().unwrap_or_else(|_| recorded.clone());
+        let expected_canonical = old_tmp
             .path()
             .canonicalize()
-            .unwrap_or_else(|_| old_tmp.path().to_path_buf())
-            .display()
-            .to_string();
-        let hits = new_raw.matches(old_s.as_str()).count()
-            + if old_s == old_canonical {
-                0
-            } else {
-                new_raw.matches(old_canonical.as_str()).count()
-            };
-        assert_eq!(hits, 1, "previous_paths duplicated: {new_raw}");
+            .unwrap_or_else(|_| old_tmp.path().to_path_buf());
+        assert_eq!(recorded_canonical, expected_canonical);
     }
 
     #[test]
@@ -1055,7 +1052,7 @@ mod previous_paths_tests {
         let regged = list_registered_workspaces().unwrap();
         let matches: Vec<_> = regged
             .iter()
-            .filter(|rp| rp.canonicalize().ok().as_deref() == Some(&p))
+            .filter(|rp| rp.canonicalize().ok() == p.canonicalize().ok())
             .collect();
         assert_eq!(matches.len(), 1, "row count drifted: {regged:?}");
     }

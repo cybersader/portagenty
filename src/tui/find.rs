@@ -2640,9 +2640,10 @@ mod tree_tests {
         // and exit tree mode, which hijacked typing `t` into the
         // new-folder name input.
         let tmp = assert_fs::TempDir::new().unwrap();
-        let mut state = super::SearchState::default();
-        state.mode =
-            super::FindMode::Tree(Box::new(TreeBrowseState::new(tmp.path().to_path_buf())));
+        let mut state = super::SearchState {
+            mode: super::FindMode::Tree(Box::new(TreeBrowseState::new(tmp.path().to_path_buf()))),
+            ..Default::default()
+        };
         // Enter the new-folder modal.
         let _ = super::handle_key(&mut state, KeyCode::Char('n'), KeyModifiers::NONE);
         // Type "test".

@@ -55,7 +55,7 @@ pub fn detect_terminals() -> Vec<Terminal> {
     let mut out = Vec::new();
     let on_wsl = crate::find::is_wsl();
     for cand in candidates_for_env(on_wsl) {
-        if let Some(bin) = which_with_extra_paths(&cand.probe_bin, on_wsl) {
+        if let Some(bin) = which_with_extra_paths(cand.probe_bin, on_wsl) {
             out.push(Terminal {
                 name: cand.name.to_string(),
                 binary: bin,
@@ -80,7 +80,7 @@ fn candidates_for_env(on_wsl: bool) -> Vec<Candidate> {
         let windows = all_candidates()
             .into_iter()
             .filter(|c| c.platform == "windows");
-        windows.chain(current.into_iter()).collect()
+        windows.chain(current).collect()
     } else {
         candidates()
     }
