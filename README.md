@@ -94,6 +94,8 @@ EOF
 # 2. From any directory under the workspace file:
 pa                       # TUI — pick a session, Enter to launch
 pa launch claude         # one-shot: skip TUI, go straight to the mpx
+pa launch claude --supervise --memory-high 12G  # experimental Linux containment
+pa resources status claude                    # owned workload metrics + events
 pa claim                 # cross-device takeover
 pa export -o starter.sh  # render a starter script to commit
 ```
@@ -120,11 +122,12 @@ pa                        # open the TUI
 | **Open in Terminal** | `o` in session list / tree mode / picker's reveal modal drops you into a plain shell at the chosen path — exits pa, no mpx, no session state. |
 | **pa://** URL scheme | `pa open <url>` dispatches `pa://open/<path>`, `pa://workspace/<uuid>`, `pa://launch/<uuid>/<session>`, and `pa://shell/<path>` links. `pa protocol install` registers the scheme with the OS (Linux `.desktop`, Windows / WSL registry); works with any detected or user-specified terminal emulator. |
 | **Cross-device** | `pa claim` takeover-attach. `pa launch --resume` appends `--continue` for claude-code sessions. |
+| **Resource supervision (experimental, Linux only)** | Opt-in transient systemd user services with cgroup-v2 CPU, memory, swap, tasks, I/O, PSI, and event counters. TUI `S` can confirm-upgrade a legacy workspace with a UUID, confirm-terminate a live shared target for a fresh supervised relaunch, and prefill editable soft guardrails (`12G` Memory High, `300%` CPU, `1200` tasks). Existing trees are never migrated or claimed; CLI limits remain explicit. Exact receipts gate control. No daemon or history service. |
 | **Workspace scoping** | Session names prefixed with workspace name in the mpx (`my-project-shell`). Auto-re-register on walk-up (folder move resilience). Auto-maintained `previous_paths` when moves are detected. |
 | **Portaconv integration** | `pa convos list` / `pa convos dump <id>` forwards to [portaconv](https://github.com/cybersader/portaconv) scoped to this workspace. `pa init --with-agent-hooks` scaffolds `.mcp.json` + `.claude/` so agents self-discover the conversation extractor. |
 | **Extras** | Declarative export (`pa export`), onboarding wizard, shell completions, bundled bash snippets, per-session env vars. |
 
-**Still roadmapped**: Tags/Groups views, `pa up` eager-launch, datetime column, jump-back-to-pa from inside a session. See [ROADMAP.md](./ROADMAP.md).
+**Still roadmapped**: Tags/Groups views, `pa up` eager-launch, datetime column, jump-back-to-pa from inside a session, non-Linux supervision adapters, hard memory/swap caps, and any external graphical resource dashboard. See [ROADMAP.md](./ROADMAP.md).
 
 ## What it is
 
@@ -133,10 +136,11 @@ pa                        # open the TUI
 - **Portable** — single static Rust binary. `scp` it to a new machine and run. No runtime to install.
 - A **workspace layer on top of the filesystem** — hierarchy on hierarchy.
 - An **attach-or-create orchestrator** over tmux and zellij.
+- On supported Linux hosts, an **opt-in workload containment and observation layer** for sessions Portagenty can prove it created.
 
 ## What it is not
 
-- Not a VS Code extension. Not a browser app. Not a daemon.
+- Not a VS Code extension. Not a browser app. Not a Portagenty daemon. Experimental Linux supervision delegates workload lifetime to the existing systemd user manager.
 - Not an agent framework. It launches agents; it does not replace them.
 - Not a project scaffolder (workspace scaffolding is built in; project-level is someone else's job).
 - Not tied to one multiplexer.

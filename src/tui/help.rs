@@ -33,10 +33,10 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, ctx: HelpContext) {
     let w = area.width;
     let h = area.height;
     let overlay_w = w.saturating_sub(4).clamp(20, 70).min(w);
-    // Enough height on a desktop to show all sections (keys + markers
-    // + kind glyphs + title-bar + coming-soon) without clipping.
-    // Narrow terminals (Termux portrait) clamp to available height.
-    let overlay_h = h.saturating_sub(2).clamp(10, 40).min(h);
+    // Enough height on a tall desktop to show all sections (keys,
+    // ownership, markers, kind glyphs, and actions) without clipping.
+    // Narrow terminals (Termux portrait) still clamp to available height.
+    let overlay_h = h.saturating_sub(2).clamp(10, 56).min(h);
     let x = area.x + (w.saturating_sub(overlay_w)) / 2;
     let y = area.y + (h.saturating_sub(overlay_h)) / 2;
     let region = Rect {
@@ -125,7 +125,7 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("D", "delete workspace file (destructive)"));
             lines.push(row(
                 "X",
-                "kill ALL live sessions under this workspace (destructive — confirms first)",
+                "stop workspace sessions; previews owned/mux-native/skipped",
             ));
             lines.push(row(
                 "a",
@@ -164,6 +164,32 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
                 "live mpx session without a workspace entry",
             ));
             lines.push(Line::raw(""));
+            lines.push(heading(" Ownership labels"));
+            lines.push(Line::raw(""));
+            lines.push(row(
+                "supervisable",
+                "idle UUID-backed session; S can contain it",
+            ));
+            lines.push(row(
+                "needs ID",
+                "legacy workspace; S can confirm-add a stable UUID",
+            ));
+            lines.push(row("bad ID", "malformed workspace UUID; fix explicitly"));
+            lines.push(row(
+                "owned",
+                "exact receipt + private target; resources available",
+            ));
+            lines.push(row(
+                "unverified",
+                "live shared target; never claimed retroactively",
+            ));
+            lines.push(row(
+                "unmanaged",
+                "live target outside Portagenty containment",
+            ));
+            lines.push(row("stale", "receipt mismatch; resource controls refuse"));
+            lines.push(row("unsupported", "platform or workspace cannot supervise"));
+            lines.push(Line::raw(""));
             lines.push(heading(" Kind glyphs"));
             lines.push(Line::raw(""));
             lines.push(row("C (blue)", "claude-code"));
@@ -191,7 +217,16 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             ));
             lines.push(row("e", "edit session field (rename/cwd/cmd/kind/env)"));
             lines.push(row("d", "delete the session (edits TOML)"));
-            lines.push(row("x", "kill the live mpx session"));
+            lines.push(row(
+                "x",
+                "owned: graceful + non-force stop; unmanaged: mpx kill",
+            ));
+            lines.push(row("X", "force-kill an owned verified cgroup (confirms)"));
+            lines.push(row(
+                "S",
+                "supervise idle; confirm-upgrade/restart legacy or live rows",
+            ));
+            lines.push(row("r", "refresh selected owned session resources"));
             lines.push(row(
                 "z",
                 "toggle expand-on-select (full desc/cmd/cwd on the highlighted row)",
@@ -223,6 +258,19 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn help_text(ctx: HelpContext) -> String {
+        help_body(ctx)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -260,6 +308,17 @@ mod tests {
             text.contains("open the highlighted"),
             "picker help should explain Enter:\n{text}"
         );
+    }
+
+    #[test]
+    fn session_help_documents_supervision_resources_and_safe_controls() {
+        let text = help_text(HelpContext::SessionList);
+        assert!(text
+            .contains("S             supervise idle; confirm-upgrade/restart legacy or live rows"));
+        assert!(text.contains("needs ID      legacy workspace; S can confirm-add a stable UUID"));
+        assert!(text.contains("r             refresh selected owned session resources"));
+        assert!(text.contains("x             owned: graceful + non-force stop"));
+        assert!(text.contains("X             force-kill an owned verified cgroup"));
     }
 
     #[test]

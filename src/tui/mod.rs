@@ -8,6 +8,8 @@ pub mod find;
 pub mod footer;
 pub mod help;
 pub mod picker;
+#[cfg(target_os = "linux")]
+pub mod resources;
 pub mod view;
 
 pub use app::{Action, App, AppOutcome, LaunchKind};
@@ -252,6 +254,17 @@ enum SessionRunOutcome {
     OpenShell(std::path::PathBuf),
 }
 
+#[cfg(target_os = "linux")]
+fn receipts_for_workspace(
+    workspace_id: Option<&str>,
+    receipts: Vec<crate::supervision::BindingReceipt>,
+) -> Vec<crate::supervision::BindingReceipt> {
+    receipts
+        .into_iter()
+        .filter(|receipt| workspace_id == Some(receipt.logical_id.workspace_id.as_str()))
+        .collect()
+}
+
 /// Runs the session-list TUI against an already-initialized terminal.
 /// Does *not* restore the terminal — caller owns init/restore so the
 /// picker can share one ratatui session with the session list.
@@ -260,6 +273,7 @@ fn run_session_tui(
     workspace: crate::domain::Workspace,
 ) -> Result<SessionRunOutcome> {
     let workspace_file = workspace.file_path.clone();
+    let workspace_for_supervision = workspace.clone();
     let mpx_kind = workspace.multiplexer;
     let mux: Box<dyn crate::mux::Multiplexer> = match workspace.multiplexer {
         crate::domain::Multiplexer::Tmux => Box::new(TmuxAdapter::new()),
@@ -287,6 +301,14 @@ fn run_session_tui(
 
     let live = mux.list_sessions().unwrap_or_default();
     let app = App::new(workspace, mux, live);
+    #[cfg(target_os = "linux")]
+    let app = {
+        let receipts = receipts_for_workspace(
+            app.workspace_id(),
+            crate::supervision::ReceiptStore::standard()?.list()?,
+        );
+        app.with_receipts(receipts)
+    };
     let (outcome, mux) = app.run(terminal)?;
 
     let mode = crate::mux::AttachMode::Takeover;
@@ -301,7 +323,21 @@ fn run_session_tui(
             // pre-launch banner prints to the user's real shell.
             ratatui::restore();
             print_launch_banner(mpx_kind, &session.name);
-            SessionRunOutcome::Launched(mux.create_and_attach(&session, &mpx_name, mode))
+            SessionRunOutcome::Launched(
+                mux.create_and_attach(&session, &mpx_name, mode).map(|_| ()),
+            )
+        }
+        AppOutcome::Launch(LaunchKind::CreateSupervised { session, limits }) => {
+            ratatui::restore();
+            print_launch_banner(mpx_kind, &session.name);
+            SessionRunOutcome::Launched(crate::cli::launch_supervised_resolved(
+                session,
+                workspace_for_supervision,
+                false,
+                mode,
+                false,
+                limits,
+            ))
         }
         AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
             if let Some(path) = &workspace_file {
@@ -310,6 +346,17 @@ fn run_session_tui(
             ratatui::restore();
             print_launch_banner(mpx_kind, &mpx_name);
             SessionRunOutcome::Launched(mux.attach(&mpx_name, mode))
+        }
+        AppOutcome::Launch(LaunchKind::AttachOwned {
+            target,
+            display_name,
+        }) => {
+            if let Some(path) = &workspace_file {
+                let _ = crate::state::record_launch(path, &display_name);
+            }
+            ratatui::restore();
+            print_launch_banner(mpx_kind, &display_name);
+            SessionRunOutcome::Launched(crate::cli::attach_receipted_target(&target, mode))
         }
         AppOutcome::OpenShellAt(dir) => SessionRunOutcome::OpenShell(dir),
     })
@@ -399,4 +446,43 @@ fn print_launch_banner(mpx: crate::domain::Multiplexer, session: &str) {
         }
     }
     eprintln!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn receipt(workspace_id: &str, session_name: &str) -> crate::supervision::BindingReceipt {
+        crate::supervision::BindingReceipt {
+            schema_version: crate::supervision::model::RECEIPT_SCHEMA_VERSION,
+            logical_id: crate::supervision::LogicalSessionId::new(workspace_id, session_name)
+                .unwrap(),
+            backend: crate::supervision::BackendKind::SystemdUserService,
+            unit_name: "portagenty-wtest.service".into(),
+            invocation_id: "00112233445566778899aabbccddeeff".into(),
+            control_group: "/user.slice/user-1000.slice/user@1000.service/app.slice/test.service"
+                .into(),
+            mux_target: crate::supervision::MuxTarget::TmuxPrivate {
+                socket: std::path::PathBuf::from("/run/user/1000/portagenty/test/tmux.sock"),
+                session: session_name.into(),
+            },
+            observed_at_unix_ms: 1,
+            limits: crate::supervision::SoftLimits::default(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_tui_receipts_are_scoped_to_the_current_workspace_uuid() {
+        let current = "550e8400-e29b-41d4-a716-446655440000";
+        let other = "123e4567-e89b-12d3-a456-426614174000";
+        let filtered = receipts_for_workspace(
+            Some(current),
+            vec![receipt(current, "kept"), receipt(other, "excluded")],
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].logical_id.session_name, "kept");
+        assert!(receipts_for_workspace(None, vec![receipt(current, "excluded")]).is_empty());
+    }
 }

@@ -1,17 +1,21 @@
 //! tmux adapter. Shells out to the `tmux` CLI via `std::process::Command`.
 //!
 //! An optional `socket` path isolates the adapter to a private tmux
-//! server (tmux `-S <path>`). Production use leaves this `None` to
-//! share the user's default server; tests pass a per-test socket so
-//! concurrent nextest runs don't collide.
+//! server (tmux `-S <path>`). Normal launches leave this `None` to share
+//! the user's default server; supervised launches and tests use a private
+//! socket for exact ownership and isolation.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::domain::Session;
-use crate::mux::{sanitize_session_name, AttachMode, Multiplexer, SessionInfo};
+use crate::mux::{
+    sanitize_session_name, AttachMode, CreationDisposition, Multiplexer, SessionInfo,
+};
 
 /// Wrap a std::io::Error that fired during a tmux invocation. We
 /// lift `NotFound` into a clear "tmux isn't installed or isn't in
@@ -41,8 +45,8 @@ impl TmuxAdapter {
         Self::default()
     }
 
-    /// Private tmux server at the given socket path. Used in tests
-    /// for isolation; not typically what end users want.
+    /// Private tmux server at the given socket path. Used for supervised
+    /// per-session ownership and for isolated tests.
     pub fn with_socket(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: Some(socket.into()),
@@ -62,30 +66,56 @@ impl TmuxAdapter {
     /// create path without taking over the controlling TTY.
     pub fn create_detached(&self, session: &Session) -> Result<()> {
         let name = sanitize_session_name(&session.name);
-        self.create_detached_with_name(session, &name)
+        self.create_detached_with_name(session, &name).map(|_| ())
     }
 
-    fn create_detached_with_name(&self, session: &Session, name: &str) -> Result<()> {
-        if self.has_session(name)? {
-            return Ok(());
-        }
+    pub(crate) fn create_detached_args(
+        &self,
+        session: &Session,
+        name: &str,
+    ) -> Result<Vec<OsString>> {
         ensure_cwd_exists(&session.cwd)?;
-        let mut cmd = self.cmd();
-        cmd.arg("new-session").arg("-d").arg("-s").arg(name);
+        let mut args = Vec::new();
+        if let Some(socket) = &self.socket {
+            args.push(OsString::from("-S"));
+            args.push(socket.as_os_str().to_owned());
+        }
+        args.extend([
+            OsString::from("new-session"),
+            OsString::from("-d"),
+            OsString::from("-s"),
+            OsString::from(name),
+        ]);
         // -e KEY=VAL flags: tmux applies these to the session's
         // environment, so the spawned shell + child processes see
         // them. Order is deterministic because session.env is BTreeMap.
-        for (k, v) in &session.env {
-            cmd.arg("-e").arg(format!("{k}={v}"));
+        for (key, value) in &session.env {
+            args.push(OsString::from("-e"));
+            args.push(OsString::from(format!("{key}={value}")));
         }
-        cmd.arg("-c").arg(&session.cwd).arg(&session.command);
-        let status = cmd
+        args.push(OsString::from("-c"));
+        args.push(session.cwd.as_os_str().to_owned());
+        args.push(OsString::from(&session.command));
+        Ok(args)
+    }
+
+    fn create_detached_with_name(
+        &self,
+        session: &Session,
+        name: &str,
+    ) -> Result<CreationDisposition> {
+        if self.has_session(name)? {
+            return Ok(CreationDisposition::Existing);
+        }
+        let args = self.create_detached_args(session, name)?;
+        let status = Command::new("tmux")
+            .args(args)
             .status()
             .map_err(|e| friendly_io_err("spawning tmux new-session", e))?;
         if !status.success() {
             bail!("tmux new-session failed for session {name:?}");
         }
-        Ok(())
+        Ok(CreationDisposition::Created)
     }
 
     /// Stop the tmux server this adapter is pointed at. Used in
@@ -188,11 +218,17 @@ impl Multiplexer for TmuxAdapter {
         Ok(())
     }
 
-    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()> {
+    fn create_and_attach(
+        &self,
+        session: &Session,
+        mpx_name: &str,
+        mode: AttachMode,
+    ) -> Result<CreationDisposition> {
         // Use the caller-provided mpx_name (workspace-scoped) instead
         // of computing from session.name (which would miss the prefix).
-        self.create_detached_with_name(session, mpx_name)?;
-        self.attach(mpx_name, mode)
+        let disposition = self.create_detached_with_name(session, mpx_name)?;
+        self.attach(mpx_name, mode)?;
+        Ok(disposition)
     }
 
     fn kill(&self, name: &str) -> Result<()> {
@@ -210,6 +246,19 @@ impl Multiplexer for TmuxAdapter {
             .map_err(|e| friendly_io_err("spawning tmux kill-session", e))?;
         if !status.success() {
             bail!("tmux kill-session failed for {name:?}");
+        }
+        if let Some(socket) = &self.socket {
+            if self.list_sessions()?.is_empty() {
+                match fs::remove_file(socket) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("removing private tmux socket {}", socket.display())
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }

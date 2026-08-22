@@ -175,6 +175,54 @@ fn read_workspace_id(ws_path: &Path) -> Option<String> {
     doc.get("id").and_then(|v| v.as_str()).map(str::to_string)
 }
 
+/// Ensure a file-backed workspace has the stable UUID required by supervised
+/// launches. Legacy files without `id` are upgraded in place with toml_edit so
+/// comments and session blocks survive. Existing IDs are validated and never
+/// replaced; a malformed value remains an explicit, fail-closed error.
+///
+/// The workspace file is authoritative. After it is safely written, the global
+/// registry entry is refreshed so protocol lookup and move reconciliation see
+/// the same identity. Retrying after a registry-write failure is safe.
+pub fn ensure_workspace_id(ws_path: &Path) -> Result<String> {
+    let raw = std::fs::read_to_string(ws_path)
+        .with_context(|| format!("reading workspace {}", ws_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing workspace {}", ws_path.display()))?;
+
+    let id = match doc.get("id") {
+        Some(item) => {
+            let value = item.as_str().ok_or_else(|| {
+                anyhow!(
+                    "workspace id in {} must be a UUID string",
+                    ws_path.display()
+                )
+            })?;
+            uuid::Uuid::parse_str(value).with_context(|| {
+                format!(
+                    "workspace id {value:?} in {} is not a valid UUID",
+                    ws_path.display()
+                )
+            })?;
+            value.to_string()
+        }
+        None => {
+            let generated = uuid::Uuid::new_v4().to_string();
+            doc["id"] = toml_edit::value(generated.as_str());
+            write_atomic(ws_path, &doc.to_string())?;
+            generated
+        }
+    };
+
+    register_global_workspace(ws_path).with_context(|| {
+        format!(
+            "workspace ID is valid, but refreshing its global registry entry failed for {}",
+            ws_path.display()
+        )
+    })?;
+    Ok(id)
+}
+
 /// Remove a workspace entry from the global registry by path.
 /// Matches on the stored `path` string, with tolerance for `~` /
 /// `${VAR}` expansion differences: both the stored value and the
@@ -820,6 +868,107 @@ mod default_mpx_tests {
             current_default_multiplexer().unwrap(),
             Some(Multiplexer::Zellij)
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_id_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::fs;
+
+    struct Sandbox {
+        _xdg: assert_fs::TempDir,
+        _home: assert_fs::TempDir,
+        _env: crate::test_env::EnvSandbox,
+    }
+
+    impl Sandbox {
+        fn new() -> Self {
+            let xdg = assert_fs::TempDir::new().unwrap();
+            let home = assert_fs::TempDir::new().unwrap();
+            let env = crate::test_env::EnvSandbox::new()
+                .set("XDG_CONFIG_HOME", xdg.path())
+                .set("HOME", home.path());
+            Self {
+                _xdg: xdg,
+                _home: home,
+                _env: env,
+            }
+        }
+    }
+
+    fn legacy_workspace(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("legacy.portagenty.toml");
+        fs::write(
+            &path,
+            "# keep this comment\nname = \"legacy\"\nmultiplexer = \"tmux\"\n\n[[session]]\nname = \"shell\"\ncwd = \".\"\ncommand = \"bash\"\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_workspace_id_upgrades_legacy_file_and_registry_idempotently() {
+        let _sandbox = Sandbox::new();
+        let temp = assert_fs::TempDir::new().unwrap();
+        let path = legacy_workspace(temp.path());
+
+        let id = ensure_workspace_id(&path).unwrap();
+        uuid::Uuid::parse_str(&id).unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        assert!(
+            first.contains("# keep this comment"),
+            "comment lost: {first}"
+        );
+        assert!(first.contains("[[session]]"), "session lost: {first}");
+        assert!(
+            first.contains(&format!("id = \"{id}\"")),
+            "id missing: {first}"
+        );
+        let registry = fs::read_to_string(global_config_path().unwrap()).unwrap();
+        assert!(registry.contains(&id), "registry ID missing: {registry}");
+
+        assert_eq!(ensure_workspace_id(&path).unwrap(), id);
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_workspace_id_refuses_invalid_existing_value_without_rewrite() {
+        let _sandbox = Sandbox::new();
+        let temp = assert_fs::TempDir::new().unwrap();
+        let path = temp.path().join("bad.portagenty.toml");
+        let raw = "name = \"bad\"\nid = \"not-a-uuid\"\nmultiplexer = \"tmux\"\n";
+        fs::write(&path, raw).unwrap();
+
+        let error = ensure_workspace_id(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("not a valid UUID"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+        assert!(!global_config_path().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn ensure_workspace_id_write_failure_leaves_legacy_file_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _sandbox = Sandbox::new();
+        let temp = assert_fs::TempDir::new().unwrap();
+        let path = legacy_workspace(temp.path());
+        let before = fs::read_to_string(&path).unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = ensure_workspace_id(&path);
+
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "read-only directory unexpectedly accepted a write"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
 }
 

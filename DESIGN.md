@@ -149,9 +149,12 @@ portagenty splits what it knows into two categories:
 - Last-attached timestamps
 - User's most recent TUI view preference
 
+**Machine-local ownership receipts**: Linux supervised launches use `$XDG_STATE_HOME/portagenty/supervision.toml`. This versioned, lock-protected file records the stable logical session ID, opaque transient-unit name, systemd `InvocationID`, exact `ControlGroup`, exact private multiplexer target, and applied guardrails. It is not workspace configuration and must never be committed or synced as authority.
+
 **Live, rebuilt on every run**: not persisted anywhere.
 
 - Which tmux/zellij/WezTerm sessions are currently running. Obtained by polling the mpx CLI at startup and on refresh. This is how untracked sessions get surfaced (see §5).
+- Current resource snapshots and counter deltas for verified supervised workloads. These are sampled on demand or by the bounded TUI worker and are not retained as history.
 - Current focus / selection in the TUI.
 
 **Why no SQLite?** v1 doesn't need query performance. It needs inspectability, simple atomic writes, and no migration pain. A SQLite file adds a library, a schema, a migration story, and makes the state opaque. If v2+ ever needs cross-process concurrency or fast queries across thousands of tagged projects, revisit. Until then: files.
@@ -167,8 +170,8 @@ v1 shipped the tmux adapter as the reference baseline. v1.x added zellij. WezTer
 **Core interface** (conceptual, not Rust API):
 
 - `list_sessions()` — return live sessions the adapter knows about, including ones portagenty didn't launch.
-- `session_exists(name)` / `attach(name)` / `create_and_attach(name, cwd, command)` — the attach-or-create loop.
-- `kill(name)` — close a session.
+- `session_exists(name)` / `attach(name)` / `create_and_attach(name, cwd, command)` — the attach-or-create loop. Creation reports `Created` versus `Existing` so ownership is never inferred from a successful attach.
+- `kill(name)` — close an ordinary shared multiplexer session.
 - `detach_current()` — let user step back to the TUI.
 - `export(workspace) -> artifact` — optional; produces a native artifact (KDL layout for zellij, a shell script for tmux, whatever for WezTerm).
 
@@ -178,12 +181,14 @@ v1 shipped the tmux adapter as the reference baseline. v1.x added zellij. WezTer
 - Attach-or-create is a shell pipe: `tmux has-session -t NAME 2>/dev/null && tmux attach-session -t NAME || tmux new-session -s NAME -c CWD -d`.
 - Session/window naming: sanitize `[^a-zA-Z0-9_-]` → `_`, clamp at 50 chars. Match the VS Code extension's approach so existing sessions carry over.
 - Untracked session adoption: `tmux list-sessions -F '#{session_name}|#{session_path}|#{session_attached}'`.
+- Supervised creation uses a dedicated private tmux socket/server per logical session. Shared/default-server sessions remain attachable but unverified and unmanaged by cgroup controls.
 
 **zellij** — added in v1.x.
 
 - Zellij's model is different: layouts (KDL) define tabs + panes declaratively. Opening a layout spins everything up at once — fights our "lazy" default.
 - v1.x adapter runs imperative where possible (`zellij attach`, `zellij action new-tab`, `zellij action new-pane`). For workspaces where the user wants "all at once," `pa export` produces a KDL layout they can open normally.
 - Works better with OpenCode than tmux does, per the agentic-workflow README.
+- Supervised creation starts a fresh opaque session under an exact validated runtime namespace, using a short-lived PTY and private generated layout. Existing Zellij sessions are never retroactively claimed.
 
 **WezTerm** — **intentionally not supported** (see §1 Vocabulary
 and ROADMAP v1.x). The `Multiplexer::Wezterm` enum variant exists
@@ -210,6 +215,32 @@ When the user selects a session and hits Enter:
 This is imperative, on-demand. A workspace with 20 sessions defined never costs you 20 processes worth of startup. It costs you one process when you open one session.
 
 **Eager / "jump-in" flag** — a v1.x feature: `pa launch <workspace> --eager` or a config key that tells portagenty to spawn every session in a workspace at entry time, so long-running things (agents, dev servers) are warm by the time you tab to them. Off by default.
+
+### Experimental Linux resource supervision
+
+Normal Enter and ordinary `pa launch` keep the attach-or-create behavior above. Supervision is an explicit alternative (`S` in the session TUI or `pa launch <session> --supervise`) and requires a workspace UUID. For a writable legacy workspace with no ID, the TUI distinguishes `needs ID` from genuine platform failure and can confirm-add a UUID before launch; malformed IDs still fail closed. It is currently implemented only where a systemd user manager and unified cgroup v2 provide the required guarantees; other platforms report unsupported capability states rather than silently weakening containment.
+
+A supervised launch creates a transient **systemd user service**, not a scope and not a Portagenty daemon. The service uses `Type=exec`, `ExitType=cgroup`, `KillMode=control-group`, `SendSIGKILL=no`, `Restart=no`, `OOMPolicy=continue`, explicit accounting, and an exact working directory/environment/argv. The existing systemd user manager owns the workload lifetime after `pa` exits. Portagenty opens no listener and retains no resident process.
+
+Ownership is proof-based:
+
+1. Stable logical identity is `workspace UUID + exact declared session name`.
+2. A fresh launch gets an opaque unit and private tmux/Zellij target.
+3. The machine-local receipt records unit name, `InvocationID`, `ControlGroup`, target, and guardrails atomically while holding the receipt lock.
+4. Every snapshot or systemd action resolves the invocation again and requires exact unit-name, invocation-ID, control-group, canonical cgroup path, user-manager subtree, and target agreement.
+5. Missing or mismatched evidence becomes stale/ambiguous and controls fail closed. Existing shared sessions are `existing-unverified`; they are never retroactively claimed. Pressing `S` may explicitly terminate only the exact ordinary multiplexer target and then offer a fresh supervised launch after idle revalidation, but it never migrates or assigns ownership to the old process tree.
+
+Optional soft guardrails are `MemoryHigh`, `CPUQuotaPerSecUSec`, and `TasksMax`. The interactive `S` modal prefills launch-local recommended values (`12G`, `300%`, and `1200`) that remain editable or clearable; CLI flags stay unset unless explicitly supplied. These controls reclaim/throttle or reject new tasks; they are not hard memory/swap caps or persisted workspace policy. `OOMPolicy=continue` allows a child OOM kill to be observed without automatically destroying the remaining session. Hard caps remain deferred until synthetic destructive testing is explicitly approved.
+
+Resource snapshots read the verified cgroup: cumulative CPU plus sampled rate, charged memory current/peak/events, swap current/peak/events, tasks current/peak/events, aggregate I/O plus sampled rates, CPU/memory/I/O PSI, and cgroup populated/frozen state. `memory.current` is cgroup-charged memory rather than root-process RSS; `pids.current` counts tasks/threads; CPU rate may exceed 100% on multicore systems. CLI/TUI notices surface deltas such as `memory.events high/oom/oom_kill`, `pids.events max`, and CPU quota throttling. Snapshots are ephemeral—there is no history database, log monitor, or unattended telemetry collector.
+
+The control ladder stays explicit:
+
+1. Gracefully stop the exact recorded multiplexer target.
+2. Revalidate and request non-force systemd `StopUnit`.
+3. Only a separately confirmed force action may call whole-cgroup `KillUnit(..., SIGKILL)`.
+
+Picker-wide stop partitions targets by capability: verified owned workloads use steps 1–2, unmanaged shared sessions use multiplexer-native kill, and stale/ambiguous receipts are shown and skipped. Bulk control never force-escalates.
 
 ---
 
@@ -712,4 +743,4 @@ subprocess.
 - **Agent-API wrapping**. Claude Code / OpenCode are launched as subprocesses. portagenty never speaks their APIs.
 - **GUI / web UI**. Terminal only.
 - **Syncing across machines**. Rely on git (for workspace files) and Syncthing/rsync (for anything else the user wants to sync). Not portagenty's problem.
-- **Supervisor-mode agent management**. portagenty launches agents; it does not restart them, monitor their logs, or gather telemetry.
+- **Resident supervisor-mode agent management**. Portagenty may explicitly contain and sample a workload it launches on a capable platform, but it does not restart agents, monitor their logs, retain resource history, inspect prompts/content, or run an always-on Portagenty supervisor/telemetry service.

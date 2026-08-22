@@ -43,6 +43,50 @@ Out of scope:
 - Issues specific to an agent CLI launched via a session (those are
   the agent's concern, not portagenty's).
 
+## Experimental Linux resource-supervision boundary
+
+Opt-in supervised launches use the caller's existing systemd user manager and
+cgroup v2. Portagenty does not gain root privileges, open a network listener, or
+leave a resident Portagenty process behind. The systemd user manager already has
+the same user-level authority needed to launch and stop the workload.
+
+Ownership is fail-closed. A machine-local receipt under
+`$XDG_STATE_HOME/portagenty/` records the logical workspace/session identity,
+opaque transient-unit name, systemd `InvocationID`, exact `ControlGroup`, exact
+private multiplexer target, and applied limits. The store uses a private
+directory, mode-`0600` files, advisory locking, same-directory temporary writes,
+fsync, and atomic rename. Before every snapshot or systemd control action,
+Portagenty resolves the invocation again and requires exact unit-name,
+invocation-ID, control-group, canonical cgroup path, user-manager subtree, and
+multiplexer-target agreement. Traversal and symlink escapes from `/sys/fs/cgroup`
+are rejected. A stale or ambiguous receipt disables control rather than widening
+it.
+
+Supervised tmux uses a private mode-`0700` runtime/socket directory and one server
+per logical session. Supervised Zellij uses an exact validated runtime directory,
+a mode-`0600` generated layout, and PTY file descriptors passed through D-Bus.
+Existing shared tmux/Zellij sessions are never retroactively claimed.
+
+The transient service receives typed argv and an explicitly constructed
+environment. Multiplexer/systemd activation variables such as `TMUX*`,
+`ZELLIJ*`, `INVOCATION_ID`, `NOTIFY_SOCKET`, `LISTEN_*`, and `WATCHDOG_*` are
+stripped before launch; a validated runtime directory and declared session env
+remain. Workspace commands are still user-authored code and execute with the
+user's permissions.
+
+`MemoryHigh`, CPU quota, and `TasksMax` are soft preventive controls, not a data
+safety guarantee. Ordinary stop performs exact multiplexer shutdown followed by
+revalidated non-force `StopUnit`; `SendSIGKILL=no` prevents implicit escalation.
+Whole-cgroup SIGKILL is a separate explicitly confirmed action. Bulk stop never
+force-escalates and skips stale/ambiguous targets.
+
+Resource observation reads numeric cgroup files only. Portagenty does not inspect
+terminal contents, prompts, command output, or agent logs, and does not retain
+resource history or transmit telemetry. Same-user arbitrary code can edit the
+receipt store or directly call systemd; that is within the existing out-of-scope
+assumption of arbitrary local code execution, but receipt tampering must still
+produce revalidation failure rather than control of a different workload.
+
 ## Current known issues
 
 Dependabot has open alerts against this repo. None are believed to be

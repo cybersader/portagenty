@@ -40,6 +40,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nucleo-matcher = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["fs", "process", "pty", "termios"] }
+zbus = "=4.4.0"
+
 [dev-dependencies]
 insta = "1.41"
 rstest = "0.23"

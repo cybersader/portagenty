@@ -25,6 +25,21 @@ fn pa_cmd() -> Command {
     c
 }
 
+/// No-workspace tests must not live beneath the developer's home directory:
+/// walk-up discovery is intentionally allowed to find a workspace in any
+/// ancestor. CI targets are Unix-like, where `/tmp` gives these fixtures a
+/// neutral ancestor chain (`/tmp` → `/`) instead of the user's home.
+fn walkup_isolated_tempdir() -> assert_fs::TempDir {
+    #[cfg(unix)]
+    {
+        assert_fs::TempDir::new_in("/tmp").unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        assert_fs::TempDir::new().unwrap()
+    }
+}
+
 #[test]
 fn version_flag_prints_version() {
     pa_cmd()
@@ -56,7 +71,7 @@ fn bare_pa_with_nonexistent_path_errors_cleanly() {
 
 #[test]
 fn launch_errors_when_no_workspace_found() {
-    let tmp = assert_fs::TempDir::new().unwrap();
+    let tmp = walkup_isolated_tempdir();
     let empty = tmp.child("empty");
     empty.create_dir_all().unwrap();
 
@@ -105,6 +120,92 @@ fn launch_dry_run_prints_what_would_happen() {
         .stdout(contains("claude"))
         .stdout(contains("echo hi"))
         .stdout(contains("takeover"));
+}
+
+fn write_supervised_workspace(tmp: &assert_fs::TempDir) -> std::path::PathBuf {
+    tmp.child("supervised.portagenty.toml")
+        .write_str(
+            r#"
+name = "Supervised"
+id = "550e8400-e29b-41d4-a716-446655440000"
+multiplexer = "tmux"
+
+[[session]]
+name = "claude"
+cwd = "."
+command = "echo hi"
+"#,
+        )
+        .unwrap();
+    tmp.child("supervised.portagenty.toml").path().to_path_buf()
+}
+
+#[test]
+fn supervised_launch_dry_run_prints_guardrails() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_supervised_workspace(&tmp);
+
+    pa_cmd()
+        .args([
+            "launch",
+            "claude",
+            "--dry-run",
+            "--supervise",
+            "--memory-high",
+            "12G",
+            "--cpu-quota",
+            "300",
+            "--tasks-max",
+            "1200",
+        ])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("systemd user supervision"))
+        .stdout(contains("12.00 GiB"))
+        .stdout(contains("300%"))
+        .stdout(contains("1200"));
+}
+
+#[test]
+fn guardrail_flag_implies_supervision() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_supervised_workspace(&tmp);
+
+    pa_cmd()
+        .args(["launch", "claude", "--dry-run", "--memory-high", "1G"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .success()
+        .stdout(contains("systemd user supervision"));
+}
+
+#[test]
+fn invalid_guardrail_value_fails_before_launch() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_supervised_workspace(&tmp);
+
+    pa_cmd()
+        .args(["launch", "claude", "--dry-run", "--memory-high", "twelve"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .failure()
+        .stderr(contains("invalid memory size"));
+}
+
+#[test]
+fn resources_help_lists_safe_control_commands() {
+    pa_cmd()
+        .args(["resources", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("capabilities"))
+        .stdout(contains("status"))
+        .stdout(contains("stop"))
+        .stdout(contains("kill"));
 }
 
 #[test]
@@ -442,7 +543,7 @@ fn add_errors_on_duplicate_session_name() {
 
 #[test]
 fn add_errors_when_no_workspace_found() {
-    let tmp = assert_fs::TempDir::new().unwrap();
+    let tmp = walkup_isolated_tempdir();
     pa_cmd()
         .args(["add", "claude", "-c", "claude"])
         .current_dir(tmp.path())

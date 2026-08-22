@@ -8,6 +8,7 @@
 
 use crate::domain::{Session, SessionKind, Workspace};
 use crate::mux::{workspace_session_name, SessionInfo};
+use crate::supervision::{LogicalSessionId, MuxTarget};
 
 /// Per-row state. Drives both the visual marker in the TUI and the
 /// action Enter maps to.
@@ -22,6 +23,33 @@ pub enum SessionState {
     /// Live mpx session that doesn't correspond to any workspace
     /// definition. Enter → `attach`. DESIGN §9's "untracked" feature.
     Untracked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOwnership {
+    IdleSupported,
+    NeedsWorkspaceId,
+    InvalidWorkspaceId,
+    Owned,
+    ExistingUnverified,
+    Unmanaged,
+    Stale,
+    Unsupported,
+}
+
+impl RowOwnership {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::IdleSupported => "supervisable",
+            Self::NeedsWorkspaceId => "needs ID",
+            Self::InvalidWorkspaceId => "bad ID",
+            Self::Owned => "owned",
+            Self::ExistingUnverified => "unverified",
+            Self::Unmanaged => "unmanaged",
+            Self::Stale => "stale",
+            Self::Unsupported => "unsupported",
+        }
+    }
 }
 
 impl SessionState {
@@ -55,6 +83,14 @@ pub struct SessionRow {
     /// tracked rows, or the sanitized mpx name for untracked rows.
     pub display_name: String,
     pub state: SessionState,
+    /// Stable logical identity when the workspace has a valid UUID.
+    pub logical_id: Option<LogicalSessionId>,
+    /// Exact receipted target for owned private tmux/Zellij sessions.
+    pub mux_target: Option<MuxTarget>,
+    pub ownership: RowOwnership,
+    /// Compact and expanded resource text supplied by the TUI worker.
+    pub resource_summary: Option<String>,
+    pub resource_details: Vec<String>,
     /// The workspace's definition, when this row maps to a tracked
     /// session. `None` for untracked rows.
     pub session: Option<Session>,
@@ -123,10 +159,27 @@ pub fn build_rows(
             .file_path
             .as_ref()
             .and_then(|p| crate::state::last_launch_for_session(p, &sess.name));
+        let logical_id = workspace
+            .id
+            .as_deref()
+            .and_then(|id| LogicalSessionId::new(id, sess.name.clone()).ok());
+        let ownership = match (logical_id.is_some(), workspace.id.is_some(), state) {
+            (false, false, _) if workspace.file_path.is_some() => RowOwnership::NeedsWorkspaceId,
+            (false, true, _) => RowOwnership::InvalidWorkspaceId,
+            (false, false, _) => RowOwnership::Unsupported,
+            (true, _, SessionState::Live) => RowOwnership::ExistingUnverified,
+            (true, _, SessionState::NotStarted) => RowOwnership::IdleSupported,
+            (true, _, SessionState::Untracked) => RowOwnership::Unmanaged,
+        };
         rows.push(SessionRow {
             mpx_name,
             display_name: sess.name.clone(),
             state,
+            logical_id,
+            mux_target: None,
+            ownership,
+            resource_summary: None,
+            resource_details: Vec::new(),
             session: Some(sess.clone()),
             cwd_display: sess.cwd.display().to_string(),
             command_display: sess.command.clone(),
@@ -179,6 +232,11 @@ pub fn build_rows(
             mpx_name: info.name.clone(),
             display_name,
             state: SessionState::Untracked,
+            logical_id: None,
+            mux_target: None,
+            ownership: RowOwnership::Unmanaged,
+            resource_summary: None,
+            resource_details: Vec::new(),
             session: None,
             cwd_display: info
                 .cwd
@@ -397,6 +455,43 @@ mod tests {
         assert_eq!(SessionState::Live.label(), "live");
         assert_eq!(SessionState::NotStarted.label(), "idle");
         assert_eq!(SessionState::Untracked.label(), "untracked");
+        assert_eq!(RowOwnership::IdleSupported.label(), "supervisable");
+        assert_eq!(RowOwnership::NeedsWorkspaceId.label(), "needs ID");
+        assert_eq!(RowOwnership::InvalidWorkspaceId.label(), "bad ID");
+        assert_eq!(RowOwnership::Owned.label(), "owned");
+        assert_eq!(RowOwnership::ExistingUnverified.label(), "unverified");
+        assert_eq!(RowOwnership::Unmanaged.label(), "unmanaged");
+        assert_eq!(RowOwnership::Stale.label(), "stale");
+        assert_eq!(RowOwnership::Unsupported.label(), "unsupported");
+    }
+
+    #[test]
+    fn legacy_and_malformed_workspace_ids_are_not_generic_unsupported() {
+        let mut legacy = ws(vec![("shell", "bash")]);
+        legacy.file_path = Some(PathBuf::from("/tmp/legacy.portagenty.toml"));
+        let legacy_rows = build_rows(&legacy, &[], UntrackedScope::WorkspacePrefix);
+        assert_eq!(legacy_rows[0].ownership, RowOwnership::NeedsWorkspaceId);
+
+        legacy.id = Some("not-a-uuid".into());
+        let malformed_rows = build_rows(&legacy, &[], UntrackedScope::WorkspacePrefix);
+        assert_eq!(
+            malformed_rows[0].ownership,
+            RowOwnership::InvalidWorkspaceId
+        );
+    }
+
+    #[test]
+    fn uuid_workspace_marks_idle_and_live_rows_honestly() {
+        let mut workspace = ws(vec![("idle", "c"), ("running", "c")]);
+        workspace.id = Some("550e8400-e29b-41d4-a716-446655440000".into());
+        let rows = build_rows(
+            &workspace,
+            &live(&["running"]),
+            UntrackedScope::WorkspacePrefix,
+        );
+        assert_eq!(rows[0].ownership, RowOwnership::IdleSupported);
+        assert_eq!(rows[1].ownership, RowOwnership::ExistingUnverified);
+        assert!(rows.iter().all(|row| row.logical_id.is_some()));
     }
 
     #[test]

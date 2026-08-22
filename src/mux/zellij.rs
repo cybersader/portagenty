@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Result};
 
 use crate::domain::Session;
-use crate::mux::{AttachMode, Multiplexer, SessionInfo};
+use crate::mux::{AttachMode, CreationDisposition, Multiplexer, SessionInfo};
 
 /// zellij-backed [`Multiplexer`].
 #[derive(Debug, Clone, Default)]
@@ -36,6 +36,10 @@ pub struct ZellijAdapter {
     /// `$XDG_RUNTIME_DIR`) but keeps config-driven behavior
     /// reproducible.
     config_dir: Option<PathBuf>,
+    /// Exact runtime directory for a receipted supervised target. Normal
+    /// launches leave this unset and use the caller's environment or the
+    /// existing secure Linux fallback.
+    runtime_dir: Option<PathBuf>,
 }
 
 impl ZellijAdapter {
@@ -46,11 +50,22 @@ impl ZellijAdapter {
     pub fn with_config_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             config_dir: Some(dir.into()),
+            runtime_dir: None,
+        }
+    }
+
+    pub fn with_runtime_dir(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            config_dir: None,
+            runtime_dir: Some(dir.into()),
         }
     }
 
     fn cmd(&self) -> Command {
         let mut c = Command::new("zellij");
+        if let Some(runtime_dir) = &self.runtime_dir {
+            c.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
         if let Some(d) = &self.config_dir {
             c.arg("--config-dir").arg(d);
         }
@@ -213,7 +228,11 @@ fn escape_kdl(s: &str) -> String {
 /// When the session has env vars set, we route through `env(1)` —
 /// each `KEY=VAL` is a separate KDL string arg, which avoids shell-
 /// escape gymnastics inside the bash -c payload.
-fn render_layout(session: &Session) -> String {
+pub(crate) fn render_layout(session: &Session) -> String {
+    render_layout_with_tab_name(session, &session.name)
+}
+
+pub(crate) fn render_layout_with_tab_name(session: &Session, tab_name: &str) -> String {
     // Normalize cwd: strip trailing `.` component the walk-up loader
     // leaves behind for `cwd = "."` in TOML. Zellij accepts it but it
     // looks ugly in the status bar and is harmless to trim.
@@ -229,6 +248,7 @@ fn render_layout(session: &Session) -> String {
     };
     let cwd = escape_kdl(&cwd_path);
     let cmd = escape_kdl(&session.command);
+    let tab_name = escape_kdl(tab_name);
 
     // Stock zellij default — needed so status-bar + tab-bar plugins
     // render. Values match the out-of-the-box tab template.
@@ -242,10 +262,10 @@ fn render_layout(session: &Session) -> String {
         if is_shell_command(&session.command) {
             // Run the shell binary directly; no `-c` wrapper.
             format!(
-                "    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"{cmd}\"\n    }}\n"
+                "        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"{cmd}\"\n        }}\n"
             )
         } else {
-            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"bash\"\n        args \"-c\" \"{cmd}\"\n    }}\n")
+            format!("        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"bash\"\n            args \"-c\" \"{cmd}\"\n        }}\n")
         }
     } else {
         let mut env_args = String::new();
@@ -254,13 +274,13 @@ fn render_layout(session: &Session) -> String {
             env_args.push_str(&format!(" \"{}\"", escape_kdl(&pair)));
         }
         if is_shell_command(&session.command) {
-            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"env\"\n        args{env_args} \"{cmd}\"\n    }}\n")
+            format!("        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"env\"\n            args{env_args} \"{cmd}\"\n        }}\n")
         } else {
-            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"env\"\n        args{env_args} \"bash\" \"-c\" \"{cmd}\"\n    }}\n")
+            format!("        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"env\"\n            args{env_args} \"bash\" \"-c\" \"{cmd}\"\n        }}\n")
         }
     };
 
-    format!("layout {{\n{tab_template}{pane}}}\n")
+    format!("layout {{\n{tab_template}    tab name=\"{tab_name}\" {{\n{pane}    }}\n}}\n")
 }
 
 /// Is this command "just run a login shell"? Matches the bare shell
@@ -341,10 +361,16 @@ impl Multiplexer for ZellijAdapter {
         Ok(())
     }
 
-    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()> {
+    fn create_and_attach(
+        &self,
+        session: &Session,
+        mpx_name: &str,
+        mode: AttachMode,
+    ) -> Result<CreationDisposition> {
         let name = mpx_name;
         if self.has_session(name)? {
-            return self.attach(name, mode);
+            self.attach(name, mode)?;
+            return Ok(CreationDisposition::Existing);
         }
         if Self::is_inside_zellij() {
             bail!(
@@ -371,7 +397,7 @@ impl Multiplexer for ZellijAdapter {
             if !status.success() {
                 bail!("zellij failed to start session {name:?}");
             }
-            return Ok(());
+            return Ok(CreationDisposition::Created);
         }
 
         // Non-shell command (or env overrides): we need a layout to
@@ -397,7 +423,7 @@ impl Multiplexer for ZellijAdapter {
         if !status.success() {
             bail!("zellij failed to start session {name:?}");
         }
-        Ok(())
+        Ok(CreationDisposition::Created)
     }
 
     fn kill(&self, name: &str) -> Result<()> {
@@ -437,6 +463,16 @@ mod tests {
             args,
             vec!["--config-dir".to_string(), "/tmp/pa-zj-cfg".to_string()]
         );
+    }
+
+    #[test]
+    fn cmd_with_runtime_dir_targets_exact_session_namespace() {
+        let command = ZellijAdapter::with_runtime_dir("/tmp/pa-zellij-runtime").cmd();
+        let runtime = command
+            .get_envs()
+            .find(|(key, _)| *key == "XDG_RUNTIME_DIR")
+            .and_then(|(_, value)| value.map(PathBuf::from));
+        assert_eq!(runtime, Some(PathBuf::from("/tmp/pa-zellij-runtime")));
     }
 
     #[test]
@@ -540,6 +576,40 @@ mod tests {
         assert!(
             layout.contains("zellij:tab-bar"),
             "missing tab-bar plugin:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_names_tab_after_declared_session() {
+        let s = Session {
+            name: r#"shell\"primary"#.into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "bash".into(),
+            kind: None,
+            env: std::collections::BTreeMap::new(),
+            description: None,
+        };
+        let layout = render_layout(&s);
+        assert!(
+            layout.contains(r#"tab name="shell\\\"primary""#),
+            "missing escaped session tab name:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_can_name_tab_after_workspace_and_session() {
+        let s = Session {
+            name: "shell".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "bash".into(),
+            kind: None,
+            env: std::collections::BTreeMap::new(),
+            description: None,
+        };
+        let layout = render_layout_with_tab_name(&s, "project / shell");
+        assert!(
+            layout.contains(r#"tab name="project / shell""#),
+            "missing human-readable workspace/session tab name:\n{layout}"
         );
     }
 

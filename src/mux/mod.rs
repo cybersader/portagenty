@@ -38,6 +38,15 @@ pub enum AttachMode {
     Shared,
 }
 
+/// Whether a create-and-attach call created a new multiplexer target or
+/// attached to one that already existed. Ownership-aware launchers must not
+/// infer this distinction from a successful return value alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationDisposition {
+    Created,
+    Existing,
+}
+
 use anyhow::Result;
 
 use crate::domain::Session;
@@ -66,7 +75,12 @@ pub trait Multiplexer {
     /// Create a session from `session` and attach. `mpx_name` is the
     /// workspace-scoped name the mpx should use (e.g. "myproject-shell").
     /// `mode` applies to the attach step.
-    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()>;
+    fn create_and_attach(
+        &self,
+        session: &Session,
+        mpx_name: &str,
+        mode: AttachMode,
+    ) -> Result<CreationDisposition>;
 
     /// Kill a session by sanitized name. No-op when the session does
     /// not exist.
