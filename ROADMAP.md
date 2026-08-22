@@ -427,6 +427,67 @@ real projects:
 
 These are plausibly valuable, but we're committing to not thinking about them until v1.x is settled.
 
+### Capability-aware session resource supervision — research, not built
+
+A recurring workstation failure mode is progressive slowdown rather than a clean
+crash: one logical session may own a growing process tree, consume memory and
+swap, saturate CPU, or create I/O pressure while the root agent process still
+looks harmless. Portagenty's stable workspace ID plus declared session name is
+a useful logical address for that workload, but Portagenty currently does **not**
+attribute descendant processes, aggregate resources, report pressure, or safely
+terminate anything narrower than its existing multiplexer lifecycle permits.
+
+The portable direction is a capability-aware supervision contract, not a
+Fedora-only implementation disguised as a universal feature. The contract would
+cover stable logical identity, launch-time workload binding, normalized resource
+snapshots, supported actions, and receipts. Platform adapters would advertise
+only what the host can actually guarantee:
+
+- **Linux:** prefer a systemd user scope backed by cgroup v2, with pidfds for
+  reuse-safe process actions and cgroup CPU, memory, swap, I/O, task, event, and
+  pressure-stall information where available. Fedora is the first reference
+  profile, not the definition of the architecture. Non-systemd Linux must
+  degrade explicitly to direct cgroup v2, process-group, or observation-only
+  operation.
+- **Windows:** use a Job Object assigned during process creation, retained
+  process/job handles for identity, and Job accounting plus member sampling.
+  Windows has no workload-local PSI equivalent, so host memory notifications
+  and Job thresholds must not be presented as the same metric.
+- **macOS:** use an anchored process group and direct-child observation. This is
+  cooperative grouping, not cgroup-style containment: descendants can leave the
+  group, aggregate swap and workload pressure are not generally available, and
+  the UI must say so.
+- **WSL:** model Linux and native Windows execution as separate planes. A Linux
+  cgroup cannot authoritatively contain a Windows executable launched through
+  ordinary WSL interop; strong dual-plane supervision would require an optional
+  Windows Job Object broker. Otherwise the capability report must say that a
+  Windows escape is possible.
+
+The cross-platform baseline should remain deliberately small: identify the root
+process Portagenty launched, sample meaningful CPU and memory values, request a
+graceful stop, force-stop the root when necessary, and report exactly what was
+attempted. Strong descendant containment, aggregate swap/I/O, per-workload
+pressure, nested sub-workloads, and GPU attribution are optional capabilities,
+never assumed portable features.
+
+**Ownership boundary remains an explicit design gate.** Portagenty may own the
+session address, capability vocabulary, TUI presentation, and request/receipt
+protocol without embedding every kernel-facing mechanism. Platform code should
+be isolated behind adapters and may ultimately live in separate Rust crates or
+an optional companion project. The current single-static-binary, terminal-only,
+no-always-running-daemon constraints remain in force until deliberately reopened
+in `DESIGN.md`; this roadmap item does not silently authorize a resident service,
+GUI, listener, or new network surface. If reliable Windows handles or macOS
+anchor lifetime prove to require a resident same-user supervisor, that is a
+separate owner decision. Any graphical resource dashboard would likewise remain
+an external consumer rather than part of Portagenty's terminal-native core.
+
+Before implementation, require evidence for launch-time binding, PID reuse,
+fork/exec/reparenting behavior, graceful-to-forceful termination, capability
+truthfulness on every claimed platform, privacy-safe labels and metrics, and
+synthetic workload tests. Until those gates pass, Portagenty remains a session
+registry and multiplexer lifecycle controller—not a resource supervisor.
+
 - **Agent adapter plugin runtime.** A formal extension mechanism so third parties can add `kind:` handlers without patching the core.
 - **Remote-machine awareness.** portagenty as a multi-host tool. Currently: SSH in and run `pa` there.
 - **Scaffolding hooks.** A `pa new` subcommand that shells out to a purpose-built project scaffolder.
