@@ -9,11 +9,13 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{load, LoadOptions};
 use crate::domain::{Multiplexer as MpxEnum, Session, Workspace};
-use crate::mux::{AttachMode, Multiplexer, TmuxAdapter, ZellijAdapter};
+use crate::mux::{
+    AttachMode, ClientCompletion, ClientExit, Multiplexer, TmuxAdapter, ZellijAdapter,
+};
 use crate::supervision::model::{parse_cpu_quota, parse_memory_size, parse_tasks_max};
 use crate::supervision::{
-    BindingReceipt, CapabilityState, LogicalSessionId, MetricValue, MuxTarget, OwnershipState,
-    ResourceSnapshot, SoftLimits, SupervisionBackend,
+    BindingReceipt, CapabilityState, LimitKind, LogicalSessionId, MetricValue, MuxTarget,
+    OwnershipState, ResourceSnapshot, SoftLimits, SupervisionBackend,
 };
 
 #[derive(Debug, Parser)]
@@ -546,9 +548,17 @@ pub fn launch(
         supervision.tasks_max,
     )?;
     if supervision.enabled || !limits.is_empty() {
-        return launch_supervised_resolved(sess, ws, dry_run, mode, fresh, limits);
+        let workspace_name = ws.name.clone();
+        let session_name = sess.name.clone();
+        let result = launch_supervised_resolved(sess, ws, dry_run, mode, fresh, limits)?;
+        if dry_run {
+            return Ok(());
+        }
+        return finish_client_return(result, &workspace_name, &session_name);
     }
 
+    let workspace_name = ws.name.clone();
+    let session_name = sess.name.clone();
     let mux = build_mux(ws.multiplexer)?;
     let mpx_name = crate::mux::workspace_session_name(&ws.name, &sess.name);
 
@@ -594,9 +604,48 @@ pub fn launch(
         let _ = crate::state::record_launch(path, &sess.name);
     }
 
-    mux.create_and_attach(&sess, &mpx_name, mode)
-        .with_context(|| format!("launching session {:?}", sess.name))?;
-    Ok(())
+    let completion = mux
+        .create_and_attach(&sess, &mpx_name, mode)
+        .with_context(|| format!("launching session {:?}", sess.name))?
+        .map(|_| ());
+    finish_client_return(completion, &workspace_name, &session_name)
+}
+
+pub(crate) fn return_banner(workspace_name: &str, session_name: &str) -> String {
+    format!(
+        "pa ← returned from {:?}",
+        format!("{workspace_name} / {session_name}")
+    )
+}
+
+pub(crate) fn print_return_banner(workspace_name: &str, session_name: &str) {
+    eprintln!();
+    eprintln!("  {}", return_banner(workspace_name, session_name));
+    eprintln!();
+}
+
+pub(crate) fn client_exit_message(exit: ClientExit) -> String {
+    match (exit.code, exit.signal) {
+        (Some(code), _) => format!("multiplexer client exited abnormally with code {code}"),
+        (None, Some(signal)) => format!("multiplexer client was terminated by signal {signal}"),
+        (None, None) => "multiplexer client exited abnormally".into(),
+    }
+}
+
+pub(crate) fn finish_client_return(
+    completion: ClientCompletion<()>,
+    workspace_name: &str,
+    session_name: &str,
+) -> Result<()> {
+    print_return_banner(workspace_name, session_name);
+    match completion {
+        ClientCompletion::Returned(()) => Ok(()),
+        ClientCompletion::Abnormal(exit) => {
+            let message = client_exit_message(exit);
+            eprintln!("  pa: {message}");
+            Err(anyhow!(message))
+        }
+    }
 }
 
 fn parse_soft_limits(
@@ -611,6 +660,11 @@ fn parse_soft_limits(
     })
 }
 
+pub(crate) enum RoutineSupervisedLaunch {
+    ClientReturned(ClientCompletion<()>),
+    FallbackSafe(anyhow::Error),
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn launch_supervised_resolved(
     sess: Session,
@@ -619,7 +673,33 @@ pub(crate) fn launch_supervised_resolved(
     mode: AttachMode,
     fresh: bool,
     limits: SoftLimits,
-) -> Result<()> {
+) -> Result<ClientCompletion<()>> {
+    match launch_supervised_inner(sess, ws, dry_run, mode, fresh, limits, false)? {
+        RoutineSupervisedLaunch::ClientReturned(completion) => Ok(completion),
+        RoutineSupervisedLaunch::FallbackSafe(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_supervised_routine_resolved(
+    sess: Session,
+    ws: Workspace,
+    mode: AttachMode,
+    limits: SoftLimits,
+) -> Result<RoutineSupervisedLaunch> {
+    launch_supervised_inner(sess, ws, false, mode, false, limits, true)
+}
+
+#[cfg(target_os = "linux")]
+fn launch_supervised_inner(
+    sess: Session,
+    ws: Workspace,
+    dry_run: bool,
+    mode: AttachMode,
+    fresh: bool,
+    limits: SoftLimits,
+    allow_fallback: bool,
+) -> Result<RoutineSupervisedLaunch> {
     let workspace_id = ws.id.as_deref().ok_or_else(|| {
         anyhow!(
             "supervised launch requires a workspace UUID; re-save or reinitialize this workspace before using --supervise"
@@ -645,19 +725,60 @@ pub(crate) fn launch_supervised_resolved(
                 "  fresh:       refused if an owned supervision receipt already exists"
             )?;
         }
-        return Ok(());
+        return Ok(RoutineSupervisedLaunch::ClientReturned(
+            ClientCompletion::Returned(()),
+        ));
     }
 
-    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
-    let capabilities = backend.capabilities();
-    if capabilities.overall != CapabilityState::Supported {
-        bail!(
-            "resource supervision is unavailable: {:?}",
-            capabilities.overall
-        );
-    }
     let store = crate::supervision::ReceiptStore::standard()?;
     let existing = store.find(&logical_id)?;
+    let ordinary_target = crate::mux::workspace_session_name(&ws.name, &sess.name);
+    if existing.is_none() {
+        let ordinary_mux = build_mux(ws.multiplexer)?;
+        if ordinary_mux.has_session(&ordinary_target)? {
+            bail!(
+                "an existing unverified multiplexer session {ordinary_target:?} is already live; Portagenty will not claim it as supervised"
+            );
+        }
+    }
+
+    let backend = match crate::supervision::LinuxSystemdBackend::connect() {
+        Ok(backend) => backend,
+        Err(error) if allow_fallback && existing.is_none() => {
+            return Ok(RoutineSupervisedLaunch::FallbackSafe(error.context(
+                "connecting to Linux systemd user supervision before any workload was created",
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let capabilities = backend.capabilities();
+    let unavailable = if capabilities.overall != CapabilityState::Supported {
+        Some(anyhow!(
+            "resource supervision is unavailable: {:?}",
+            capabilities.overall
+        ))
+    } else {
+        [
+            (LimitKind::MemoryHigh, limits.memory_high_bytes.is_some()),
+            (LimitKind::CpuQuota, limits.cpu_quota_percent.is_some()),
+            (LimitKind::TasksMax, limits.tasks_max.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(kind, requested)| {
+            if !requested {
+                return None;
+            }
+            let state = capabilities.limits.get(&kind);
+            (state != Some(&CapabilityState::Supported))
+                .then(|| anyhow!("requested {kind:?} guardrail is unavailable: {state:?}"))
+        })
+    };
+    if let Some(error) = unavailable {
+        if allow_fallback && existing.is_none() {
+            return Ok(RoutineSupervisedLaunch::FallbackSafe(error));
+        }
+        return Err(error);
+    }
     if fresh && existing.is_some() {
         bail!(
             "--fresh cannot replace an owned supervised workload; use `pa resources stop {:?}` first",
@@ -665,17 +786,16 @@ pub(crate) fn launch_supervised_resolved(
         );
     }
     if let Some(receipt) = &existing {
-        if !limits.is_empty() && receipt.limits != limits {
+        if !allow_fallback && !limits.is_empty() && receipt.limits != limits {
             bail!(
                 "this supervised session already exists with different guardrails; stop it before launching with new limits"
             );
         }
     } else {
-        let ordinary_target = crate::mux::workspace_session_name(&ws.name, &sess.name);
         let ordinary_mux = build_mux(ws.multiplexer)?;
         if ordinary_mux.has_session(&ordinary_target)? {
             bail!(
-                "an existing unverified multiplexer session {ordinary_target:?} is already live; Portagenty will not claim it as supervised"
+                "an existing unverified multiplexer session {ordinary_target:?} appeared during supervised preflight; Portagenty will not claim it"
             );
         }
     }
@@ -691,12 +811,12 @@ pub(crate) fn launch_supervised_resolved(
         MpxEnum::Wezterm => bail!("supervised WezTerm sessions are not supported"),
     };
     let before = backend.snapshot(&receipt, None).ok();
-    attach_receipted_target(&receipt.mux_target, mode)
+    let completion = attach_receipted_target(&receipt.mux_target, mode)
         .with_context(|| format!("attaching to supervised session {:?}", sess.name))?;
     if let Ok(after) = backend.snapshot(&receipt, before.as_ref()) {
         print_resource_event_notice(before.as_ref(), &after);
     }
-    Ok(())
+    Ok(RoutineSupervisedLaunch::ClientReturned(completion))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -707,14 +827,113 @@ pub(crate) fn launch_supervised_resolved(
     _mode: AttachMode,
     _fresh: bool,
     _limits: SoftLimits,
-) -> Result<()> {
+) -> Result<ClientCompletion<()>> {
     bail!(
         "resource supervision is currently implemented only on Linux with systemd user services and cgroup v2"
     )
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn launch_supervised_routine_resolved(
+    _sess: Session,
+    _ws: Workspace,
+    _mode: AttachMode,
+    _limits: SoftLimits,
+) -> Result<RoutineSupervisedLaunch> {
+    Ok(RoutineSupervisedLaunch::FallbackSafe(anyhow!(
+        "resource supervision is currently implemented only on Linux with systemd user services and cgroup v2"
+    )))
+}
+
 #[cfg(target_os = "linux")]
-pub(crate) fn attach_receipted_target(target: &MuxTarget, mode: AttachMode) -> Result<()> {
+pub(crate) fn replace_stale_supervised_resolved(
+    sess: Session,
+    ws: Workspace,
+    expected: BindingReceipt,
+    mode: AttachMode,
+    limits: SoftLimits,
+) -> Result<ClientCompletion<()>> {
+    let workspace_id = ws
+        .id
+        .as_deref()
+        .ok_or_else(|| anyhow!("stale supervised replacement requires a valid workspace UUID"))?;
+    let logical_id = LogicalSessionId::new(workspace_id, sess.name.clone())?;
+    if expected.logical_id != logical_id {
+        bail!("the confirmed stale receipt does not match the selected workspace/session");
+    }
+    let store = crate::supervision::ReceiptStore::standard()?;
+    if store.find(&logical_id)?.as_ref() != Some(&expected) {
+        bail!("the ownership receipt changed after confirmation; refresh and retry");
+    }
+    let ordinary_target = crate::mux::workspace_session_name(&ws.name, &sess.name);
+    let ordinary_mux = build_mux(ws.multiplexer)?;
+    if ordinary_mux.has_session(&ordinary_target)? {
+        bail!(
+            "an ordinary multiplexer target {ordinary_target:?} is live; no stale receipt was removed"
+        );
+    }
+    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+    let capabilities = backend.capabilities();
+    if capabilities.overall != CapabilityState::Supported {
+        bail!(
+            "resource supervision is unavailable: {:?}; no stale receipt was removed",
+            capabilities.overall
+        );
+    }
+    for (kind, requested) in [
+        (LimitKind::MemoryHigh, limits.memory_high_bytes.is_some()),
+        (LimitKind::CpuQuota, limits.cpu_quota_percent.is_some()),
+        (LimitKind::TasksMax, limits.tasks_max.is_some()),
+    ] {
+        if requested && capabilities.limits.get(&kind) != Some(&CapabilityState::Supported) {
+            bail!(
+                "requested {kind:?} guardrail is unavailable: {:?}; no stale receipt was removed",
+                capabilities.limits.get(&kind)
+            );
+        }
+    }
+
+    backend.remove_stale_binding(&store, &expected)?;
+    if ordinary_mux.has_session(&ordinary_target)? {
+        bail!(
+            "an ordinary multiplexer target {ordinary_target:?} appeared after stale cleanup; refusing supervised creation"
+        );
+    }
+    if let Some(path) = &ws.file_path {
+        let _ = crate::state::record_launch(path, &sess.name);
+    }
+    let receipt = match ws.multiplexer {
+        MpxEnum::Tmux => backend.create_tmux_binding(&store, logical_id, &sess, limits)?,
+        MpxEnum::Zellij => {
+            backend.create_zellij_binding(&store, logical_id, &ws.name, &sess, limits)?
+        }
+        MpxEnum::Wezterm => bail!("supervised WezTerm sessions are not supported"),
+    };
+    let before = backend.snapshot(&receipt, None).ok();
+    let completion = attach_receipted_target(&receipt.mux_target, mode)
+        .with_context(|| format!("attaching to supervised session {:?}", sess.name))?;
+    if let Ok(after) = backend.snapshot(&receipt, before.as_ref()) {
+        print_resource_event_notice(before.as_ref(), &after);
+    }
+    Ok(completion)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn replace_stale_supervised_resolved(
+    _sess: Session,
+    _ws: Workspace,
+    _expected: BindingReceipt,
+    _mode: AttachMode,
+    _limits: SoftLimits,
+) -> Result<ClientCompletion<()>> {
+    bail!("stale supervised replacement is currently supported only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_receipted_target(
+    target: &MuxTarget,
+    mode: AttachMode,
+) -> Result<ClientCompletion<()>> {
     match target {
         MuxTarget::TmuxPrivate { socket, session } => {
             TmuxAdapter::with_socket(socket).attach(session, mode)
@@ -728,7 +947,10 @@ pub(crate) fn attach_receipted_target(target: &MuxTarget, mode: AttachMode) -> R
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn attach_receipted_target(_target: &MuxTarget, _mode: AttachMode) -> Result<()> {
+pub(crate) fn attach_receipted_target(
+    _target: &MuxTarget,
+    _mode: AttachMode,
+) -> Result<ClientCompletion<()>> {
     bail!("receipted resource targets are currently supported only on Linux")
 }
 
@@ -2317,6 +2539,37 @@ pub fn protocol_status() -> Result<()> {
     let s = crate::protocol::register::status()?;
     print!("{s}");
     Ok(())
+}
+
+#[cfg(test)]
+mod return_banner_tests {
+    use super::*;
+
+    #[test]
+    fn return_banner_uses_human_workspace_and_session_identity() {
+        assert_eq!(
+            return_banner("21 - Teaching", "shell"),
+            "pa ← returned from \"21 - Teaching / shell\""
+        );
+    }
+
+    #[test]
+    fn client_exit_message_preserves_code_and_signal() {
+        assert_eq!(
+            client_exit_message(ClientExit {
+                code: Some(7),
+                signal: None,
+            }),
+            "multiplexer client exited abnormally with code 7"
+        );
+        assert_eq!(
+            client_exit_message(ClientExit {
+                code: None,
+                signal: Some(15),
+            }),
+            "multiplexer client was terminated by signal 15"
+        );
+    }
 }
 
 #[cfg(test)]

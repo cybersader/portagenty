@@ -12,13 +12,13 @@ pub mod picker;
 pub mod resources;
 pub mod view;
 
-pub use app::{Action, App, AppOutcome, LaunchKind};
+pub use app::{Action, App, AppOutcome, LaunchKind, RowSelectionIdentity, SupervisionIntent};
 pub use view::{build_rows, SessionRow, SessionState};
 
 use anyhow::{Context, Result};
 
 use crate::config::{load, LoadOptions};
-use crate::mux::TmuxAdapter;
+use crate::mux::{ClientCompletion, TmuxAdapter};
 
 /// Entry point for the bare `pa` invocation. Loads the current
 /// workspace + live mpx sessions, runs the TUI, and — if the user
@@ -95,8 +95,13 @@ pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
     // always show the picker.
     let mut terminal = ratatui::init();
     let mut first_iteration = true;
+    let mut resume_workspace: Option<(crate::domain::Workspace, RowSelectionIdentity, String)> =
+        None;
     loop {
-        let ws = if first_iteration {
+        let resumed = resume_workspace.take();
+        let ws = if let Some((workspace, _, _)) = &resumed {
+            Some(workspace.clone())
+        } else if first_iteration {
             first_iteration = false;
             let loaded = load(&load_opts()).ok();
             // Auto-re-register: if walk-up found a workspace that
@@ -137,15 +142,38 @@ pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
             },
         };
 
-        match run_session_tui(&mut terminal, ws) {
+        let (resume_selection, resume_notice) = match resumed {
+            Some((_, selection, notice)) => (Some(selection), Some(notice)),
+            None => (None, None),
+        };
+        match run_session_tui(&mut terminal, ws, resume_selection.as_ref(), resume_notice) {
             Ok(SessionRunOutcome::Back) => continue,
             Ok(SessionRunOutcome::Quit) => {
                 ratatui::restore();
                 return Ok(());
             }
-            Ok(SessionRunOutcome::Launched(r)) => {
+            Ok(SessionRunOutcome::SetupFailed {
+                workspace,
+                selection,
+                error,
+            }) => {
+                eprintln!();
+                eprintln!("  pa: session setup failed before entering the multiplexer client.");
+                eprintln!("  {error:#}");
+                eprintln!("  Returning to the same workspace and session.");
+                eprintln!();
+                let notice = format!("setup failed: {error:#}");
+                terminal = ratatui::init();
+                resume_workspace = Some((workspace, selection, notice));
+                continue;
+            }
+            Ok(SessionRunOutcome::ClientReturned {
+                completion,
+                workspace_name,
+                session_name,
+            }) => {
                 ratatui::restore();
-                return finalize_launch(r);
+                return finalize_launch(completion, &workspace_name, &session_name);
             }
             Ok(SessionRunOutcome::OpenShell(dir)) => {
                 ratatui::restore();
@@ -247,8 +275,19 @@ enum SessionRunOutcome {
     Back,
     /// q / Ctrl+C — caller should exit cleanly.
     Quit,
-    /// User picked a session; deferred launch result for the caller.
-    Launched(Result<()>),
+    /// Launch setup failed before an attach client returned. Re-open the same
+    /// workspace and logical row instead of dropping the user at the shell.
+    SetupFailed {
+        workspace: crate::domain::Workspace,
+        selection: RowSelectionIdentity,
+        error: anyhow::Error,
+    },
+    /// A multiplexer client actually ran and returned, normally or abnormally.
+    ClientReturned {
+        completion: ClientCompletion<()>,
+        workspace_name: String,
+        session_name: String,
+    },
     /// User pressed `o` — spawn a plain shell at this directory and
     /// exit pa when the shell exits.
     OpenShell(std::path::PathBuf),
@@ -265,14 +304,52 @@ fn receipts_for_workspace(
         .collect()
 }
 
+fn declared_selection(
+    workspace: &crate::domain::Workspace,
+    session_name: &str,
+) -> RowSelectionIdentity {
+    let logical_id = workspace.id.as_deref().and_then(|workspace_id| {
+        crate::supervision::LogicalSessionId::new(workspace_id, session_name).ok()
+    });
+    RowSelectionIdentity::Declared {
+        logical_id,
+        session_name: session_name.to_string(),
+    }
+}
+
+fn classify_launch_result(
+    result: Result<ClientCompletion<()>>,
+    workspace: crate::domain::Workspace,
+    selection: RowSelectionIdentity,
+    workspace_name: String,
+    session_name: String,
+) -> SessionRunOutcome {
+    match result {
+        Ok(completion) => SessionRunOutcome::ClientReturned {
+            completion,
+            workspace_name,
+            session_name,
+        },
+        Err(error) => SessionRunOutcome::SetupFailed {
+            workspace,
+            selection,
+            error,
+        },
+    }
+}
+
 /// Runs the session-list TUI against an already-initialized terminal.
 /// Does *not* restore the terminal — caller owns init/restore so the
 /// picker can share one ratatui session with the session list.
 fn run_session_tui(
     terminal: &mut ratatui::DefaultTerminal,
     workspace: crate::domain::Workspace,
+    resume_selection: Option<&RowSelectionIdentity>,
+    resume_notice: Option<String>,
 ) -> Result<SessionRunOutcome> {
     let workspace_file = workspace.file_path.clone();
+    let workspace_name = workspace.name.clone();
+    let workspace_for_resume = workspace.clone();
     let workspace_for_supervision = workspace.clone();
     let mpx_kind = workspace.multiplexer;
     let mux: Box<dyn crate::mux::Multiplexer> = match workspace.multiplexer {
@@ -300,15 +377,25 @@ fn run_session_tui(
     };
 
     let live = mux.list_sessions().unwrap_or_default();
-    let app = App::new(workspace, mux, live);
+    let mut app = App::new(workspace, mux, live);
     #[cfg(target_os = "linux")]
-    let app = {
-        let receipts = receipts_for_workspace(
-            app.workspace_id(),
-            crate::supervision::ReceiptStore::standard()?.list()?,
-        );
-        app.with_receipts(receipts)
-    };
+    {
+        match crate::supervision::ReceiptStore::standard().and_then(|store| store.list()) {
+            Ok(all_receipts) => {
+                let receipts = receipts_for_workspace(app.workspace_id(), all_receipts);
+                app = app.with_receipts(receipts);
+            }
+            Err(error) => app.set_persistent_status(format!(
+                "ownership receipts unavailable; idle supervision is fail-closed: {error:#}"
+            )),
+        }
+    }
+    if let Some(selection) = resume_selection {
+        app.restore_selection(selection);
+    }
+    if let Some(notice) = resume_notice {
+        app.set_persistent_status(notice);
+    }
     let (outcome, mux) = app.run(terminal)?;
 
     let mode = crate::mux::AttachMode::Takeover;
@@ -323,29 +410,127 @@ fn run_session_tui(
             // pre-launch banner prints to the user's real shell.
             ratatui::restore();
             print_launch_banner(mpx_kind, &session.name);
-            SessionRunOutcome::Launched(
-                mux.create_and_attach(&session, &mpx_name, mode).map(|_| ()),
+            let session_name = session.name.clone();
+            classify_launch_result(
+                mux.create_and_attach(&session, &mpx_name, mode)
+                    .map(|completion| completion.map(|_| ())),
+                workspace_for_resume.clone(),
+                declared_selection(&workspace_for_resume, &session_name),
+                workspace_name,
+                session_name,
             )
         }
-        AppOutcome::Launch(LaunchKind::CreateSupervised { session, limits }) => {
+        AppOutcome::Launch(LaunchKind::CreateSupervised {
+            session,
+            limits,
+            intent,
+        }) => {
             ratatui::restore();
             print_launch_banner(mpx_kind, &session.name);
-            SessionRunOutcome::Launched(crate::cli::launch_supervised_resolved(
-                session,
-                workspace_for_supervision,
-                false,
-                mode,
-                false,
-                limits,
-            ))
+            let session_name = session.name.clone();
+            let result = match intent {
+                SupervisionIntent::RoutineEnter => {
+                    match crate::cli::launch_supervised_routine_resolved(
+                        session.clone(),
+                        workspace_for_supervision,
+                        mode,
+                        limits.clone(),
+                    ) {
+                        Ok(crate::cli::RoutineSupervisedLaunch::ClientReturned(completion)) => {
+                            Ok(completion)
+                        }
+                        Ok(crate::cli::RoutineSupervisedLaunch::FallbackSafe(reason)) => {
+                            print_supervision_fallback_notice(
+                                &workspace_name,
+                                &session_name,
+                                &limits,
+                                &reason,
+                            );
+                            if let Some(path) = &workspace_file {
+                                let _ = crate::state::record_launch(path, &session.name);
+                            }
+                            let mpx_name =
+                                crate::mux::workspace_session_name(&workspace_name, &session.name);
+                            mux.create_and_attach(&session, &mpx_name, mode)
+                                .map(|completion| completion.map(|_| ()))
+                                .map_err(|ordinary_error| {
+                                    anyhow::anyhow!(
+                                        "supervision preflight was unavailable ({reason:#}); ordinary fallback also failed: {ordinary_error:#}"
+                                    )
+                                })
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                SupervisionIntent::ExplicitCustom => crate::cli::launch_supervised_resolved(
+                    session,
+                    workspace_for_supervision,
+                    false,
+                    mode,
+                    false,
+                    limits,
+                ),
+                SupervisionIntent::StaleReplacement => Err(anyhow::anyhow!(
+                    "stale replacement requires an exact receipt"
+                )),
+            };
+            classify_launch_result(
+                result,
+                workspace_for_resume.clone(),
+                declared_selection(&workspace_for_resume, &session_name),
+                workspace_name,
+                session_name,
+            )
         }
-        AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
+        AppOutcome::Launch(LaunchKind::ReplaceStaleSupervised {
+            session,
+            receipt,
+            limits,
+        }) => {
+            ratatui::restore();
+            print_launch_banner(mpx_kind, &session.name);
+            let session_name = session.name.clone();
+            classify_launch_result(
+                crate::cli::replace_stale_supervised_resolved(
+                    session,
+                    workspace_for_supervision,
+                    *receipt,
+                    mode,
+                    limits,
+                ),
+                workspace_for_resume.clone(),
+                declared_selection(&workspace_for_resume, &session_name),
+                workspace_name,
+                session_name,
+            )
+        }
+        AppOutcome::Launch(LaunchKind::Attach {
+            mpx_name,
+            display_name,
+        }) => {
             if let Some(path) = &workspace_file {
-                let _ = crate::state::record_launch(path, &mpx_name);
+                let _ = crate::state::record_launch(path, &display_name);
             }
             ratatui::restore();
-            print_launch_banner(mpx_kind, &mpx_name);
-            SessionRunOutcome::Launched(mux.attach(&mpx_name, mode))
+            print_launch_banner(mpx_kind, &display_name);
+            let selection = if workspace_for_resume
+                .sessions
+                .iter()
+                .any(|session| session.name == display_name)
+            {
+                declared_selection(&workspace_for_resume, &display_name)
+            } else {
+                RowSelectionIdentity::Untracked {
+                    mpx_name: mpx_name.clone(),
+                }
+            };
+            classify_launch_result(
+                mux.attach(&mpx_name, mode),
+                workspace_for_resume.clone(),
+                selection,
+                workspace_name,
+                display_name,
+            )
         }
         AppOutcome::Launch(LaunchKind::AttachOwned {
             target,
@@ -356,21 +541,62 @@ fn run_session_tui(
             }
             ratatui::restore();
             print_launch_banner(mpx_kind, &display_name);
-            SessionRunOutcome::Launched(crate::cli::attach_receipted_target(&target, mode))
+            classify_launch_result(
+                crate::cli::attach_receipted_target(&target, mode),
+                workspace_for_resume.clone(),
+                declared_selection(&workspace_for_resume, &display_name),
+                workspace_name,
+                display_name,
+            )
         }
         AppOutcome::OpenShellAt(dir) => SessionRunOutcome::OpenShell(dir),
     })
 }
 
-/// Emit the loud post-restore banner on launch failure so the error
-/// survives the user's next shell prompt.
-fn finalize_launch(launch: Result<()>) -> Result<()> {
-    if let Err(e) = &launch {
-        eprintln!();
-        eprintln!("  pa: couldn't launch the selected session.");
-        eprintln!("  {e:#}");
-    }
-    launch
+fn supervision_fallback_notice(
+    workspace_name: &str,
+    session_name: &str,
+    limits: &crate::supervision::SoftLimits,
+    reason: &anyhow::Error,
+) -> String {
+    let memory = limits
+        .memory_high_bytes
+        .map(|bytes| format!("{:.0} GiB", bytes as f64 / 1024_f64.powi(3)))
+        .unwrap_or_else(|| "unset".into());
+    let cpu = limits
+        .cpu_quota_percent
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "unset".into());
+    let tasks = limits
+        .tasks_max
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unset".into());
+    format!(
+        "  pa: RESOURCE SUPERVISION UNAVAILABLE\n      launching {:?} ordinarily without cgroup guardrails\n      omitted guardrails: MemoryHigh {memory} · CPU {cpu} · TasksMax {tasks}\n      reason: {reason:#}",
+        format!("{workspace_name} / {session_name}")
+    )
+}
+
+fn print_supervision_fallback_notice(
+    workspace_name: &str,
+    session_name: &str,
+    limits: &crate::supervision::SoftLimits,
+    reason: &anyhow::Error,
+) {
+    eprintln!();
+    eprintln!(
+        "{}",
+        supervision_fallback_notice(workspace_name, session_name, limits, reason)
+    );
+    eprintln!();
+}
+
+fn finalize_launch(
+    completion: ClientCompletion<()>,
+    workspace_name: &str,
+    session_name: &str,
+) -> Result<()> {
+    crate::cli::finish_client_return(completion, workspace_name, session_name)
 }
 
 /// Build a synthetic empty workspace so the TUI can render
@@ -469,6 +695,57 @@ mod tests {
             },
             observed_at_unix_ms: 1,
             limits: crate::supervision::SoftLimits::default(),
+        }
+    }
+
+    #[test]
+    fn loud_fallback_notice_names_identity_and_omitted_guardrails() {
+        let notice = supervision_fallback_notice(
+            "workspace",
+            "shell",
+            &crate::supervision::SoftLimits::recommended_tui_launch(),
+            &anyhow::anyhow!("systemd unavailable"),
+        );
+        assert!(notice.contains("RESOURCE SUPERVISION UNAVAILABLE"));
+        assert!(notice.contains("workspace / shell"));
+        assert!(notice.contains("ordinarily without cgroup guardrails"));
+        assert!(notice.contains("MemoryHigh 12 GiB"));
+        assert!(notice.contains("CPU 300%"));
+        assert!(notice.contains("TasksMax 1200"));
+        assert!(notice.contains("systemd unavailable"));
+    }
+
+    #[test]
+    fn launch_setup_failure_keeps_workspace_and_selection_for_resume() {
+        let workspace = crate::domain::Workspace {
+            name: "workspace".into(),
+            id: None,
+            multiplexer: crate::domain::Multiplexer::Tmux,
+            file_path: None,
+            sessions: Vec::new(),
+            projects: Vec::new(),
+            tags: Vec::new(),
+        };
+        let selection = RowSelectionIdentity::Untracked {
+            mpx_name: "workspace-shell".into(),
+        };
+        match classify_launch_result(
+            Err(anyhow::anyhow!("client never spawned")),
+            workspace,
+            selection.clone(),
+            "workspace".into(),
+            "shell".into(),
+        ) {
+            SessionRunOutcome::SetupFailed {
+                workspace,
+                selection: actual,
+                error,
+            } => {
+                assert_eq!(workspace.name, "workspace");
+                assert_eq!(actual, selection);
+                assert!(format!("{error:#}").contains("client never spawned"));
+            }
+            _ => panic!("expected resumable setup failure"),
         }
     }
 

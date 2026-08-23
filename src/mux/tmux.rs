@@ -14,7 +14,8 @@ use std::process::{Command, Stdio};
 
 use crate::domain::Session;
 use crate::mux::{
-    sanitize_session_name, AttachMode, CreationDisposition, Multiplexer, SessionInfo,
+    sanitize_session_name, AttachMode, ClientCompletion, CreationDisposition, Multiplexer,
+    SessionInfo,
 };
 
 /// Wrap a std::io::Error that fired during a tmux invocation. We
@@ -140,7 +141,10 @@ fn ensure_cwd_exists(cwd: &Path) -> Result<()> {
 
 fn is_no_server_error(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
-    s.contains("no server running") || s.contains("no sessions") || s.contains("error connecting")
+    s.contains("no server running")
+        || s.contains("no sessions")
+        || s.contains("error connecting")
+        || s.contains("server exited unexpectedly")
 }
 
 impl Multiplexer for TmuxAdapter {
@@ -201,7 +205,7 @@ impl Multiplexer for TmuxAdapter {
         Ok(status.success())
     }
 
-    fn attach(&self, name: &str, mode: AttachMode) -> Result<()> {
+    fn attach(&self, name: &str, mode: AttachMode) -> Result<ClientCompletion<()>> {
         let mut cmd = self.cmd();
         cmd.arg("attach-session").arg("-t").arg(name);
         if mode == AttachMode::Takeover {
@@ -212,10 +216,7 @@ impl Multiplexer for TmuxAdapter {
         let status = cmd
             .status()
             .map_err(|e| friendly_io_err("spawning tmux attach-session", e))?;
-        if !status.success() {
-            bail!("tmux attach-session failed for {name:?}");
-        }
-        Ok(())
+        Ok(ClientCompletion::from_status(status, ()))
     }
 
     fn create_and_attach(
@@ -223,12 +224,11 @@ impl Multiplexer for TmuxAdapter {
         session: &Session,
         mpx_name: &str,
         mode: AttachMode,
-    ) -> Result<CreationDisposition> {
+    ) -> Result<ClientCompletion<CreationDisposition>> {
         // Use the caller-provided mpx_name (workspace-scoped) instead
         // of computing from session.name (which would miss the prefix).
         let disposition = self.create_detached_with_name(session, mpx_name)?;
-        self.attach(mpx_name, mode)?;
-        Ok(disposition)
+        Ok(self.attach(mpx_name, mode)?.map(|()| disposition))
     }
 
     fn kill(&self, name: &str) -> Result<()> {
@@ -306,6 +306,7 @@ mod tests {
         assert!(is_no_server_error("no server running on /tmp/sock"));
         assert!(is_no_server_error("error connecting to /tmp/sock"));
         assert!(is_no_server_error("no sessions"));
+        assert!(is_no_server_error("server exited unexpectedly"));
         assert!(!is_no_server_error("some unrelated tmux error"));
     }
 

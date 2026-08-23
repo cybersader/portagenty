@@ -108,15 +108,15 @@ mouse poorly, so don't rely on it there).
 | `k` / `↑` / `Alt+K` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` / `l` / `→` | Attach-or-create the highlighted session (takeover) |
+| `Enter` / `l` / `→` | Attach the highlighted live/owned session, supervision-first start an eligible idle UUID-backed row with `12G` / `300%` / `1200`, or ordinarily create a legacy/invalid/unsupported idle row |
 | `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `PgDn` / `PgUp` | 10-row jumps |
 | `a` | Add a new session (2-stage name → command modal) |
 | `e` | Edit session (name / cwd / command / kind / env) |
 | `d` | Delete session from workspace TOML (with confirm) |
-| `S` | Supervise the selected declared session. Idle UUID-backed rows open editable recommended limits (`12G`, `300%`, `1200`); legacy rows can confirm-add a UUID, and live shared rows can confirm a terminate-then-fresh-relaunch flow. Existing process trees are never migrated or claimed. |
+| `S` | Advanced/custom supervision. Edit the same recommended limits, confirm-add a UUID to a legacy row, customize a stale replacement, or confirm a terminate-then-fresh-relaunch flow for a live shared row. Existing process trees are never migrated or claimed; `S` never silently falls back ordinary. |
 | `r` | Refresh resources for the selected owned workload |
-| `x` | Owned row: confirm graceful + non-force stop. Unmanaged row: confirm mpx-native kill. Stale ownership: refuse. |
+| `x` | Owned row: confirm graceful + non-force stop. Stale row: confirm receipt-only cleanup after proving the exact unit and target are absent (no signal is sent). Unmanaged row: confirm mpx-native kill. |
 | `X` | Separately confirm whole-cgroup SIGKILL for an owned-and-verified workload |
 | `z` | Toggle expand-on-select (see below) |
 | `m` | Switch workspace multiplexer (tmux ↔ zellij) |
@@ -125,6 +125,17 @@ mouse poorly, so don't rely on it there).
 | `?` | Help overlay |
 | `Esc` / `q` / `Ctrl+Q` | Back to workspace picker |
 | `Ctrl+C` | Exit `pa` directly |
+
+A receipt-backed row is non-attachable until exact reconciliation finishes. If
+its label becomes `stale`, Portagenty never chases the old opaque target, and `X`
+remains unavailable because there is no verified cgroup to force-kill. On an idle
+declared row, Enter confirms one exact flow: prove the stored receipt is unchanged,
+prove both its systemd invocation and private multiplexer target absent, remove only
+that receipt without sending a signal, then create and attach a fresh supervised
+binding. Prior nonempty limits are reused; an empty prior policy receives the TUI
+recommendations. `S` exposes those values for editing, while `x` remains the
+cleanup-only option. If a real ordinary target is live beside the stale receipt,
+Enter attaches it normally instead of cleaning, stopping, or claiming it.
 
 ### Expand-on-select
 
@@ -202,17 +213,26 @@ pa launch claude --supervise
 pa launch claude --memory-high 12G --cpu-quota 300 --tasks-max 1200
 ```
 
-Guardrail flags imply supervision. Supervised launch requires a valid workspace
-UUID and a supported Linux systemd-user/cgroup-v2 environment. In the TUI, `S`
-can confirm-add a UUID to a writable legacy workspace before opening launch-local
-recommendations of `12G`, `300%`, and `1200`; edit them or use `Ctrl+U` to clear a
-field back to unset. On a live shared declared row, `S` confirms termination of
-the exact multiplexer target and waits for it to become idle before offering the
-fresh supervised launch. It does not migrate or retroactively claim the running
-process tree. Supervised Zellij layouts keep the stock tab/status bars and name
-the visible tab after both the workspace and declared session, while the private
-backend target remains opaque. CLI resource limits remain unset unless their flags
-are supplied. There are no workspace-TOML enforcement fields.
+Guardrail flags imply supervision. Explicit CLI supervision requires a valid
+workspace UUID and a supported Linux systemd-user/cgroup-v2 environment; it never
+falls back ordinary, and CLI resource limits remain unset unless their flags are
+supplied. In the TUI, eligible idle UUID-backed Enter uses launch-local
+recommendations of `12G`, `300%`, and `1200`. Only after receipt ownership is known
+and non-creating preflight proves supervision capability/runtime unavailable does
+Portagenty print a loud notice and launch ordinarily; receipt ambiguity and every
+failure after creation may have begun remain fail-closed.
+
+`S` edits the recommendations or uses `Ctrl+U` to clear a field, can confirm-add a
+UUID to a writable legacy workspace, and can separately confirm termination of one
+exact live shared target before a fresh supervised launch. It does not migrate or
+retroactively claim the running process tree. Supervised Zellij layouts keep the
+stock tab/status bars and name the visible tab after both the workspace and declared
+session, while the private backend target remains opaque. A setup failure before the
+client starts reopens the same workspace/session row. Once a client actually runs and
+returns—normally, nonzero, by signal, or after forced disconnection—Portagenty prints
+`pa ← returned from "my-workspace / shell"` and then any abnormal diagnostics. No
+hand-back line is printed for dry runs or pre-client setup failures. There are no
+workspace-TOML enforcement fields.
 
 ## `pa resources`
 

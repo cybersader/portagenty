@@ -8,7 +8,7 @@
 //! require pulling in a prompt-library dep.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -69,7 +69,8 @@ pub fn run_wizard(forced: bool) -> Result<OnboardOutcome> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
-    run_wizard_with(&mut stdin, &mut stdout, forced)
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    run_wizard_with_cwd(&mut stdin, &mut stdout, forced, &cwd)
 }
 
 /// Testable variant: takes `Read` + `Write` handles instead of
@@ -77,7 +78,17 @@ pub fn run_wizard(forced: bool) -> Result<OnboardOutcome> {
 pub fn run_wizard_with<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
+    forced: bool,
+) -> Result<OnboardOutcome> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    run_wizard_with_cwd(input, output, forced, &cwd)
+}
+
+fn run_wizard_with_cwd<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
     _forced: bool,
+    cwd: &Path,
 ) -> Result<OnboardOutcome> {
     writeln!(output)?;
     writeln!(output, "  Welcome to portagenty.")?;
@@ -100,14 +111,17 @@ pub fn run_wizard_with<R: BufRead, W: Write>(
     let choice = read_line(input)?;
     let choice = choice.trim();
     match choice {
-        "" | "1" => scaffold_flow(input, output),
+        "" | "1" => scaffold_flow(input, output, cwd),
         "2" => show_docs(output),
         _ => skip(output),
     }
 }
 
-fn scaffold_flow<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<OnboardOutcome> {
-    let cwd = std::env::current_dir().context("reading current directory")?;
+fn scaffold_flow<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    cwd: &Path,
+) -> Result<OnboardOutcome> {
     let default_name = cwd
         .file_name()
         .and_then(|f| f.to_str())
@@ -234,7 +248,7 @@ fn scaffold_flow<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<
     // / future TUI flow share one scaffolder. The wizard owns the
     // user prompts; the scaffolder owns the file write + global
     // registry update.
-    let outcome = crate::scaffold::create_at(&cwd, &name, mpx_enum, with_claude, false)?;
+    let outcome = crate::scaffold::create_at(cwd, &name, mpx_enum, with_claude, false)?;
     let path = outcome.path().to_path_buf();
     match outcome {
         crate::scaffold::ScaffoldOutcome::AlreadyExisted(_) => {
@@ -334,22 +348,25 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Run the wizard against a sandboxed state dir.
-    ///
-    /// The wizard writes an `.onboarded` sentinel into `$XDG_STATE_HOME`.
-    /// These tests used to inherit whatever that happened to be, which made
-    /// them fail when a sibling test had left `HOME=/home/test` (unwritable)
-    /// and, worse, write into the developer's real state dir otherwise.
-    /// Pinning it to a tempdir makes the tests hermetic in both directions.
+    /// Run the wizard with every filesystem root, including cwd, inside one
+    /// temporary sandbox. Choice 1 is therefore safe to exercise: it cannot
+    /// create a workspace in the checkout or register one in the real config.
     fn drive(input: &str) -> (OnboardOutcome, String) {
-        let state = assert_fs::TempDir::new().unwrap();
-        let _env = crate::test_env::EnvSandbox::new().set("XDG_STATE_HOME", state.path());
+        let root = assert_fs::TempDir::new().unwrap();
+        let config = root.path().join("config");
+        let state = root.path().join("state");
+        let home = root.path().join("home");
+        let cwd = root.path().join("workspace");
+        for dir in [&config, &state, &home, &cwd] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let _env = crate::test_env::EnvSandbox::new()
+            .set("XDG_CONFIG_HOME", &config)
+            .set("XDG_STATE_HOME", &state)
+            .set("HOME", &home);
         let mut r = Cursor::new(input.as_bytes().to_vec());
         let mut w: Vec<u8> = Vec::new();
-        // For test purposes we always treat as forced=false (it's
-        // unused in the testable variant but still an arg for API
-        // symmetry).
-        let outcome = run_wizard_with(&mut r, &mut w, false).expect("wizard");
+        let outcome = run_wizard_with_cwd(&mut r, &mut w, false, &cwd).expect("wizard");
         (outcome, String::from_utf8(w).unwrap())
     }
 
@@ -371,13 +388,46 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_defaults_to_scaffold_but_bails_if_cwd_has_no_filename() {
-        // We can't actually exercise the scaffold-write path in a
-        // unit test without hijacking cwd, so just confirm the
-        // prompt text gets rendered for choice 1.
-        let (_, out) = drive("\n\n\nn\n");
-        assert!(out.contains("Workspace name"));
-        assert!(out.contains("Multiplexer"));
+    fn default_scaffold_stays_inside_explicit_cwd_and_xdg_roots() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let config = root.path().join("config");
+        let state = root.path().join("state");
+        let home = root.path().join("home");
+        let cwd = root.path().join("sandbox-project");
+        let untouched = root.path().join("outside-config.toml");
+        for dir in [&config, &state, &home, &cwd] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&untouched, "sentinel = true\n").unwrap();
+        let _env = crate::test_env::EnvSandbox::new()
+            .set("XDG_CONFIG_HOME", &config)
+            .set("XDG_STATE_HOME", &state)
+            .set("HOME", &home);
+        let mut input = Cursor::new(b"\n\n\nn\nn\n".to_vec());
+        let mut output = Vec::new();
+
+        let outcome = run_wizard_with_cwd(&mut input, &mut output, false, &cwd).unwrap();
+        let created = match outcome {
+            OnboardOutcome::Scaffolded { path } => path,
+            other => panic!("expected scaffolded outcome, got {other:?}"),
+        };
+        assert_eq!(
+            created,
+            cwd.join("sandbox-project.portagenty.toml"),
+            "wizard must scaffold only at its explicit cwd"
+        );
+        assert!(created.is_file());
+        let registry = std::fs::read_to_string(config.join("portagenty/config.toml")).unwrap();
+        assert!(registry.contains(created.to_string_lossy().as_ref()));
+        assert_eq!(
+            registry.matches("[[workspace]]").count(),
+            1,
+            "sandbox registry should contain only the workspace just created: {registry}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(untouched).unwrap(),
+            "sentinel = true\n"
+        );
     }
 
     #[test]

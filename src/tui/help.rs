@@ -150,7 +150,10 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("G / End", "last"));
             lines.push(row("Ctrl+D / Ctrl+U", "half-page down / up"));
             lines.push(row("PgDn / PgUp", "10-row jumps"));
-            lines.push(row("l / → / Enter", "attach (or create-and-attach)"));
+            lines.push(row(
+                "l / → / Enter",
+                "attach; supervised start when idle + eligible",
+            ));
             lines.push(row("Esc / q / Ctrl+Q", "back to picker (home screen)"));
             lines.push(row("Ctrl+C", "exit pa"));
             lines.push(row("?", "toggle this help"));
@@ -168,7 +171,7 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(Line::raw(""));
             lines.push(row(
                 "supervisable",
-                "idle UUID-backed session; S can contain it",
+                "idle UUID-backed; Enter uses recommended guardrails",
             ));
             lines.push(row(
                 "needs ID",
@@ -187,7 +190,10 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
                 "unmanaged",
                 "live target outside Portagenty containment",
             ));
-            lines.push(row("stale", "receipt mismatch; resource controls refuse"));
+            lines.push(row(
+                "stale",
+                "idle Enter replaces exactly; x clears only after proof",
+            ));
             lines.push(row("unsupported", "platform or workspace cannot supervise"));
             lines.push(Line::raw(""));
             lines.push(heading(" Kind glyphs"));
@@ -219,12 +225,12 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("d", "delete the session (edits TOML)"));
             lines.push(row(
                 "x",
-                "owned: graceful + non-force stop; unmanaged: mpx kill",
+                "owned: graceful stop; stale: clear dead receipt; unmanaged: mpx kill",
             ));
             lines.push(row("X", "force-kill an owned verified cgroup (confirms)"));
             lines.push(row(
                 "S",
-                "supervise idle; confirm-upgrade/restart legacy or live rows",
+                "custom limits; confirm-upgrade/restart legacy or live rows",
             ));
             lines.push(row("r", "refresh selected owned session resources"));
             lines.push(row(
@@ -313,11 +319,15 @@ mod tests {
     #[test]
     fn session_help_documents_supervision_resources_and_safe_controls() {
         let text = help_text(HelpContext::SessionList);
+        assert!(text.contains("attach; supervised start when idle + eligible"));
         assert!(text
-            .contains("S             supervise idle; confirm-upgrade/restart legacy or live rows"));
+            .contains("S             custom limits; confirm-upgrade/restart legacy or live rows"));
         assert!(text.contains("needs ID      legacy workspace; S can confirm-add a stable UUID"));
         assert!(text.contains("r             refresh selected owned session resources"));
-        assert!(text.contains("x             owned: graceful + non-force stop"));
+        assert!(text.contains("x             owned: graceful stop; stale: clear dead receipt"));
+        assert!(
+            text.contains("stale         idle Enter replaces exactly; x clears only after proof")
+        );
         assert!(text.contains("X             force-kill an owned verified cgroup"));
     }
 

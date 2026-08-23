@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Result};
 
 use crate::domain::Session;
-use crate::mux::{AttachMode, CreationDisposition, Multiplexer, SessionInfo};
+use crate::mux::{AttachMode, ClientCompletion, CreationDisposition, Multiplexer, SessionInfo};
 
 /// zellij-backed [`Multiplexer`].
 #[derive(Debug, Clone, Default)]
@@ -86,9 +86,9 @@ impl ZellijAdapter {
     /// zellij's session registration is briefly async after the CLI
     /// returns — the child process can exit successfully before
     /// `list-sessions` reports the new name. This method polls
-    /// `has_session` up to one second so the return is
+    /// `has_session` for up to five seconds so the return is
     /// synchronous-to-visibility, which keeps tests deterministic on
-    /// slow CI runners without every test having to retry.
+    /// slow or concurrently exercised CI runners without every test having to retry.
     pub fn create_background(&self, name: &str) -> Result<()> {
         let status = self
             .cmd()
@@ -103,16 +103,16 @@ impl ZellijAdapter {
             bail!("zellij attach --create-background failed for session {name:?}");
         }
 
-        // Wait for the session to appear in list-sessions. 40 × 50ms
-        // = 2s max; most runs return on the first check. CI runners
-        // occasionally need more than 1s.
-        for _ in 0..40 {
+        // Wait for the session to appear in list-sessions. 100 × 50ms
+        // = 5s max; most runs return on the first check. Concurrent
+        // Zellij e2e tests can make shared registry propagation slower.
+        for _ in 0..100 {
             if self.has_session(name)? {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        bail!("zellij session {name:?} was created but did not appear in list within 2s")
+        bail!("zellij session {name:?} was created but did not appear in list within 5s")
     }
 
     /// Best-effort "are other clients attached to this session?"
@@ -335,7 +335,7 @@ impl Multiplexer for ZellijAdapter {
         Ok(sessions.iter().any(|s| s.name == name))
     }
 
-    fn attach(&self, name: &str, mode: AttachMode) -> Result<()> {
+    fn attach(&self, name: &str, mode: AttachMode) -> Result<ClientCompletion<()>> {
         if Self::is_inside_zellij() {
             bail!(
                 "already inside a zellij session; detach first (Ctrl+Q by default) before attaching to {name:?}"
@@ -355,10 +355,7 @@ impl Multiplexer for ZellijAdapter {
             .arg(name)
             .status()
             .map_err(|e| friendly_io_err("spawning zellij attach", e))?;
-        if !status.success() {
-            bail!("zellij attach failed for session {name:?}");
-        }
-        Ok(())
+        Ok(ClientCompletion::from_status(status, ()))
     }
 
     fn create_and_attach(
@@ -366,11 +363,12 @@ impl Multiplexer for ZellijAdapter {
         session: &Session,
         mpx_name: &str,
         mode: AttachMode,
-    ) -> Result<CreationDisposition> {
+    ) -> Result<ClientCompletion<CreationDisposition>> {
         let name = mpx_name;
         if self.has_session(name)? {
-            self.attach(name, mode)?;
-            return Ok(CreationDisposition::Existing);
+            return Ok(self
+                .attach(name, mode)?
+                .map(|()| CreationDisposition::Existing));
         }
         if Self::is_inside_zellij() {
             bail!(
@@ -394,10 +392,10 @@ impl Multiplexer for ZellijAdapter {
                 .arg("--create")
                 .status()
                 .map_err(|e| friendly_io_err("spawning zellij attach --create", e))?;
-            if !status.success() {
-                bail!("zellij failed to start session {name:?}");
-            }
-            return Ok(CreationDisposition::Created);
+            return Ok(ClientCompletion::from_status(
+                status,
+                CreationDisposition::Created,
+            ));
         }
 
         // Non-shell command (or env overrides): we need a layout to
@@ -420,10 +418,10 @@ impl Multiplexer for ZellijAdapter {
             .arg(&layout)
             .status()
             .map_err(|e| friendly_io_err("spawning zellij with layout", e))?;
-        if !status.success() {
-            bail!("zellij failed to start session {name:?}");
-        }
-        Ok(CreationDisposition::Created)
+        Ok(ClientCompletion::from_status(
+            status,
+            CreationDisposition::Created,
+        ))
     }
 
     fn kill(&self, name: &str) -> Result<()> {

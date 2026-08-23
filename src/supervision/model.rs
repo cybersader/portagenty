@@ -172,6 +172,17 @@ pub struct SoftLimits {
 }
 
 impl SoftLimits {
+    /// Recommended guardrails for one-click TUI launches. This is deliberately
+    /// not `Default`: scriptable CLI launches remain explicit and unset unless
+    /// the caller supplies supervision flags.
+    pub fn recommended_tui_launch() -> Self {
+        Self {
+            memory_high_bytes: Some(12 * 1024 * 1024 * 1024),
+            cpu_quota_percent: Some(300.0),
+            tasks_max: Some(1200),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.memory_high_bytes.is_none()
             && self.cpu_quota_percent.is_none()
@@ -511,6 +522,19 @@ mod tests {
         assert_eq!(parse_memory_size("512MiB").unwrap(), 512 * 1024_u64.pow(2));
         assert!(parse_memory_size("0").is_err());
         assert!(parse_memory_size("12watts").is_err());
+    }
+
+    #[test]
+    fn recommended_tui_limits_do_not_change_empty_default() {
+        assert!(SoftLimits::default().is_empty());
+        assert_eq!(
+            SoftLimits::recommended_tui_launch(),
+            SoftLimits {
+                memory_high_bytes: Some(12 * 1024_u64.pow(3)),
+                cpu_quota_percent: Some(300.0),
+                tasks_max: Some(1200),
+            }
+        );
     }
 
     #[test]

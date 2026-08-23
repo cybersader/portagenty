@@ -557,6 +557,45 @@ impl LinuxSystemdBackend {
         result.context("creating supervised Zellij binding")
     }
 
+    /// Remove one exact stale receipt without signalling any process. The
+    /// receipt store stays exclusively locked while both runtime identities
+    /// are revalidated, preventing a concurrent launch from being mistaken for
+    /// the dead generation the user confirmed.
+    pub fn remove_stale_binding(
+        &self,
+        store: &ReceiptStore,
+        expected: &BindingReceipt,
+    ) -> Result<()> {
+        self.remove_stale_binding_with_probe(store, expected, mux_target_exists)
+    }
+
+    fn remove_stale_binding_with_probe(
+        &self,
+        store: &ReceiptStore,
+        expected: &BindingReceipt,
+        target_exists: impl Fn(&MuxTarget) -> Result<bool>,
+    ) -> Result<()> {
+        store.update_locked(|file| {
+            let index = file
+                .bindings
+                .iter()
+                .position(|receipt| receipt.logical_id == expected.logical_id)
+                .ok_or_else(|| anyhow!("the stale receipt is no longer present"))?;
+            let current = &file.bindings[index];
+            if current != expected {
+                bail!("the ownership receipt changed after confirmation; refresh and retry");
+            }
+            if self.identity_if_present(current)?.is_some() {
+                bail!("the exact systemd invocation is still present; no receipt was removed");
+            }
+            if target_exists(&current.mux_target)? {
+                bail!("the exact multiplexer target is still present; no receipt was removed");
+            }
+            file.bindings.remove(index);
+            Ok(())
+        })
+    }
+
     fn require_limit_capabilities(&self, limits: &SoftLimits) -> Result<()> {
         if limits.is_empty() {
             return Ok(());
@@ -1240,6 +1279,42 @@ mod tests {
         }
     }
 
+    fn stale_receipt() -> BindingReceipt {
+        BindingReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            logical_id: LogicalSessionId::new(
+                "550e8400-e29b-41d4-a716-446655440000",
+                "shell",
+            )
+            .unwrap(),
+            backend: BackendKind::SystemdUserService,
+            unit_name: "portagenty-w550e8400e29b41d4a716446655440000-g00112233445566778899aabbccddeeff.service".into(),
+            invocation_id: "00112233445566778899aabbccddeeff".into(),
+            control_group: "/user.slice/user-1000.slice/user@1000.service/app.slice/portagenty-test.service".into(),
+            mux_target: MuxTarget::TmuxPrivate {
+                socket: PathBuf::from("/run/user/1000/portagenty/test/tmux.sock"),
+                session: "opaque-target".into(),
+            },
+            observed_at_unix_ms: 1,
+            limits: SoftLimits::default(),
+        }
+    }
+
+    fn fake_backend(unit: Option<SystemdUnitIdentity>) -> LinuxSystemdBackend {
+        LinuxSystemdBackend::with_api(
+            Arc::new(FakeSystemd {
+                manager: ManagerInfo {
+                    version: "259".into(),
+                    control_group: "/user.slice/user-1000.slice/user@1000.service".into(),
+                },
+                unit: Mutex::new(unit),
+                stops: Mutex::new(Vec::new()),
+                kills: Mutex::new(Vec::new()),
+            }),
+            PathBuf::from("/sys/fs/cgroup"),
+        )
+    }
+
     #[test]
     fn service_properties_include_soft_limits_and_safe_stop_policy() {
         let spec = TransientServiceSpec {
@@ -1391,5 +1466,87 @@ mod tests {
             backend.reconcile(&receipt).unwrap(),
             OwnershipState::StaleBinding(_)
         ));
+    }
+
+    #[test]
+    fn stale_cleanup_removes_only_the_exact_dead_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+        let receipt = stale_receipt();
+        store.upsert(receipt.clone()).unwrap();
+
+        fake_backend(None)
+            .remove_stale_binding_with_probe(&store, &receipt, |_| Ok(false))
+            .unwrap();
+
+        assert!(store.find(&receipt.logical_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_cleanup_refuses_a_replaced_receipt_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+        let expected = stale_receipt();
+        let mut replacement = expected.clone();
+        replacement.invocation_id = "ffeeddccbbaa99887766554433221100".into();
+        replacement.unit_name = "portagenty-w550e8400e29b41d4a716446655440000-gffeeddccbbaa99887766554433221100.service".into();
+        store.upsert(replacement.clone()).unwrap();
+
+        let error = fake_backend(None)
+            .remove_stale_binding_with_probe(&store, &expected, |_| Ok(false))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed after confirmation"));
+        assert_eq!(store.find(&expected.logical_id).unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn stale_cleanup_refuses_when_exact_invocation_is_present() {
+        let receipt = stale_receipt();
+        let temp = tempfile::tempdir().unwrap();
+        let cgroup_root = temp.path().join("cgroup");
+        let cgroup_path = cgroup_root.join(receipt.control_group.trim_start_matches('/'));
+        fs::create_dir_all(&cgroup_path).unwrap();
+        let api = Arc::new(FakeSystemd {
+            manager: ManagerInfo {
+                version: "259".into(),
+                control_group: "/user.slice/user-1000.slice/user@1000.service".into(),
+            },
+            unit: Mutex::new(Some(SystemdUnitIdentity {
+                unit_name: receipt.unit_name.clone(),
+                invocation_id: decode_hex(&receipt.invocation_id).unwrap(),
+                control_group: receipt.control_group.clone(),
+                active_state: "active".into(),
+                sub_state: "running".into(),
+                transient: true,
+            })),
+            stops: Mutex::new(Vec::new()),
+            kills: Mutex::new(Vec::new()),
+        });
+        let backend = LinuxSystemdBackend::with_api(api, cgroup_root);
+        let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+        store.upsert(receipt.clone()).unwrap();
+
+        let error = backend
+            .remove_stale_binding_with_probe(&store, &receipt, |_| Ok(false))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("still present"));
+        assert!(store.find(&receipt.logical_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn stale_cleanup_refuses_when_exact_mux_target_is_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+        let receipt = stale_receipt();
+        store.upsert(receipt.clone()).unwrap();
+
+        let error = fake_backend(None)
+            .remove_stale_binding_with_probe(&store, &receipt, |_| Ok(true))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("multiplexer target is still present"));
+        assert!(store.find(&receipt.logical_id).unwrap().is_some());
     }
 }

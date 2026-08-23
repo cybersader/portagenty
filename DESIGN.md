@@ -207,10 +207,14 @@ clear "use tmux or zellij" message.
 
 "Entering" a workspace is cheap. It does not start any processes. It loads the session definitions, checks the multiplexer for live sessions matching those names, and draws the TUI.
 
-When the user selects a session and hits Enter:
+When the user selects a session and hits Enter, ownership and live state determine the path:
 
-1. If the mpx already has a session with that sanitized name → attach to it. (Covers both "resume something I left running" and "adopt an untracked session.")
-2. If not → create it with the session's `cwd` + `command`, then attach.
+1. An owned-and-verified row attaches to the exact private target in its receipt.
+2. A live ordinary or untracked target attaches in place; Enter never kills, migrates, or retroactively claims it.
+3. An idle UUID-backed `supervisable` row uses supervision-first creation with the TUI recommendations (`12G` Memory High, `300%` CPU, `1200` tasks).
+4. An idle legacy/no-ID, malformed-ID, or genuinely unsupported row retains ordinary `create_and_attach`; malformed identity remains ineligible for supervision.
+5. An idle stale declared row can confirm exact signal-free stale-receipt removal plus a fresh supervised relaunch. A stale receipt beside a real live ordinary target follows rule 2 instead.
+6. A receipt still awaiting exact reconciliation is non-attachable until it becomes owned or stale.
 
 This is imperative, on-demand. A workspace with 20 sessions defined never costs you 20 processes worth of startup. It costs you one process when you open one session.
 
@@ -218,7 +222,9 @@ This is imperative, on-demand. A workspace with 20 sessions defined never costs 
 
 ### Experimental Linux resource supervision
 
-Normal Enter and ordinary `pa launch` keep the attach-or-create behavior above. Supervision is an explicit alternative (`S` in the session TUI or `pa launch <session> --supervise`) and requires a workspace UUID. For a writable legacy workspace with no ID, the TUI distinguishes `needs ID` from genuine platform failure and can confirm-add a UUID before launch; malformed IDs still fail closed. It is currently implemented only where a systemd user manager and unified cgroup v2 provide the required guarantees; other platforms report unsupported capability states rather than silently weakening containment.
+TUI Enter is supervision-first only for idle UUID-backed rows; ordinary `pa launch` remains ordinary unless `--supervise` or a guardrail flag is supplied. `S` is the advanced/custom path: it edits launch-local limits, can confirm-add a UUID to a writable legacy workspace, and can separately confirm termination of one exact live ordinary target before fresh supervised relaunch. Malformed IDs still fail closed for supervision. The backend is currently implemented only where a systemd user manager and unified cgroup v2 provide the required guarantees; other platforms report unsupported capability states rather than silently weakening containment.
+
+The launch lifecycle has three typed boundaries: non-creating preflight, creation that may have begun, and a multiplexer client that actually ran and returned. Routine Enter may fall back loudly to ordinary creation only when preflight has already proved the receipt store readable, no binding requires preservation, no ordinary target exists, and supervision capability/runtime is unavailable. Receipt ambiguity, identity/target races, explicit `S`, stale replacement, CLI supervision, and every error after backend creation is invoked remain fail-closed. A pre-client setup failure reopens the same workspace and logical row; a client that returns normally, nonzero, by signal, or after forced disconnection prints the human `workspace / session` identity before abnormal diagnostics.
 
 A supervised launch creates a transient **systemd user service**, not a scope and not a Portagenty daemon. The service uses `Type=exec`, `ExitType=cgroup`, `KillMode=control-group`, `SendSIGKILL=no`, `Restart=no`, `OOMPolicy=continue`, explicit accounting, and an exact working directory/environment/argv. The existing systemd user manager owns the workload lifetime after `pa` exits. Portagenty opens no listener and retains no resident process.
 
@@ -228,9 +234,9 @@ Ownership is proof-based:
 2. A fresh launch gets an opaque unit and private tmux/Zellij target.
 3. The machine-local receipt records unit name, `InvocationID`, `ControlGroup`, target, and guardrails atomically while holding the receipt lock.
 4. Every snapshot or systemd action resolves the invocation again and requires exact unit-name, invocation-ID, control-group, canonical cgroup path, user-manager subtree, and target agreement.
-5. Missing or mismatched evidence becomes stale/ambiguous and controls fail closed. Existing shared sessions are `existing-unverified`; they are never retroactively claimed. Pressing `S` may explicitly terminate only the exact ordinary multiplexer target and then offer a fresh supervised launch after idle revalidation, but it never migrates or assigns ownership to the old process tree.
+5. Missing or mismatched evidence becomes stale/ambiguous and controls fail closed. Existing shared sessions are `existing-unverified`; they are never retroactively claimed. Idle stale Enter can replace only the exact confirmed dead receipt after locked revalidation proves both its invocation and private target absent; cleanup sends no signal, and fresh creation begins only afterward. Pressing `S` may explicitly terminate only the exact ordinary multiplexer target and then offer a fresh supervised launch after idle revalidation, but it never migrates or assigns ownership to the old process tree.
 
-Optional soft guardrails are `MemoryHigh`, `CPUQuotaPerSecUSec`, and `TasksMax`. The interactive `S` modal prefills launch-local recommended values (`12G`, `300%`, and `1200`) that remain editable or clearable; CLI flags stay unset unless explicitly supplied. These controls reclaim/throttle or reject new tasks; they are not hard memory/swap caps or persisted workspace policy. `OOMPolicy=continue` allows a child OOM kill to be observed without automatically destroying the remaining session. Hard caps remain deferred until synthetic destructive testing is explicitly approved.
+Optional soft guardrails are `MemoryHigh`, `CPUQuotaPerSecUSec`, and `TasksMax`. Routine eligible Enter uses launch-local recommendations (`12G`, `300%`, and `1200`); the interactive `S` modal exposes the same typed values for editing or clearing. CLI flags stay unset unless explicitly supplied. These controls reclaim/throttle or reject new tasks; they are not hard memory/swap caps or persisted workspace policy. `OOMPolicy=continue` allows a child OOM kill to be observed without automatically destroying the remaining session. Hard caps remain deferred until synthetic destructive testing is explicitly approved.
 
 Resource snapshots read the verified cgroup: cumulative CPU plus sampled rate, charged memory current/peak/events, swap current/peak/events, tasks current/peak/events, aggregate I/O plus sampled rates, CPU/memory/I/O PSI, and cgroup populated/frozen state. `memory.current` is cgroup-charged memory rather than root-process RSS; `pids.current` counts tasks/threads; CPU rate may exceed 100% on multicore systems. CLI/TUI notices surface deltas such as `memory.events high/oom/oom_kill`, `pids.events max`, and CPU quota throttling. Snapshots are ephemeral—there is no history database, log monitor, or unattended telemetry collector.
 

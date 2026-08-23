@@ -45,8 +45,9 @@ Explicitly **not** in v1:
 3. **Untracked session adoption.** The TUI merges `mux.list_sessions`
    with workspace definitions and surfaces three row states — Live,
    NotStarted, Untracked — each with a distinct color marker.
-   Enter routes to `attach` for Live/Untracked and `create_and_attach`
-   for NotStarted.
+   Enter routes to exact owned attach for verified receipts, ordinary `attach`
+   for Live/Untracked, supervision-first creation for eligible idle UUID-backed
+   rows, and ordinary `create_and_attach` for legacy/invalid/unsupported idle rows.
 6. **State/activity decorations.** Delivered alongside untracked
    adoption: ● (green) live, ○ (dim) idle, ? (yellow) untracked,
    plus a `[label]` tag on each row.
@@ -425,21 +426,30 @@ real projects:
 
 ## Experimental Linux resource supervision — implemented and live-validated
 
-The first capability-aware supervision milestone is implemented behind explicit
-opt-in launch paths. On supported Linux hosts, Portagenty creates fresh tmux or
-Zellij workloads as transient systemd **user services** backed by cgroup v2. It
-uses stable logical identity (`workspace UUID + declared session name`), opaque
-private multiplexer targets, atomic machine-local ownership receipts, and exact
-`InvocationID`/`ControlGroup` revalidation before observation or control.
+The first capability-aware supervision milestone is implemented with a split
+TUI/CLI default: eligible idle UUID-backed TUI rows use supervision-first Enter,
+while CLI supervision remains explicit. On supported Linux hosts, Portagenty
+creates fresh tmux or Zellij workloads as transient systemd **user services**
+backed by cgroup v2. It uses stable logical identity (`workspace UUID + declared
+session name`), opaque private multiplexer targets, atomic machine-local ownership
+receipts, and exact `InvocationID`/`ControlGroup` revalidation before observation
+or control.
 
 The MVP includes:
 
 - `pa launch <session> --supervise`, plus optional `--memory-high`,
   `--cpu-quota`, and `--tasks-max` soft guardrails;
 - `pa resources capabilities|status|stop|kill --force`;
-- TUI ownership labels, explicit `S` supervised launch, bounded two-second
-  sampling, `r` refresh, resource details, event warnings, capability-aware
-  `x` stop, and separately confirmed `X` force-kill;
+- TUI ownership labels; supervision-first Enter with `12G` / `300%` / `1200`
+  recommendations for eligible idle rows; `S` for custom limits, legacy upgrade,
+  and explicit restart; bounded two-second sampling; `r` refresh; resource
+  details/event warnings; capability-aware `x` stop; and separately confirmed
+  `X` force-kill;
+- loud ordinary fallback only from proven-safe non-creating capability preflight,
+  with every ownership ambiguity and post-creation failure remaining fail-closed;
+- exact signal-free stale cleanup-and-relaunch, same-row retry after pre-client
+  setup failure, and human `workspace / session` identity after normal or abnormal
+  multiplexer-client return;
 - CPU, memory, swap, tasks, I/O, PSI, event counters, and cgroup state from the
   verified workload cgroup;
 - dedicated private tmux servers and exact-runtime PTY-backed Zellij startup;
@@ -448,10 +458,11 @@ The MVP includes:
   targets and never bulk-force-kills.
 
 This does **not** add a Portagenty daemon, listener, GUI, history database, log
-monitor, restart manager, or unattended telemetry service. Normal launches remain
-unsupervised. Existing live multiplexer sessions remain unverified and are never
-retroactively claimed. `MemoryHigh`, CPU quota, and `TasksMax` are preventive
-soft controls; hard memory/swap caps remain deferred.
+monitor, restart manager, or unattended telemetry service. Ordinary CLI launches
+and legacy/invalid/unsupported idle TUI rows remain unsupervised; eligible idle
+UUID-backed TUI rows are supervision-first. Existing live multiplexer sessions
+remain unverified and are never retroactively claimed. `MemoryHigh`, CPU quota,
+and `TasksMax` are preventive soft controls; hard memory/swap caps remain deferred.
 
 The backend, store, parser, CLI, and TUI state machines have bounded fake/unit
 coverage. Ignored, explicitly invoked Linux integration tests also prove fresh

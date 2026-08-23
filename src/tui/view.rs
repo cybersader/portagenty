@@ -15,7 +15,8 @@ use crate::supervision::{LogicalSessionId, MuxTarget};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     /// Workspace-defined session not currently running in the mpx.
-    /// Enter → `create_and_attach`.
+    /// Enter routes by ownership: supervised creation when eligible,
+    /// otherwise ordinary `create_and_attach`.
     NotStarted,
     /// Workspace-defined session that already has a live mpx session
     /// under the sanitized name. Enter → `attach`.
