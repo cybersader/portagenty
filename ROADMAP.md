@@ -41,7 +41,10 @@ Explicitly **not** in v1:
 1. **zellij adapter.** List/has/kill via imperative CLI; create +
    attach via generated KDL layout files. Inside-zellij detection
    returns a clear "detach first" error instead of the opaque
-   nesting failure. 7 e2e tests against real zellij on Linux CI.
+   nesting failure. On Linux, child-only recovery of a missing
+   `XDG_RUNTIME_DIR` keeps local and Tailscale SSH clients on the
+   same secure `/run/user/<uid>` session registry. 7 e2e tests against
+   real zellij on Linux CI, including a run with the variable unset.
 3. **Untracked session adoption.** The TUI merges `mux.list_sessions`
    with workspace definitions and surfaces three row states — Live,
    NotStarted, Untracked — each with a distinct color marker.
@@ -106,11 +109,12 @@ real projects:
   run flow: pick workspace name, multiplexer (with install-detection
   badges), Claude-Code starter session. Auto-registers the new
   workspace in the global index.
-- **Workspace picker "home screen"** in the TUI. When `pa` runs
-  outside any walk-up tree, a ratatui picker lists registered
-  workspaces + a "live sessions on this machine" sentinel. Android-
-  back navigation: Esc from session TUI always returns to the
-  picker; q / Ctrl+C exits.
+- **Workspace picker "home screen"** in the TUI. Bare `pa` always opens
+  a ratatui picker listing registered workspaces, their live-session
+  counts, and a "live sessions on this machine" sentinel. `pa <path>`
+  remains the explicit direct-workspace fast path. Android-back
+  navigation: Esc from session TUI always returns to the picker; q /
+  Ctrl+C exits.
 - **Workspace recency** across the picker (sort + "X ago" column)
   and session list (LAST column on Live rows at ≥80 cols). Reads
   from the state store written since v1.
@@ -211,10 +215,10 @@ real projects:
   drops least-important entries first at narrow widths, then drops
   labels for keys-only mode. Mobile (<30 col) always sees `?` and
   `q` plus their labels.
-- **Auto-re-register on walk-up.** When walk-up finds a workspace
-  file that isn't in the global registry (e.g. the user moved the
-  folder), it's silently re-registered so the picker sees it next
-  time. Makes folder moves transparent without manual config fixes.
+- **Auto-re-register on walk-up.** Before bare `pa` renders the picker,
+  a reachable workspace missing from the global registry (for example,
+  after a folder move) is silently re-registered. The picker reflects
+  the corrected path immediately without changing the home-screen flow.
 - **Stable workspace `id` field.** Every new workspace TOML gets an
   auto-generated UUIDv4 `id` field. Optional — old files without
   one keep working. The ID is committed, survives git clone and

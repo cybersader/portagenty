@@ -46,6 +46,10 @@ export default defineConfig({
           autogenerate: { directory: "getting-started" },
         },
         {
+          label: "Features",
+          slug: "features",
+        },
+        {
           label: "Concepts",
           autogenerate: { directory: "concepts" },
         },

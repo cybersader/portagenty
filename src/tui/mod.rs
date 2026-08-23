@@ -20,13 +20,26 @@ use anyhow::{Context, Result};
 use crate::config::{load, LoadOptions};
 use crate::mux::{ClientCompletion, TmuxAdapter};
 
-/// Entry point for the bare `pa` invocation. Loads the current
-/// workspace + live mpx sessions, runs the TUI, and — if the user
-/// picked a row — restores the terminal and hands off to the mpx.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialScreen {
+    Picker,
+    Workspace,
+}
+
+fn initial_screen(explicit_path: bool) -> InitialScreen {
+    if explicit_path {
+        InitialScreen::Workspace
+    } else {
+        InitialScreen::Picker
+    }
+}
+
+/// Entry point for the interactive TUI. Bare `pa` opens the global workspace
+/// picker — the home screen — while `pa PATH` jumps directly into the workspace
+/// resolved from that explicit path.
 ///
-/// `explicit_path` — when Some, opens the workspace at that path
-/// directly, bypassing walk-up. Accepts either a `*.portagenty.toml`
-/// file or a directory (walks up from the directory if it's a dir).
+/// `explicit_path` accepts either a `*.portagenty.toml` file or a directory
+/// (walks up from the directory if it's a dir).
 pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
     // See DESIGN.md §12 for the full entry-point contract. Key
     // invariant: the workspace picker is the *home screen*. Esc from
@@ -89,10 +102,9 @@ pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
         ));
     }
 
-    // Main loop: session TUI ↔ picker, sharing one ratatui session.
-    // On the first iteration, if walk-up finds a workspace, show its
-    // session TUI directly. On subsequent iterations (after Esc),
-    // always show the picker.
+    // Main loop: picker ↔ session TUI, sharing one ratatui session. Bare `pa`
+    // starts at the picker; only an explicit `pa PATH` enters a workspace
+    // directly. After Esc, every path returns to the picker.
     let mut terminal = ratatui::init();
     let mut first_iteration = true;
     let mut resume_workspace: Option<(crate::domain::Workspace, RowSelectionIdentity, String)> =
@@ -104,23 +116,22 @@ pub fn run(explicit_path: Option<&std::path::Path>) -> Result<()> {
         } else if first_iteration {
             first_iteration = false;
             let loaded = load(&load_opts()).ok();
-            // Auto-re-register: if walk-up found a workspace that
-            // isn't in the global registry (e.g. the user moved the
-            // folder), register it so the picker sees it next time.
-            // After registering, reconcile against prior registrations
-            // of the same `id` — a different-path match means the
-            // folder moved, and we record the old location in the
-            // workspace TOML's `previous_paths` so external tools
-            // (portaconv) can bridge to pre-move conversation state.
+            // Auto-re-register the workspace reachable from the launch path even
+            // when bare `pa` opens the picker. This preserves moved-workspace
+            // reconciliation without making the walk-up workspace the home
+            // screen.
             if let Some(ref w) = loaded {
                 if let Some(ref path) = w.file_path {
                     let _ = crate::config::register_global_workspace(path);
                     let _ = crate::config::reconcile_previous_paths_on_reregister(path);
                 }
             }
-            loaded
+            match initial_screen(explicit_opts.is_some()) {
+                InitialScreen::Picker => None,
+                InitialScreen::Workspace => loaded,
+            }
         } else {
-            None // Back was pressed — always show picker from here on
+            None
         };
 
         let ws = match ws {
@@ -363,10 +374,9 @@ fn run_session_tui(
                 ratatui::restore();
                 anyhow::bail!(
                     "refusing to open the TUI: you're already inside zellij session {cur:?}.\n\
-                     zellij can't attach to another session from within a client. Options:\n\
-                       - Detach first (Ctrl+Q by default), then run `pa` again.\n\
-                       - Or launch into the existing session directly: `zellij attach <name>`.\n\
-                     Current live zellij sessions: run `zellij list-sessions -n -s` to see them."
+                     zellij can't attach to another session from within a client.\n\
+                     Detach first (Ctrl+O then d by default), then run `pa` again.\n\
+                     The global picker will show your existing live sessions."
                 );
             }
             Box::new(crate::mux::ZellijAdapter::new())
@@ -677,6 +687,16 @@ fn print_launch_banner(mpx: crate::domain::Multiplexer, session: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_pa_starts_at_global_picker() {
+        assert_eq!(initial_screen(false), InitialScreen::Picker);
+    }
+
+    #[test]
+    fn explicit_path_starts_in_resolved_workspace() {
+        assert_eq!(initial_screen(true), InitialScreen::Workspace);
+    }
 
     #[cfg(target_os = "linux")]
     fn receipt(workspace_id: &str, session_name: &str) -> crate::supervision::BindingReceipt {

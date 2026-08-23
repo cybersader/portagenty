@@ -187,6 +187,7 @@ v1 shipped the tmux adapter as the reference baseline. v1.x added zellij. WezTer
 
 - Zellij's model is different: layouts (KDL) define tabs + panes declaratively. Opening a layout spins everything up at once — fights our "lazy" default.
 - v1.x adapter runs imperative where possible (`zellij attach`, `zellij action new-tab`, `zellij action new-pane`). For workspaces where the user wants "all at once," `pa export` produces a KDL layout they can open normally.
+- On Linux, every Zellij child uses the caller's `XDG_RUNTIME_DIR` when present. If an SSH path omits it, the adapter recovers the secure systemd directory at `/run/user/<effective-uid>` (real directory, matching owner, mode `0700`) for that child only. This prevents local and Tailscale SSH launches from splitting into separate Zellij socket registries without mutating `pa`'s process environment.
 - Works better with OpenCode than tmux does, per the agentic-workflow README.
 - Supervised creation starts a fresh opaque session under an exact validated runtime namespace, using a short-lived PTY and private generated layout. Existing Zellij sessions are never retroactively claimed.
 
@@ -303,7 +304,7 @@ This bridges the gap between "what portagenty thinks is going on" and "what's ac
 
 ## 10. Termux and small-screen TUI constraints
 
-A primary access path for this tool is **Termux on Android → SSH → desktop → zellij → `pa`**. Portagenty never runs *on* Termux; it renders *through* it. But Termux imposes real constraints on what the TUI can assume:
+A primary access path for this tool is **Termux on Android → SSH → desktop → `pa` → zellij/tmux**. Portagenty never runs *on* Termux; it renders *through* it and attaches to the desktop's persistent multiplexer sessions. But Termux imposes real constraints on what the TUI can assume:
 
 **Keyboard reality**: Termux has no physical Ctrl/Alt/Meta. The on-screen Extra Keys row provides Ctrl/Esc/Tab/arrows as taps (each is a second tap on top of any letter). Volume-Down often maps to Ctrl, Volume-Up to Esc, but not everyone configures it. Flow control (Ctrl+S / Ctrl+Q) freezes the terminal if not disabled.
 
@@ -422,37 +423,35 @@ in the code should derive from this table, not second-guess it.
 
 ### Decision order
 
-When the user runs bare `pa` (no subcommand, no `-w`):
+When the user runs bare `pa` (no subcommand, no path):
 
-1. **Try walk-up discovery from `$PWD`.** If a `*.portagenty.toml`
-   (with non-empty prefix) exists in the current directory or any
-   ancestor, load it and open the session-list TUI for that workspace.
-   This is the fast path: in-tree invocation should feel instant and
-   local.
-2. **Walk-up fails + non-interactive shell (pipe, script, CI).** Emit
-   the discovery error and exit non-zero. Never prompt. Scripted
+1. **Try walk-up discovery from `$PWD` for registry maintenance.** If a
+   `*.portagenty.toml` exists in the current directory or an ancestor,
+   auto-register/reconcile it so moved or newly reached workspaces appear
+   in the global list. Walk-up does not bypass the home screen.
+2. **If discovery fails in a non-interactive shell (pipe, script, CI),**
+   emit the discovery error and exit non-zero. Never prompt. Scripted
    callers must get deterministic behavior.
-3. **Walk-up fails + interactive + first-time user** (no
-   `.onboarded` sentinel in `$XDG_STATE_HOME/portagenty/`). Run the
-   onboarding wizard (`src/onboarding/`). On scaffold, retry the load
-   and continue into the session-list TUI. On "skip" or "show docs",
-   exit cleanly.
-4. **Walk-up fails + interactive + returning user.** Open the
-   workspace picker TUI (`src/tui/picker.rs`). Lists every
-   `[[workspace]]` registered in `$XDG_CONFIG_HOME/portagenty/config.toml`,
-   filtering entries whose files no longer exist. Always includes a
-   trailing **"live sessions on this machine"** option for the
-   no-workspace case. On pick: load the chosen workspace inside the
-   same ratatui session (no flicker) and continue into the
-   session-list TUI.
-5. **Walk-up fails + interactive + returning user + no registered
-   workspaces.** Picker shows only the "live sessions" option, which
-   resolves to a synthetic empty workspace populated from
-   `mux.list_sessions()`.
+3. **If discovery fails for an interactive first-time user** (no
+   `.onboarded` sentinel in `$XDG_STATE_HOME/portagenty/`), run the
+   onboarding wizard (`src/onboarding/`). On scaffold, register the new
+   workspace and continue to the picker. On "skip" or "show docs", exit
+   cleanly.
+4. **Open the workspace picker TUI (`src/tui/picker.rs`).** This is the
+   home screen for every bare invocation. It lists every `[[workspace]]`
+   registered in `$XDG_CONFIG_HOME/portagenty/config.toml`, filters entries
+   whose files no longer exist, shows live-session counts, and always
+   includes a trailing **"live sessions on this machine"** option. On
+   pick, load the workspace inside the same ratatui session (no flicker)
+   and continue into the session-list TUI.
+5. **If no workspaces are registered,** the picker shows only the live-
+   sessions option, which resolves to a synthetic empty workspace populated
+   from `mux.list_sessions()`.
 
-The crucial consequence: **`pa` is callable from anywhere**. There is
-no "right" directory to be in. Walk-up is an optimization, not a
-requirement.
+`pa PATH` is the explicit fast path: it opens the workspace resolved from
+that file or directory directly. The crucial consequence is that **bare
+`pa` is callable from anywhere and always shows the same home screen**;
+location helps maintain the registry but does not silently choose the UI.
 
 ### Workspace registry — invariants
 
@@ -461,10 +460,10 @@ requirement.
   via `config::register_global_workspace`. Idempotent: re-runs and
   duplicate paths are no-ops. Preserves the rest of the config via
   `toml_edit`.
-- **Auto-re-registered on walk-up.** If walk-up finds a workspace
-  file whose path isn't already in the registry, it's silently
-  appended so the picker sees it next time. This handles folder
-  moves transparently.
+- **Auto-re-registered on walk-up.** If bare `pa` can reach a workspace
+  file whose path isn't already in the registry, it is silently appended
+  before the picker renders. This handles folder moves transparently while
+  keeping the picker as the home screen.
 - **Never edited silently outside scaffold + walk-up paths.** `pa`
   `launch` and other subcommands never mutate the registry.
 - **Stale-tolerant.** `config::list_registered_workspaces` filters
@@ -510,10 +509,9 @@ one back-stack and `Esc` means the same thing everywhere:
 
 Entry-flow-specific wrinkles:
 
-- Walk-up-entered users still see the picker once they press Esc.
-  This is a feature: the picker doubles as a "jump to another
-  registered workspace" affordance without needing to exit `pa` and
-  cd somewhere else first.
+- `pa PATH` enters that workspace directly, but Esc still returns to the
+  picker. Bare `pa` starts at the picker and therefore needs no entry-path
+  special case.
 - If the picker's own registry is empty (no workspaces registered,
   no pinned mpx with live sessions) the picker still renders with
   the "live sessions on this machine" option as the only row, so

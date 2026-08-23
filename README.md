@@ -129,7 +129,7 @@ pa                        # open the TUI
 
 A setup failure before the multiplexer client starts reopens the same workspace and logical session row instead of dropping back to the picker or shell. Once a client actually runs and returns—normally, nonzero, by signal, or because the user was forced out—Portagenty prints the human `workspace / session` identity before any abnormal-exit diagnostics.
 
-**Still roadmapped**: Tags/Groups views, `pa up` eager-launch, datetime column, jump-back-to-pa from inside a session, non-Linux supervision adapters, hard memory/swap caps, and any external graphical resource dashboard. See [ROADMAP.md](./ROADMAP.md).
+**Still roadmapped**: Custom ordered groups, `pa up` eager-launch, datetime column, jump-back-to-pa from inside a session, non-Linux supervision adapters, hard memory/swap caps, and any external graphical resource dashboard. See [ROADMAP.md](./ROADMAP.md).
 
 ## What it is
 

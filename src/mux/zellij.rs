@@ -10,8 +10,8 @@
 //! - **No per-session cwd exposed.** `list_sessions` returns names
 //!   only; `SessionInfo::cwd` is always `None` for zellij.
 //! - **No CLI detach action.** `detach_current` returns an error
-//!   directing the user to the multiplexer's keybind (Ctrl+Q by
-//!   default). Parity with tmux's `detach-client` is fundamentally
+//!   directing the user to the multiplexer's detach keybind (Ctrl+O then d
+//!   by default). Parity with tmux's `detach-client` is fundamentally
 //!   not available here.
 //! - **Sessions with a command** are spawned via a generated KDL
 //!   layout file (see `write_layout_file`); zellij's `attach
@@ -20,6 +20,8 @@
 
 use std::fs;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -63,6 +65,7 @@ impl ZellijAdapter {
 
     fn cmd(&self) -> Command {
         let mut c = Command::new("zellij");
+        configure_runtime_environment(&mut c);
         if let Some(runtime_dir) = &self.runtime_dir {
             c.env("XDG_RUNTIME_DIR", runtime_dir);
         }
@@ -173,6 +176,46 @@ impl ZellijAdapter {
             .status();
         Ok(())
     }
+}
+
+/// Point Zellij at the standard systemd user runtime directory when a login
+/// path (notably Tailscale SSH) omitted `XDG_RUNTIME_DIR`. The override is
+/// child-only: PortAgenty's own environment and unrelated session commands are
+/// left untouched.
+fn configure_runtime_environment(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    configure_runtime_environment_from(
+        command,
+        Path::new("/run/user"),
+        rustix::process::geteuid().as_raw(),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn configure_runtime_environment_from(command: &mut Command, root: &Path, uid: u32) {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        if let Some(runtime_dir) = secure_systemd_runtime_dir(root, uid) {
+            command.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
+    }
+}
+
+/// Return `<root>/<uid>` only when it is the secure runtime directory systemd
+/// normally creates for that user. Refusing symlinks, foreign ownership, and
+/// permissive modes avoids redirecting Zellij's control socket to an untrusted
+/// location.
+#[cfg(target_os = "linux")]
+fn secure_systemd_runtime_dir(root: &Path, uid: u32) -> Option<PathBuf> {
+    let candidate = root.join(uid.to_string());
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return None;
+    }
+    Some(candidate)
 }
 
 fn friendly_io_err(context: &str, err: io::Error) -> anyhow::Error {
@@ -338,7 +381,7 @@ impl Multiplexer for ZellijAdapter {
     fn attach(&self, name: &str, mode: AttachMode) -> Result<ClientCompletion<()>> {
         if Self::is_inside_zellij() {
             bail!(
-                "already inside a zellij session; detach first (Ctrl+Q by default) before attaching to {name:?}"
+                "already inside a zellij session; detach first (Ctrl+O then d by default) before attaching to {name:?}"
             );
         }
         // zellij has no CLI-level "detach other clients" flag. On
@@ -372,7 +415,7 @@ impl Multiplexer for ZellijAdapter {
         }
         if Self::is_inside_zellij() {
             bail!(
-                "already inside a zellij session; detach first (Ctrl+Q by default) before launching session {name:?}"
+                "already inside a zellij session; detach first (Ctrl+O then d by default) before launching session {name:?}"
             );
         }
         ensure_cwd_exists(&session.cwd)?;
@@ -432,7 +475,7 @@ impl Multiplexer for ZellijAdapter {
     }
 
     fn detach_current(&self) -> Result<()> {
-        bail!("zellij has no CLI detach action; use the multiplexer's keybind (Ctrl+Q by default)");
+        bail!("zellij has no CLI detach action; use the multiplexer's detach keybind (Ctrl+O then d by default)");
     }
 }
 
@@ -440,6 +483,11 @@ impl Multiplexer for ZellijAdapter {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[cfg(target_os = "linux")]
+    use crate::test_env::EnvSandbox;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
     fn cmd_without_config_dir_has_no_flag() {
@@ -471,6 +519,110 @@ mod tests {
             .find(|(key, _)| *key == "XDG_RUNTIME_DIR")
             .and_then(|(_, value)| value.map(PathBuf::from));
         assert_eq!(runtime, Some(PathBuf::from("/tmp/pa-zellij-runtime")));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_override(command: &Command) -> Option<PathBuf> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "XDG_RUNTIME_DIR")
+            .and_then(|(_, value)| value.map(PathBuf::from))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn secure_runtime_fixture(mode: u32) -> (tempfile::TempDir, u32, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let candidate = root.path().join(uid.to_string());
+        fs::create_dir(&candidate).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(mode)).unwrap();
+        (root, uid, candidate)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_runtime_env_injects_secure_systemd_directory_child_only() {
+        let _env = EnvSandbox::new().unset("XDG_RUNTIME_DIR");
+        let (root, uid, candidate) = secure_runtime_fixture(0o700);
+        let mut command = Command::new("zellij");
+
+        configure_runtime_environment_from(&mut command, root.path(), uid);
+
+        assert_eq!(runtime_override(&command), Some(candidate));
+        assert!(
+            std::env::var_os("XDG_RUNTIME_DIR").is_none(),
+            "command construction must not mutate PortAgenty's environment"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_runtime_env_is_preserved_without_child_override() {
+        let _env = EnvSandbox::new().set("XDG_RUNTIME_DIR", "/caller/runtime");
+        let (root, uid, _) = secure_runtime_fixture(0o700);
+        let mut command = Command::new("zellij");
+
+        configure_runtime_environment_from(&mut command, root.path(), uid);
+
+        assert_eq!(runtime_override(&command), None);
+        assert_eq!(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            Some(std::ffi::OsStr::new("/caller/runtime"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_directory_validation_rejects_unsafe_candidates() {
+        let uid = rustix::process::geteuid().as_raw();
+
+        let missing_root = tempfile::tempdir().unwrap();
+        assert_eq!(secure_systemd_runtime_dir(missing_root.path(), uid), None);
+
+        let file_root = tempfile::tempdir().unwrap();
+        fs::write(file_root.path().join(uid.to_string()), b"not a directory").unwrap();
+        assert_eq!(secure_systemd_runtime_dir(file_root.path(), uid), None);
+
+        let link_root = tempfile::tempdir().unwrap();
+        let link_target = tempfile::tempdir().unwrap();
+        symlink(link_target.path(), link_root.path().join(uid.to_string())).unwrap();
+        assert_eq!(secure_systemd_runtime_dir(link_root.path(), uid), None);
+
+        let (permissive_root, _, _) = secure_runtime_fixture(0o755);
+        assert_eq!(
+            secure_systemd_runtime_dir(permissive_root.path(), uid),
+            None
+        );
+
+        let foreign_uid = uid.wrapping_add(1);
+        let foreign_root = tempfile::tempdir().unwrap();
+        let foreign_candidate = foreign_root.path().join(foreign_uid.to_string());
+        fs::create_dir(&foreign_candidate).unwrap();
+        fs::set_permissions(&foreign_candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            secure_systemd_runtime_dir(foreign_root.path(), foreign_uid),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_dir_and_runtime_override_compose_on_one_command() {
+        let _env = EnvSandbox::new().unset("XDG_RUNTIME_DIR");
+        let (root, uid, candidate) = secure_runtime_fixture(0o700);
+        let adapter = ZellijAdapter::with_config_dir("/tmp/pa-zj-cfg");
+        let mut command = Command::new("zellij");
+        configure_runtime_environment_from(&mut command, root.path(), uid);
+        if let Some(dir) = &adapter.config_dir {
+            command.arg("--config-dir").arg(dir);
+        }
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["--config-dir", "/tmp/pa-zj-cfg"]);
+        assert_eq!(runtime_override(&command), Some(candidate));
     }
 
     #[test]

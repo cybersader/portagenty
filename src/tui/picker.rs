@@ -1493,21 +1493,29 @@ fn perform_scaffold_at(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
     Ok(outcome.path().to_path_buf())
 }
 
-/// Probe the multiplexers once and return a map of workspace path
-/// → number of live sessions that correspond to its declared
-/// sessions. "Live" means an mpx session exists under the
-/// workspace-scoped name (matches what the session-list TUI shows
-/// with the green ● marker, minus Idle and Untracked).
+/// Probe the multiplexers and supervision receipts once, then return a map of
+/// workspace path → number of declared sessions that are actually live.
+/// Ordinary sessions count when the workspace-scoped mpx target exists;
+/// supervised sessions count only after exact receipt reconciliation proves the
+/// private target and systemd invocation are still owned.
 ///
-/// Errors are swallowed as 0 — a workspace whose TOML is broken or
-/// whose mpx is unreachable just gets a live count of 0.
+/// Errors are swallowed as 0 for the affected source — a broken workspace,
+/// unreachable mpx, unreadable receipt store, or unavailable supervision backend
+/// must not make an idle/stale session look live.
 fn compute_live_counts(workspaces: &[PathBuf]) -> std::collections::HashMap<PathBuf, usize> {
     use std::collections::{HashMap, HashSet};
     let mut counts: HashMap<PathBuf, usize> = HashMap::new();
 
-    // Resolve each workspace (name, mpx, session names).
-    let mut resolved: Vec<(PathBuf, String, crate::domain::Multiplexer, Vec<String>)> =
-        Vec::with_capacity(workspaces.len());
+    struct ResolvedWorkspace {
+        path: PathBuf,
+        id: Option<String>,
+        name: String,
+        mpx: crate::domain::Multiplexer,
+        session_names: Vec<String>,
+    }
+
+    // Resolve each workspace (stable ID, name, mpx, session names).
+    let mut resolved: Vec<ResolvedWorkspace> = Vec::with_capacity(workspaces.len());
     for p in workspaces {
         let Ok(ws) = crate::config::load(&crate::config::LoadOptions {
             workspace_path: Some(p.clone()),
@@ -1516,15 +1524,21 @@ fn compute_live_counts(workspaces: &[PathBuf]) -> std::collections::HashMap<Path
             counts.insert(p.clone(), 0);
             continue;
         };
-        let names: Vec<String> = ws.sessions.iter().map(|s| s.name.clone()).collect();
-        resolved.push((p.clone(), ws.name, ws.multiplexer, names));
+        let session_names = ws.sessions.iter().map(|s| s.name.clone()).collect();
+        resolved.push(ResolvedWorkspace {
+            path: p.clone(),
+            id: ws.id,
+            name: ws.name,
+            mpx: ws.multiplexer,
+            session_names,
+        });
     }
 
     // Probe each distinct mpx at most once — spawning tmux / zellij
     // is ~100ms, so collapsing across workspaces is worth it.
     let mut live_by_mpx: HashMap<crate::domain::Multiplexer, HashSet<String>> = HashMap::new();
     let unique_mpxs: HashSet<crate::domain::Multiplexer> =
-        resolved.iter().map(|(_, _, m, _)| *m).collect();
+        resolved.iter().map(|workspace| workspace.mpx).collect();
     for mpx in unique_mpxs {
         let mux: Option<Box<dyn crate::mux::Multiplexer>> = match mpx {
             crate::domain::Multiplexer::Tmux => Some(Box::new(crate::mux::TmuxAdapter::new())),
@@ -1538,19 +1552,83 @@ fn compute_live_counts(workspaces: &[PathBuf]) -> std::collections::HashMap<Path
         }
     }
 
-    // Count per workspace.
-    for (path, ws_name, mpx, session_names) in &resolved {
-        let Some(live) = live_by_mpx.get(mpx) else {
-            counts.insert(path.clone(), 0);
-            continue;
-        };
-        let n = session_names
-            .iter()
-            .filter(|sn| live.contains(&crate::mux::workspace_session_name(ws_name, sn)))
-            .count();
-        counts.insert(path.clone(), n);
+    let workspace_ids: HashSet<String> = resolved
+        .iter()
+        .filter_map(|workspace| workspace.id.clone())
+        .collect();
+    let owned_supervised = owned_supervised_sessions(&workspace_ids);
+    let empty_live = HashSet::new();
+
+    // Count the union of ordinary live targets and exactly owned private targets.
+    for workspace in &resolved {
+        let live = live_by_mpx.get(&workspace.mpx).unwrap_or(&empty_live);
+        let n = declared_live_count(
+            workspace.id.as_deref(),
+            &workspace.name,
+            &workspace.session_names,
+            live,
+            &owned_supervised,
+        );
+        counts.insert(workspace.path.clone(), n);
     }
     counts
+}
+
+fn declared_live_count(
+    workspace_id: Option<&str>,
+    workspace_name: &str,
+    session_names: &[String],
+    ordinary_live: &std::collections::HashSet<String>,
+    owned_supervised: &std::collections::HashSet<crate::supervision::LogicalSessionId>,
+) -> usize {
+    session_names
+        .iter()
+        .filter(|session_name| {
+            let ordinary = ordinary_live.contains(&crate::mux::workspace_session_name(
+                workspace_name,
+                session_name,
+            ));
+            let supervised = workspace_id.is_some_and(|workspace_id| {
+                owned_supervised.contains(&crate::supervision::LogicalSessionId {
+                    workspace_id: workspace_id.to_string(),
+                    session_name: (*session_name).clone(),
+                })
+            });
+            ordinary || supervised
+        })
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+fn owned_supervised_sessions(
+    workspace_ids: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<crate::supervision::LogicalSessionId> {
+    use crate::supervision::SupervisionBackend as _;
+
+    let Ok(receipts) = crate::supervision::ReceiptStore::standard().and_then(|store| store.list())
+    else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(backend) = crate::supervision::LinuxSystemdBackend::connect() else {
+        return std::collections::HashSet::new();
+    };
+
+    receipts
+        .into_iter()
+        .filter(|receipt| workspace_ids.contains(&receipt.logical_id.workspace_id))
+        .filter_map(|receipt| match backend.reconcile(&receipt) {
+            Ok(crate::supervision::OwnershipState::OwnedVerified(_)) => Some(receipt.logical_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn owned_supervised_sessions(
+    workspace_ids: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<crate::supervision::LogicalSessionId> {
+    let _ = workspace_ids;
+    std::collections::HashSet::new()
 }
 
 fn clamp_selection(workspaces: &[PathBuf], state: &mut ListState) {
@@ -2167,6 +2245,67 @@ mod tests {
         // Other Ctrl combos are ignored (don't insert a literal char).
         edit_text_input(&mut s, KeyCode::Char('a'), KeyModifiers::CONTROL);
         assert_eq!(s, "x");
+    }
+
+    #[test]
+    fn declared_live_count_unions_ordinary_and_owned_supervised_sessions() {
+        let workspace_id = "550e8400-e29b-41d4-a716-446655440000";
+        let session_names = vec![
+            "ordinary".to_string(),
+            "supervised".to_string(),
+            "both".to_string(),
+            "idle".to_string(),
+        ];
+        let ordinary_live = std::collections::HashSet::from([
+            crate::mux::workspace_session_name("Example", "ordinary"),
+            crate::mux::workspace_session_name("Example", "both"),
+        ]);
+        let owned_supervised = std::collections::HashSet::from([
+            crate::supervision::LogicalSessionId {
+                workspace_id: workspace_id.into(),
+                session_name: "supervised".into(),
+            },
+            crate::supervision::LogicalSessionId {
+                workspace_id: workspace_id.into(),
+                session_name: "both".into(),
+            },
+            crate::supervision::LogicalSessionId {
+                workspace_id: "550e8400-e29b-41d4-a716-446655440001".into(),
+                session_name: "idle".into(),
+            },
+        ]);
+
+        assert_eq!(
+            declared_live_count(
+                Some(workspace_id),
+                "Example",
+                &session_names,
+                &ordinary_live,
+                &owned_supervised,
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_does_not_claim_owned_receipts_by_session_name() {
+        let session_names = vec!["supervised".to_string()];
+        let owned_supervised =
+            std::collections::HashSet::from([crate::supervision::LogicalSessionId {
+                workspace_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                session_name: "supervised".into(),
+            }]);
+
+        assert_eq!(
+            declared_live_count(
+                None,
+                "Example",
+                &session_names,
+                &std::collections::HashSet::new(),
+                &owned_supervised,
+            ),
+            0
+        );
     }
 
     #[test]
