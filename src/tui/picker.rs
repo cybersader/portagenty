@@ -1617,7 +1617,11 @@ fn owned_supervised_sessions(
         .into_iter()
         .filter(|receipt| workspace_ids.contains(&receipt.logical_id.workspace_id))
         .filter_map(|receipt| match backend.reconcile(&receipt) {
-            Ok(crate::supervision::OwnershipState::OwnedVerified(_)) => Some(receipt.logical_id),
+            Ok(
+                crate::supervision::OwnershipState::OwnedVerified(_)
+                | crate::supervision::OwnershipState::LegacyRestartRequired(_)
+                | crate::supervision::OwnershipState::SplitContainment(_),
+            ) => Some(receipt.logical_id),
             _ => None,
         })
         .collect()
@@ -2311,7 +2315,7 @@ mod tests {
     #[test]
     fn bulk_stop_confirmation_names_each_control_path_and_skips_ambiguity() {
         let receipt = crate::supervision::BindingReceipt {
-            schema_version: crate::supervision::model::RECEIPT_SCHEMA_VERSION,
+            schema_version: crate::supervision::model::LEGACY_RECEIPT_SCHEMA_VERSION,
             logical_id: crate::supervision::LogicalSessionId::new(
                 "550e8400-e29b-41d4-a716-446655440000",
                 "owned",
@@ -2327,7 +2331,10 @@ mod tests {
                 session: "opaque".into(),
             },
             observed_at_unix_ms: 1,
-            limits: crate::supervision::SoftLimits::default(),
+            limits: crate::supervision::ResourceLimits::default(),
+            session_kind: None,
+            requested_slice: None,
+            workload_anchor: None,
         };
         let pending = PickerPending::KillAllSessions {
             ws_display_name: "example".into(),

@@ -428,52 +428,58 @@ real projects:
 
 ---
 
-## Experimental Linux resource supervision — implemented and live-validated
+## Experimental Linux resource supervision — Claude containment integration implemented
 
-The first capability-aware supervision milestone is implemented with a split
-TUI/CLI default: eligible idle UUID-backed TUI rows use supervision-first Enter,
+The capability-aware supervision milestone now has an explicit kind-selected
+Claude policy. Eligible idle UUID-backed TUI rows use supervision-first Enter,
 while CLI supervision remains explicit. On supported Linux hosts, Portagenty
 creates fresh tmux or Zellij workloads as transient systemd **user services**
-backed by cgroup v2. It uses stable logical identity (`workspace UUID + declared
-session name`), opaque private multiplexer targets, atomic machine-local ownership
-receipts, and exact `InvocationID`/`ControlGroup` revalidation before observation
-or control.
+backed by cgroup v2. Stable logical identity (`workspace UUID + declared session
+name`), opaque private targets, a pending-launch journal, versioned machine-local
+receipts, and workload-anchor proof gate observation and control.
 
-The MVP includes:
+The implementation includes:
 
-- `pa launch <session> --supervise`, plus optional `--memory-high`,
-  `--cpu-quota`, and `--tasks-max` soft guardrails;
-- `pa resources capabilities|status|stop|kill --force`;
-- TUI ownership labels; supervision-first Enter with `12G` / `300%` / `1200`
-  recommendations for eligible idle rows; `S` for custom limits, legacy upgrade,
-  and explicit restart; bounded two-second sampling; `r` refresh; resource
-  details/event warnings; capability-aware `x` stop; and separately confirmed
-  `X` force-kill;
+- `pa launch <session> --supervise`, plus typed `--memory-high`,
+  `--memory-max`, `--memory-swap-max`, `--cpu-quota`, and `--tasks-max` limits;
+- explicit `kind = "claude-code"` selection of `3G` MemoryHigh, `5G` MemoryMax,
+  `512MiB` MemorySwapMax, `800%` CPU, and `1200` tasks; names and command strings
+  never select Claude policy, and overrides may only be equal or stricter;
+- Claude service placement beneath externally provisioned `claude-code.slice`,
+  aggregate-slice structural preflight, `ManagedOOMPreference=omit`, and service
+  placement/limit read-back before v2 ownership persistence;
+- one shared tmux/Zellij workload-anchor protocol with exact nonce, PID,
+  `/proc` start time, and cgroup evidence, plus bounded descendant traversal via
+  `/proc/<pid>/task/<pid>/children` without a global process scan;
+- split-containment reporting when the root or descendants escape, including an
+  explicit external-bounded-scope explanation for `build-contained` descendants
+  beneath `background.slice`; split rows may attach but receive no whole-workload
+  metrics, stop, or force-kill authority;
+- mixed receipt transition semantics: new launches write v2 evidence, live v1
+  services are legacy/restart-required exact-target attach-only, both unit and
+  target absent may stale-clean, and partial presence remains ambiguous;
+- `pa resources capabilities|status|stop|kill --force` and TUI ownership labels,
+  editable five-field limits, bounded sampling, event warnings, and separately
+  confirmed force-kill only for complete owned-and-verified v2 containment;
 - loud ordinary fallback only from proven-safe non-creating capability preflight,
   with every ownership ambiguity and post-creation failure remaining fail-closed;
-- exact signal-free stale cleanup-and-relaunch, same-row retry after pre-client
-  setup failure, and human `workspace / session` identity after normal or abnormal
-  multiplexer-client return;
-- CPU, memory, swap, tasks, I/O, PSI, event counters, and cgroup state from the
-  verified workload cgroup;
-- dedicated private tmux servers and exact-runtime PTY-backed Zellij startup;
-- graceful target shutdown followed by non-force systemd stop, with no implicit
-  SIGKILL escalation; picker-wide stop partitions owned, mux-native, and skipped
-  targets and never bulk-force-kills.
+- graceful target shutdown followed by non-force systemd stop, preserving
+  `OOMPolicy=continue`, `ExitType=cgroup`, `KillMode=control-group`, and
+  `SendSIGKILL=no`; picker-wide stop skips legacy, split, stale, and ambiguous
+  receipts and never bulk-force-kills, while a pending journal blocks duplicate
+  supervised creation without granting control.
 
 This does **not** add a Portagenty daemon, listener, GUI, history database, log
-monitor, restart manager, or unattended telemetry service. Ordinary CLI launches
-and legacy/invalid/unsupported idle TUI rows remain unsupervised; eligible idle
-UUID-backed TUI rows are supervision-first. Existing live multiplexer sessions
-remain unverified and are never retroactively claimed. `MemoryHigh`, CPU quota,
-and `TasksMax` are preventive soft controls; hard memory/swap caps remain deferred.
+monitor, restart manager, or unattended telemetry service. Portagenty observes but
+does not create or modify the aggregate Claude slice. Existing services and live
+ordinary multiplexer sessions are not stopped, migrated, upgraded, or retroactively
+claimed. `MemoryHigh` remains a reclaim threshold; `MemoryMax` and
+`MemorySwapMax` are hard ceilings.
 
-The backend, store, parser, CLI, and TUI state machines have bounded fake/unit
-coverage. Ignored, explicitly invoked Linux integration tests also prove fresh
-private tmux and Zellij creation, exact receipt reconciliation, cgroup snapshots,
-soft-limit application, graceful multiplexer shutdown, verified non-force systemd
-stop, and complete synthetic artifact cleanup. Pressure, OOM, logout/reboot,
-hard-cap, and force-kill tests remain behind separate owner checkpoints.
+The backend, store, parser, CLI, TUI, picker, and multiplexer seams have bounded
+fake/unit coverage. Ignored Linux integration fixtures remain explicit, short-lived,
+and non-pressure; pressure, OOM, swap-fill, CPU saturation, force-kill,
+logout/reboot, and real-agent workload tests remain outside routine verification.
 
 ### Future platform and supervision work
 
@@ -487,8 +493,8 @@ hard-cap, and force-kill tests remain behind separate owner checkpoints.
 - **WSL dual plane:** Linux cgroups cannot contain native Windows descendants
   launched through interop. Strong support would require a separately approved
   Windows Job Object companion; otherwise report the escape honestly.
-- Hard `MemoryMax`/swap controls, nested sub-workloads, GPU attribution, history,
-  alerts, and arbitrary child-process actions remain deferred.
+- Nested sub-workloads, GPU attribution, history, alerts, and arbitrary
+  child-process actions remain deferred.
 - A Plasma or other graphical resource dashboard remains an external consumer,
   not part of the terminal-native core.
 

@@ -39,6 +39,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             fresh,
             supervise,
             memory_high,
+            memory_max,
+            memory_swap_max,
             cpu_quota,
             tasks_max,
         }) => cli::launch(
@@ -51,6 +53,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             cli::LaunchSupervisionOptions {
                 enabled: supervise,
                 memory_high: memory_high.as_deref(),
+                memory_max: memory_max.as_deref(),
+                memory_swap_max: memory_swap_max.as_deref(),
                 cpu_quota: cpu_quota.as_deref(),
                 tasks_max: tasks_max.as_deref(),
             },
@@ -83,6 +87,17 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }) => cli::init(name, mpx, force, with_agent_hooks),
         Some(Command::Snippets(cmd)) => cli::snippets(cmd),
         Some(Command::Onboard) => cli::onboard(),
+        Some(Command::WorkloadAnchor { spec }) => {
+            #[cfg(target_os = "linux")]
+            {
+                supervision::linux_systemd::run_workload_anchor(&spec)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = spec;
+                anyhow::bail!("workload anchors are supported only on Linux")
+            }
+        }
         Some(Command::Completions { shell }) => cli::completions(shell),
         Some(Command::Add {
             name,

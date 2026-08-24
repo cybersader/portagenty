@@ -131,9 +131,10 @@ running; only the terminal attached to them changes.
     links, and bridge conversation history through Portaconv.
   </Card>
   <Card title="Experimental Linux resource supervision" icon="approve-check">
-    On supported systemd-user/cgroup-v2 hosts, launch eligible sessions with soft
-    memory, CPU, and task guardrails; inspect current cgroup metrics and events;
-    and stop or separately force-kill only exactly owned workloads.
+    On supported systemd-user/cgroup-v2 hosts, use explicit kind-selected Claude
+    placement with soft and hard memory/swap, CPU, and task limits; prove the
+    workload root and bounded descendants; and control only complete owned v2
+    containment while legacy and split workloads remain attach-only.
   </Card>
 </CardGrid>
 

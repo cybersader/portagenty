@@ -276,6 +276,14 @@ pub(crate) fn render_layout(session: &Session) -> String {
 }
 
 pub(crate) fn render_layout_with_tab_name(session: &Session, tab_name: &str) -> String {
+    render_layout_with_tab_name_and_command(session, tab_name, &session.command)
+}
+
+pub(crate) fn render_layout_with_tab_name_and_command(
+    session: &Session,
+    tab_name: &str,
+    command: &str,
+) -> String {
     // Normalize cwd: strip trailing `.` component the walk-up loader
     // leaves behind for `cwd = "."` in TOML. Zellij accepts it but it
     // looks ugly in the status bar and is harmless to trim.
@@ -290,7 +298,7 @@ pub(crate) fn render_layout_with_tab_name(session: &Session, tab_name: &str) -> 
         }
     };
     let cwd = escape_kdl(&cwd_path);
-    let cmd = escape_kdl(&session.command);
+    let cmd = escape_kdl(command);
     let tab_name = escape_kdl(tab_name);
 
     // Stock zellij default — needed so status-bar + tab-bar plugins
@@ -302,7 +310,7 @@ pub(crate) fn render_layout_with_tab_name(session: &Session, tab_name: &str) -> 
     // ENTER to close" which confuses users who expect their shell
     // exit to close the session.
     let pane = if session.env.is_empty() {
-        if is_shell_command(&session.command) {
+        if is_shell_command(command) {
             // Run the shell binary directly; no `-c` wrapper.
             format!(
                 "        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"{cmd}\"\n        }}\n"
@@ -316,7 +324,7 @@ pub(crate) fn render_layout_with_tab_name(session: &Session, tab_name: &str) -> 
             let pair = format!("{k}={v}");
             env_args.push_str(&format!(" \"{}\"", escape_kdl(&pair)));
         }
-        if is_shell_command(&session.command) {
+        if is_shell_command(command) {
             format!("        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"env\"\n            args{env_args} \"{cmd}\"\n        }}\n")
         } else {
             format!("        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"env\"\n            args{env_args} \"bash\" \"-c\" \"{cmd}\"\n        }}\n")

@@ -8,14 +8,14 @@ pub mod store;
 use anyhow::{anyhow, Result};
 
 #[cfg(target_os = "linux")]
-pub use linux_systemd::LinuxSystemdBackend;
+pub use linux_systemd::{LinuxSystemdBackend, PendingLaunchState};
 pub use model::{
     ActionKind, ActionResult, ActionStage, BackendKind, BindingReceipt, CapabilityReport,
     CapabilityState, GeneratedNames, LimitKind, LogicalSessionId, MetricKind, MetricValue,
-    MuxTarget, OwnershipState, ResourceSnapshot, SoftLimits, SupervisionMode,
+    MuxTarget, OwnershipState, ResourceLimits, ResourceSnapshot, SupervisionMode,
 };
 #[cfg(target_os = "linux")]
-pub use store::ReceiptStore;
+pub use store::{PendingLaunch, ReceiptStore};
 
 /// Capability-aware platform boundary. Implementations must revalidate a
 /// binding before returning `OwnedVerified`, resource data, or performing a

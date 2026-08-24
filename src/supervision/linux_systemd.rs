@@ -1,19 +1,21 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use crate::domain::Session;
+use crate::domain::{Session, SessionKind};
 use crate::mux::{Multiplexer, TmuxAdapter};
 
 use super::metrics::{
@@ -23,9 +25,10 @@ use super::metrics::{
 use super::model::{
     ActionKind, ActionResult, ActionStage, BackendKind, BindingReceipt, CapabilityReport,
     CapabilityState, LimitKind, LogicalSessionId, MetricKind, MetricValue, MuxTarget,
-    OwnershipState, ResourceSnapshot, SoftLimits, RECEIPT_SCHEMA_VERSION,
+    OwnershipState, ResourceLimits, ResourceSnapshot, WorkloadAnchorProof, CLAUDE_CODE_SLICE,
+    LEGACY_RECEIPT_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION,
 };
-use super::store::ReceiptStore;
+use super::store::{PendingLaunch, ReceiptStore};
 use super::SupervisionBackend;
 
 const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
@@ -33,6 +36,7 @@ const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
 const MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
 const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const SERVICE_INTERFACE: &str = "org.freedesktop.systemd1.Service";
+const SLICE_INTERFACE: &str = "org.freedesktop.systemd1.Slice";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 const TARGET_TIMEOUT: Duration = Duration::from_secs(3);
@@ -40,6 +44,8 @@ const STOP_TIMEOUT_USEC: u64 = 8_000_000;
 const STOP_OBSERVE_TIMEOUT: Duration = Duration::from_secs(9);
 const KILL_OBSERVE_TIMEOUT: Duration = Duration::from_secs(3);
 const UINT64_MAX: u64 = u64::MAX;
+const ANCHOR_PROTOCOL_VERSION: u32 = 1;
+const MAX_DESCENDANTS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagerInfo {
@@ -55,6 +61,31 @@ pub struct SystemdUnitIdentity {
     pub active_state: String,
     pub sub_state: String,
     pub transient: bool,
+    pub slice: String,
+    pub memory_high: u64,
+    pub memory_max: u64,
+    pub memory_swap_max: u64,
+    pub cpu_quota_per_sec_usec: u64,
+    pub tasks_max: u64,
+    pub managed_oom_preference: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingLaunchState {
+    Active(String),
+    Dead(String),
+    Ambiguous(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeSliceIdentity {
+    pub control_group: String,
+    pub memory_high: u64,
+    pub memory_max: u64,
+    pub memory_swap_max: u64,
+    pub cpu_quota_per_sec_usec: u64,
+    pub tasks_max: u64,
+    pub managed_oom_preference: String,
 }
 
 #[derive(Debug)]
@@ -67,12 +98,14 @@ pub struct PtyStdio {
 #[derive(Debug)]
 pub struct TransientServiceSpec {
     pub unit_name: String,
+    pub session_kind: Option<SessionKind>,
+    pub requested_slice: Option<String>,
     pub executable: PathBuf,
     /// Arguments after argv[0]. The D-Bus adapter prepends the executable.
     pub args: Vec<String>,
     pub working_directory: PathBuf,
     pub environment: Vec<String>,
-    pub limits: SoftLimits,
+    pub limits: ResourceLimits,
     pub pty_stdio: Option<PtyStdio>,
 }
 
@@ -81,7 +114,36 @@ pub struct PreparedLaunch {
     pub logical_id: LogicalSessionId,
     pub spec: TransientServiceSpec,
     pub mux_target: MuxTarget,
+    expected_anchor: ExpectedAnchor,
     cleanup_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedAnchor {
+    nonce: String,
+    marker_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct WorkloadLaunchSpec {
+    protocol_version: u32,
+    nonce: String,
+    marker_path: PathBuf,
+    command: String,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_kind: Option<SessionKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct WorkloadMarker {
+    protocol_version: u32,
+    nonce: String,
+    pid: u32,
+    start_time_ticks: u64,
 }
 
 impl Drop for PreparedLaunch {
@@ -94,7 +156,9 @@ impl Drop for PreparedLaunch {
 
 pub trait SystemdApi: Send + Sync {
     fn manager_info(&self) -> Result<ManagerInfo>;
+    fn claude_slice_info(&self) -> Result<Option<ClaudeSliceIdentity>>;
     fn start_transient_service(&self, spec: &TransientServiceSpec) -> Result<SystemdUnitIdentity>;
+    fn unit_by_name(&self, unit_name: &str) -> Result<Option<SystemdUnitIdentity>>;
     fn unit_by_invocation_id(&self, invocation_id: &[u8]) -> Result<Option<SystemdUnitIdentity>>;
     fn stop_unit(&self, unit_name: &str) -> Result<()>;
     fn kill_unit(&self, unit_name: &str) -> Result<()>;
@@ -152,10 +216,31 @@ impl DbusSystemdApi {
             transient: unit
                 .get_property("Transient")
                 .context("reading systemd Transient property")?,
+            slice: service
+                .get_property("Slice")
+                .context("reading systemd Slice")?,
+            memory_high: service
+                .get_property("MemoryHigh")
+                .context("reading systemd MemoryHigh")?,
+            memory_max: service
+                .get_property("MemoryMax")
+                .context("reading systemd MemoryMax")?,
+            memory_swap_max: service
+                .get_property("MemorySwapMax")
+                .context("reading systemd MemorySwapMax")?,
+            cpu_quota_per_sec_usec: service
+                .get_property("CPUQuotaPerSecUSec")
+                .context("reading systemd CPUQuotaPerSecUSec")?,
+            tasks_max: service
+                .get_property("TasksMax")
+                .context("reading systemd TasksMax")?,
+            managed_oom_preference: service
+                .get_property("ManagedOOMPreference")
+                .context("reading systemd ManagedOOMPreference")?,
         })
     }
 
-    fn unit_by_name(&self, name: &str) -> Result<Option<SystemdUnitIdentity>> {
+    fn lookup_unit_by_name(&self, name: &str) -> Result<Option<SystemdUnitIdentity>> {
         let manager = self.manager_proxy()?;
         let path: OwnedObjectPath = match manager.call("GetUnit", &(name,)) {
             Ok(path) => path,
@@ -179,6 +264,45 @@ impl SystemdApi for DbusSystemdApi {
         })
     }
 
+    fn claude_slice_info(&self) -> Result<Option<ClaudeSliceIdentity>> {
+        let manager = self.manager_proxy()?;
+        let path: OwnedObjectPath = match manager.call("GetUnit", &(CLAUDE_CODE_SLICE,)) {
+            Ok(path) => path,
+            Err(error) if is_no_such_unit(&error) => return Ok(None),
+            Err(error) => return Err(error).context("resolving claude-code.slice"),
+        };
+        let slice = Proxy::new(
+            &self.connection,
+            SYSTEMD_DESTINATION,
+            path.as_str(),
+            SLICE_INTERFACE,
+        )
+        .context("creating systemd Claude slice proxy")?;
+        Ok(Some(ClaudeSliceIdentity {
+            control_group: slice
+                .get_property("ControlGroup")
+                .context("reading Claude slice ControlGroup")?,
+            memory_high: slice
+                .get_property("MemoryHigh")
+                .context("reading Claude slice MemoryHigh")?,
+            memory_max: slice
+                .get_property("MemoryMax")
+                .context("reading Claude slice MemoryMax")?,
+            memory_swap_max: slice
+                .get_property("MemorySwapMax")
+                .context("reading Claude slice MemorySwapMax")?,
+            cpu_quota_per_sec_usec: slice
+                .get_property("CPUQuotaPerSecUSec")
+                .context("reading Claude slice CPUQuotaPerSecUSec")?,
+            tasks_max: slice
+                .get_property("TasksMax")
+                .context("reading Claude slice TasksMax")?,
+            managed_oom_preference: slice
+                .get_property("ManagedOOMPreference")
+                .context("reading Claude slice ManagedOOMPreference")?,
+        }))
+    }
+
     fn start_transient_service(&self, spec: &TransientServiceSpec) -> Result<SystemdUnitIdentity> {
         let manager = self.manager_proxy()?;
         let properties = service_properties(spec)?;
@@ -192,7 +316,7 @@ impl SystemdApi for DbusSystemdApi {
 
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
-            if let Some(identity) = self.unit_by_name(&spec.unit_name)? {
+            if let Some(identity) = self.lookup_unit_by_name(&spec.unit_name)? {
                 if !identity.invocation_id.is_empty() && !identity.control_group.is_empty() {
                     return Ok(identity);
                 }
@@ -206,6 +330,10 @@ impl SystemdApi for DbusSystemdApi {
             }
             thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    fn unit_by_name(&self, unit_name: &str) -> Result<Option<SystemdUnitIdentity>> {
+        self.lookup_unit_by_name(unit_name)
     }
 
     fn unit_by_invocation_id(&self, invocation_id: &[u8]) -> Result<Option<SystemdUnitIdentity>> {
@@ -273,6 +401,17 @@ fn service_properties(spec: &TransientServiceSpec) -> Result<Vec<(String, OwnedV
         property("Environment", spec.environment.clone())?,
         property("ExecStart", exec_start)?,
     ];
+    if spec.session_kind == Some(SessionKind::ClaudeCode) {
+        properties.push(property(
+            "Slice",
+            spec.requested_slice
+                .clone()
+                .ok_or_else(|| anyhow!("Claude Code service is missing its slice"))?,
+        )?);
+        properties.push(property("ManagedOOMPreference", "omit".to_string())?);
+    } else if spec.requested_slice.is_some() {
+        bail!("generic service unexpectedly requested a Claude slice");
+    }
     if let Some(pty) = &spec.pty_stdio {
         let tty_path = path_to_utf8(&pty.tty_path, "PTY slave path")?;
         properties.push(property("StandardInput", "tty".to_string())?);
@@ -282,6 +421,12 @@ fn service_properties(spec: &TransientServiceSpec) -> Result<Vec<(String, OwnedV
     }
     if let Some(value) = spec.limits.memory_high_bytes {
         properties.push(property("MemoryHigh", value)?);
+    }
+    if let Some(value) = spec.limits.memory_max_bytes {
+        properties.push(property("MemoryMax", value)?);
+    }
+    if let Some(value) = spec.limits.memory_swap_max_bytes {
+        properties.push(property("MemorySwapMax", value)?);
     }
     if let Some(percent) = spec.limits.cpu_quota_percent {
         let usec = (percent * 10_000.0).round();
@@ -294,6 +439,35 @@ fn service_properties(spec: &TransientServiceSpec) -> Result<Vec<(String, OwnedV
         properties.push(property("TasksMax", value)?);
     }
     Ok(properties)
+}
+
+fn is_direct_claude_service_cgroup(control_group: &str) -> bool {
+    Path::new(control_group)
+        .parent()
+        .is_some_and(|parent| parent.ends_with("claude.slice/claude-code.slice"))
+}
+
+fn current_binding_receipt(
+    prepared: &PreparedLaunch,
+    identity: &SystemdUnitIdentity,
+    workload_anchor: WorkloadAnchorProof,
+) -> Result<BindingReceipt> {
+    let receipt = BindingReceipt {
+        schema_version: RECEIPT_SCHEMA_VERSION,
+        logical_id: prepared.logical_id.clone(),
+        backend: BackendKind::SystemdUserService,
+        unit_name: identity.unit_name.clone(),
+        invocation_id: encode_hex(&identity.invocation_id),
+        control_group: identity.control_group.clone(),
+        mux_target: prepared.mux_target.clone(),
+        observed_at_unix_ms: now_unix_ms(),
+        limits: prepared.spec.limits.clone(),
+        session_kind: prepared.spec.session_kind,
+        requested_slice: prepared.spec.requested_slice.clone(),
+        workload_anchor: Some(workload_anchor),
+    };
+    receipt.validate_shape()?;
+    Ok(receipt)
 }
 
 fn property<T>(name: &str, value: T) -> Result<(String, OwnedValue)>
@@ -312,31 +486,251 @@ fn owned_property(name: &str, value: Value<'static>) -> Result<(String, OwnedVal
     ))
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn prepare_workload_anchor(
+    session: &Session,
+    runtime_dir: &Path,
+    portagenty_executable: &Path,
+) -> Result<(ExpectedAnchor, PathBuf, String)> {
+    let root = runtime_dir.join("portagenty/workloads");
+    ensure_private_runtime_dir(&root)?;
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let spec_path = root.join(format!("{nonce}.launch.toml"));
+    let marker_path = root.join(format!("{nonce}.marker.toml"));
+    let spec = WorkloadLaunchSpec {
+        protocol_version: ANCHOR_PROTOCOL_VERSION,
+        nonce: nonce.clone(),
+        marker_path: marker_path.clone(),
+        command: session.command.clone(),
+        environment: session.env.clone(),
+        session_kind: session.kind,
+    };
+    let serialized = toml::to_string(&spec).context("serializing workload launch specification")?;
+    write_private_file(&spec_path, serialized.as_bytes())?;
+    let command = format!(
+        "exec {} __workload-anchor --spec {}",
+        shell_quote(path_to_utf8(portagenty_executable, "Portagenty executable")?.as_str()),
+        shell_quote(path_to_utf8(&spec_path, "workload launch specification")?.as_str())
+    );
+    Ok((ExpectedAnchor { nonce, marker_path }, spec_path, command))
+}
+
+fn validate_runtime_workload_path(path: &Path, nonce: &str, suffix: &str) -> Result<()> {
+    validate_runtime_workload_path_in(&validated_runtime_dir()?, path, nonce, suffix)
+}
+
+fn validate_runtime_workload_path_in(
+    runtime_dir: &Path,
+    path: &Path,
+    nonce: &str,
+    suffix: &str,
+) -> Result<()> {
+    validate_owner_private_dir(runtime_dir, "runtime directory")?;
+    let workloads = runtime_dir.join("portagenty/workloads");
+    let expected = workloads.join(format!("{nonce}.{suffix}.toml"));
+    if path != expected {
+        bail!(
+            "workload file {} is outside the exact owner runtime namespace",
+            path.display()
+        );
+    }
+    validate_owner_private_dir(
+        &runtime_dir.join("portagenty"),
+        "Portagenty runtime directory",
+    )?;
+    validate_owner_private_dir(&workloads, "workload directory")?;
+    Ok(())
+}
+
+fn marker_matches_proof(marker: &WorkloadMarker, proof: &WorkloadAnchorProof) -> bool {
+    marker.protocol_version == proof.protocol_version
+        && marker.nonce == proof.nonce
+        && marker.pid == proof.pid
+        && marker.start_time_ticks == proof.start_time_ticks
+}
+
+pub(crate) fn remove_verified_workload_marker(proof: &WorkloadAnchorProof) -> Result<()> {
+    remove_verified_workload_marker_in(&validated_runtime_dir()?, proof)
+}
+
+fn remove_verified_workload_marker_in(
+    runtime_dir: &Path,
+    proof: &WorkloadAnchorProof,
+) -> Result<()> {
+    super::model::validate_workload_marker_shape(&proof.marker_path, &proof.nonce)?;
+    validate_runtime_workload_path_in(runtime_dir, &proof.marker_path, &proof.nonce, "marker")?;
+    let marker = match read_workload_marker(&proof.marker_path) {
+        Ok(marker) => marker,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    };
+    if !marker_matches_proof(&marker, proof) {
+        bail!("refusing to remove a workload marker that does not match its receipt");
+    }
+    fs::remove_file(&proof.marker_path)
+        .with_context(|| format!("removing workload marker {}", proof.marker_path.display()))
+}
+
+pub fn run_workload_anchor(spec_path: &Path) -> Result<()> {
+    let filename = spec_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("workload launch specification has no UTF-8 filename"))?;
+    let path_nonce = filename
+        .strip_suffix(".launch.toml")
+        .ok_or_else(|| anyhow!("workload launch specification filename is invalid"))?;
+    validate_runtime_workload_path(spec_path, path_nonce, "launch")?;
+    let uid = rustix::process::geteuid().as_raw();
+    let metadata = fs::symlink_metadata(spec_path).with_context(|| {
+        format!(
+            "reading workload launch specification {}",
+            spec_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o600
+    {
+        bail!(
+            "workload launch specification {} is not an owner-only regular file",
+            spec_path.display()
+        );
+    }
+    let raw = fs::read_to_string(spec_path).with_context(|| {
+        format!(
+            "reading workload launch specification {}",
+            spec_path.display()
+        )
+    })?;
+    let spec: WorkloadLaunchSpec = toml::from_str(&raw).with_context(|| {
+        format!(
+            "parsing workload launch specification {}",
+            spec_path.display()
+        )
+    })?;
+    if spec.protocol_version != ANCHOR_PROTOCOL_VERSION || spec.nonce != path_nonce {
+        bail!("unsupported or mismatched workload-anchor launch protocol");
+    }
+    super::model::validate_workload_marker_shape(&spec.marker_path, &spec.nonce)?;
+    validate_runtime_workload_path(&spec.marker_path, &spec.nonce, "marker")?;
+    let parent = spec
+        .marker_path
+        .parent()
+        .ok_or_else(|| anyhow!("workload marker path has no parent"))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("reading workload marker directory {}", parent.display()))?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != uid
+        || parent_metadata.mode() & 0o777 != 0o700
+    {
+        bail!("workload marker directory is not owner-only");
+    }
+    let pid = std::process::id();
+    let marker = WorkloadMarker {
+        protocol_version: ANCHOR_PROTOCOL_VERSION,
+        nonce: spec.nonce.clone(),
+        pid,
+        start_time_ticks: process_start_time_ticks(pid)?,
+    };
+    write_atomic_private_toml(&spec.marker_path, &marker)?;
+    fs::remove_file(spec_path).with_context(|| {
+        format!(
+            "removing one-shot launch specification {}",
+            spec_path.display()
+        )
+    })?;
+
+    let mut command = if is_bare_shell_command(&spec.command) {
+        std::process::Command::new(spec.command.trim())
+    } else {
+        let mut command = std::process::Command::new("bash");
+        command.arg("-c").arg(&spec.command);
+        command
+    };
+    command.envs(spec.environment);
+    command.env("PORTAGENTY_WORKLOAD_NONCE", &spec.nonce);
+    let error = command.exec();
+    Err(error).context("executing anchored workload")
+}
+
+fn is_bare_shell_command(command: &str) -> bool {
+    matches!(
+        command.trim(),
+        "bash" | "sh" | "zsh" | "fish" | "ash" | "dash"
+    )
+}
+
+fn write_atomic_private_toml(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("private marker path has no parent"))?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("marker"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let bytes = toml::to_string(value).context("serializing workload marker")?;
+    write_private_file(&temp, bytes.as_bytes())?;
+    fs::rename(&temp, path)
+        .with_context(|| format!("publishing workload marker {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting workload marker permissions {}", path.display()))?;
+    Ok(())
+}
+
 pub struct LinuxSystemdBackend {
     api: Arc<dyn SystemdApi>,
     cgroup_root: PathBuf,
+    workload_executable: PathBuf,
 }
 
 impl LinuxSystemdBackend {
     pub fn connect() -> Result<Self> {
+        Self::connect_with_workload_executable(
+            std::env::current_exe().context("resolving the Portagenty executable")?,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn connect_with_workload_executable(workload_executable: PathBuf) -> Result<Self> {
         Ok(Self {
             api: Arc::new(DbusSystemdApi::connect()?),
             cgroup_root: PathBuf::from(CGROUP_ROOT),
+            workload_executable,
         })
     }
 
     #[cfg(test)]
     pub fn with_api(api: Arc<dyn SystemdApi>, cgroup_root: PathBuf) -> Self {
-        Self { api, cgroup_root }
+        Self {
+            api,
+            cgroup_root,
+            workload_executable: std::env::current_exe().unwrap(),
+        }
     }
 
     pub fn prepare_tmux_launch(
         &self,
         logical_id: LogicalSessionId,
         session: &Session,
-        limits: SoftLimits,
+        limits: ResourceLimits,
     ) -> Result<PreparedLaunch> {
+        let limits = limits.resolve_for_kind(session.kind)?;
         self.require_limit_capabilities(&limits)?;
+        self.preflight_session_policy(session.kind)?;
         let runtime_dir = validated_runtime_dir()?;
         let names = super::model::generate_names(&logical_id, uuid::Uuid::new_v4(), &runtime_dir)?;
         ensure_private_runtime_dir(
@@ -349,22 +743,44 @@ impl LinuxSystemdBackend {
         if adapter.has_session(&names.tmux_session)? {
             bail!("generated private tmux target unexpectedly already exists");
         }
-        let args = adapter.create_detached_args(session, &names.tmux_session)?;
-        let args = os_args_to_utf8(args)?;
-        let executable = resolve_executable("tmux")?;
+        let (expected_anchor, launch_spec, anchor_command) =
+            prepare_workload_anchor(session, &runtime_dir, &self.workload_executable)?;
+        let (server_environment, pane_environment) =
+            supervised_tmux_environments(&session.env, &runtime_dir)?;
+        let args = adapter.create_detached_args_with_command_and_environment(
+            session,
+            &names.tmux_session,
+            &anchor_command,
+            &pane_environment,
+        )?;
+        let tmux_args = os_args_to_utf8(args)?;
+        let tmux_executable = resolve_executable("tmux")?;
+        let mut args = vec![
+            "-u".into(),
+            "DBUS_SESSION_BUS_ADDRESS".into(),
+            "-u".into(),
+            "XDG_RUNTIME_DIR".into(),
+            path_to_utf8(&tmux_executable, "tmux executable")?,
+        ];
+        args.extend(tmux_args);
+        let executable = resolve_executable("env")?;
         Ok(PreparedLaunch {
             logical_id,
             mux_target: MuxTarget::TmuxPrivate {
                 socket: names.tmux_socket,
                 session: names.tmux_session,
             },
-            cleanup_paths: Vec::new(),
+            expected_anchor,
+            cleanup_paths: vec![launch_spec],
             spec: TransientServiceSpec {
                 unit_name: names.unit_name,
+                session_kind: session.kind,
+                requested_slice: (session.kind == Some(SessionKind::ClaudeCode))
+                    .then(|| CLAUDE_CODE_SLICE.to_string()),
                 executable,
                 args,
                 working_directory: session.cwd.clone(),
-                environment: sanitized_environment(&session.env)?,
+                environment: server_environment,
                 limits,
                 pty_stdio: None,
             },
@@ -376,9 +792,11 @@ impl LinuxSystemdBackend {
         logical_id: LogicalSessionId,
         workspace_name: &str,
         session: &Session,
-        limits: SoftLimits,
+        limits: ResourceLimits,
     ) -> Result<PreparedLaunch> {
+        let limits = limits.resolve_for_kind(session.kind)?;
         self.require_limit_capabilities(&limits)?;
+        self.preflight_session_policy(session.kind)?;
         if !session.cwd.is_dir() {
             bail!("session cwd does not exist: {}", session.cwd.display());
         }
@@ -396,9 +814,16 @@ impl LinuxSystemdBackend {
         let environment = sanitized_environment_with_runtime(&session.env, &runtime_dir)?;
         let pty_stdio = open_pty_stdio()?;
         let tab_name = format!("{workspace_name} / {}", session.name);
+        let (expected_anchor, launch_spec, anchor_command) =
+            prepare_workload_anchor(session, &runtime_dir, &self.workload_executable)?;
         write_private_file(
             &layout_path,
-            crate::mux::zellij::render_layout_with_tab_name(session, &tab_name).as_bytes(),
+            crate::mux::zellij::render_layout_with_tab_name_and_command(
+                session,
+                &tab_name,
+                &anchor_command,
+            )
+            .as_bytes(),
         )?;
 
         Ok(PreparedLaunch {
@@ -407,9 +832,13 @@ impl LinuxSystemdBackend {
                 session: names.zellij_session.clone(),
                 runtime_dir: Some(runtime_dir),
             },
-            cleanup_paths: vec![layout_path],
+            expected_anchor,
+            cleanup_paths: vec![layout_path, launch_spec],
             spec: TransientServiceSpec {
                 unit_name: names.unit_name,
+                session_kind: session.kind,
+                requested_slice: (session.kind == Some(SessionKind::ClaudeCode))
+                    .then(|| CLAUDE_CODE_SLICE.to_string()),
                 executable,
                 args: vec![
                     "--session".into(),
@@ -442,20 +871,15 @@ impl LinuxSystemdBackend {
             }
             let manager = self.api.manager_info()?;
             self.validated_cgroup_path(&manager.control_group, &identity.control_group)?;
+            self.verify_service_policy(&identity, &prepared.spec)?;
             wait_for_mux_target(&prepared.mux_target, TARGET_TIMEOUT)?;
-            let receipt = BindingReceipt {
-                schema_version: RECEIPT_SCHEMA_VERSION,
-                logical_id: prepared.logical_id.clone(),
-                backend: BackendKind::SystemdUserService,
-                unit_name: identity.unit_name.clone(),
-                invocation_id: encode_hex(&identity.invocation_id),
-                control_group: identity.control_group.clone(),
-                mux_target: prepared.mux_target.clone(),
-                observed_at_unix_ms: now_unix_ms(),
-                limits: prepared.spec.limits.clone(),
-            };
-            receipt.validate_shape()?;
-            Ok(receipt)
+            let workload_anchor = wait_for_workload_anchor(
+                &prepared.expected_anchor,
+                &identity.control_group,
+                &prepared.mux_target,
+                TARGET_TIMEOUT,
+            )?;
+            current_binding_receipt(prepared, &identity, workload_anchor)
         })();
         if launch_result.is_err() {
             let _ = self.api.stop_unit(&prepared.spec.unit_name);
@@ -463,52 +887,25 @@ impl LinuxSystemdBackend {
         launch_result.context("validating the new supervised workload")
     }
 
-    /// Create and receipt one private tmux server while holding the receipt
-    /// store lock across the ownership decision. A persistence failure stops
-    /// the just-created unit so Portagenty never leaves an unreceipted owned
-    /// workload behind.
     pub fn create_tmux_binding(
         &self,
         store: &ReceiptStore,
         logical_id: LogicalSessionId,
         session: &Session,
-        limits: SoftLimits,
+        limits: ResourceLimits,
     ) -> Result<BindingReceipt> {
-        let mut started = None;
-        let result = store.update_locked(|file| {
-            if let Some(existing) = file
-                .bindings
-                .iter()
-                .find(|receipt| receipt.logical_id == logical_id)
-            {
-                return match self.reconcile(existing)? {
-                    OwnershipState::OwnedVerified(_) => Ok(existing.clone()),
-                    OwnershipState::StaleBinding(reason) => bail!(
-                        "a stale supervision receipt already exists for this session: {reason}"
-                    ),
-                    state => bail!(
-                        "an incompatible supervision receipt already exists for this session: {state:?}"
-                    ),
-                };
-            }
-
-            let prepared =
-                self.prepare_tmux_launch(logical_id.clone(), session, limits.clone())?;
-            let receipt = self.start_prepared(&prepared)?;
-            started = Some(receipt.clone());
-            file.bindings.push(receipt.clone());
-            file.bindings.sort_by(|left, right| left.logical_id.cmp(&right.logical_id));
-            Ok(receipt)
-        });
-        if result.is_err() {
-            if let Some(receipt) = &started {
-                let _ = self.api.stop_unit(&receipt.unit_name);
-                if let MuxTarget::TmuxPrivate { socket, .. } = &receipt.mux_target {
-                    let _ = fs::remove_file(socket);
-                }
-            }
+        if let Some(existing) = store.find(&logical_id)? {
+            return match self.reconcile(&existing)? {
+                OwnershipState::OwnedVerified(_) => Ok(existing),
+                state => bail!("an incompatible supervision receipt already exists: {state:?}"),
+            };
         }
-        result.context("creating supervised tmux binding")
+        if let Some(pending) = store.find_pending(&logical_id)? {
+            bail!("a pending supervision launch already exists: {pending:?}");
+        }
+        let prepared = self.prepare_tmux_launch(logical_id.clone(), session, limits)?;
+        self.start_and_persist(store, &prepared)
+            .context("creating supervised tmux binding")
     }
 
     pub fn create_zellij_binding(
@@ -517,44 +914,156 @@ impl LinuxSystemdBackend {
         logical_id: LogicalSessionId,
         workspace_name: &str,
         session: &Session,
-        limits: SoftLimits,
+        limits: ResourceLimits,
     ) -> Result<BindingReceipt> {
-        let mut started = None;
-        let result = store.update_locked(|file| {
-            if let Some(existing) = file
-                .bindings
-                .iter()
-                .find(|receipt| receipt.logical_id == logical_id)
-            {
-                return match self.reconcile(existing)? {
-                    OwnershipState::OwnedVerified(_) => Ok(existing.clone()),
-                    OwnershipState::StaleBinding(reason) => bail!(
-                        "a stale supervision receipt already exists for this session: {reason}"
-                    ),
-                    state => bail!(
-                        "an incompatible supervision receipt already exists for this session: {state:?}"
-                    ),
-                };
-            }
+        if let Some(existing) = store.find(&logical_id)? {
+            return match self.reconcile(&existing)? {
+                OwnershipState::OwnedVerified(_) => Ok(existing),
+                state => bail!("an incompatible supervision receipt already exists: {state:?}"),
+            };
+        }
+        if let Some(pending) = store.find_pending(&logical_id)? {
+            bail!("a pending supervision launch already exists: {pending:?}");
+        }
+        let prepared =
+            self.prepare_zellij_launch(logical_id.clone(), workspace_name, session, limits)?;
+        self.start_and_persist(store, &prepared)
+            .context("creating supervised Zellij binding")
+    }
 
-            let prepared = self.prepare_zellij_launch(
-                logical_id.clone(),
-                workspace_name,
-                session,
-                limits.clone(),
-            )?;
-            let receipt = self.start_prepared(&prepared)?;
-            started = Some(receipt.clone());
-            file.bindings.push(receipt.clone());
-            file.bindings.sort_by(|left, right| left.logical_id.cmp(&right.logical_id));
-            Ok(receipt)
-        });
-        if result.is_err() {
-            if let Some(receipt) = &started {
-                let _ = self.api.stop_unit(&receipt.unit_name);
+    fn start_and_persist(
+        &self,
+        store: &ReceiptStore,
+        prepared: &PreparedLaunch,
+    ) -> Result<BindingReceipt> {
+        let creator_pid = std::process::id();
+        let pending = PendingLaunch {
+            logical_id: prepared.logical_id.clone(),
+            unit_name: prepared.spec.unit_name.clone(),
+            mux_target: prepared.mux_target.clone(),
+            marker_path: prepared.expected_anchor.marker_path.clone(),
+            created_at_unix_ms: now_unix_ms(),
+            creator_pid,
+            creator_start_time_ticks: process_start_time_ticks(creator_pid)
+                .context("recording pending-launch creator process proof")?,
+            last_error: None,
+        };
+        store.begin_pending(pending)?;
+        match self.start_prepared(prepared) {
+            Ok(receipt) => {
+                if let Err(error) = store.finalize_pending(receipt.clone()) {
+                    let _ = self.api.stop_unit(&receipt.unit_name);
+                    let _ = store.mark_pending_error(
+                        &receipt.logical_id,
+                        format!("receipt persistence failed: {error:#}"),
+                    );
+                    return Err(error).context("persisting supervision receipt");
+                }
+                Ok(receipt)
+            }
+            Err(error) => {
+                // Creation may already have started. Request only the normal
+                // non-force stop, then retain the pending journal unless every
+                // unit/target/marker probe proves the partial launch absent.
+                let _ = self.api.stop_unit(&prepared.spec.unit_name);
+                let unit_present = self
+                    .api
+                    .unit_by_name(&prepared.spec.unit_name)
+                    .unwrap_or(Some(SystemdUnitIdentity {
+                        unit_name: prepared.spec.unit_name.clone(),
+                        invocation_id: Vec::new(),
+                        control_group: String::new(),
+                        active_state: String::new(),
+                        sub_state: String::new(),
+                        transient: true,
+                        slice: String::new(),
+                        memory_high: UINT64_MAX,
+                        memory_max: UINT64_MAX,
+                        memory_swap_max: UINT64_MAX,
+                        cpu_quota_per_sec_usec: UINT64_MAX,
+                        tasks_max: UINT64_MAX,
+                        managed_oom_preference: String::new(),
+                    }))
+                    .is_some();
+                let target_present = mux_target_exists(&prepared.mux_target).unwrap_or(true);
+                let marker_present = prepared.expected_anchor.marker_path.exists();
+                if !unit_present && !target_present && !marker_present {
+                    let _ = store.clear_pending(&prepared.logical_id);
+                } else {
+                    let _ = store.mark_pending_error(
+                        &prepared.logical_id,
+                        format!("post-creation validation failed: {error:#}"),
+                    );
+                }
+                Err(error)
             }
         }
-        result.context("creating supervised Zellij binding")
+    }
+
+    pub fn reconcile_pending(&self, pending: &PendingLaunch) -> Result<PendingLaunchState> {
+        pending.validate_shape()?;
+        if !pending.has_creator_proof() {
+            return Ok(PendingLaunchState::Ambiguous(
+                "pending launch has no creator process proof".into(),
+            ));
+        }
+        let creator_alive = match process_start_time_ticks(pending.creator_pid) {
+            Ok(start_time) => start_time == pending.creator_start_time_ticks,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                false
+            }
+            Err(error) => {
+                return Ok(PendingLaunchState::Ambiguous(format!(
+                    "pending creator process could not be verified: {error:#}"
+                )))
+            }
+        };
+        let unit_present = self.api.unit_by_name(&pending.unit_name)?.is_some();
+        let target_present = mux_target_exists(&pending.mux_target)?;
+        let marker_present = pending
+            .marker_path
+            .try_exists()
+            .with_context(|| format!("probing {}", pending.marker_path.display()))?;
+        Ok(classify_pending_launch(
+            creator_alive,
+            unit_present,
+            target_present,
+            marker_present,
+        ))
+    }
+
+    pub fn remove_dead_pending(
+        &self,
+        store: &ReceiptStore,
+        expected: &PendingLaunch,
+    ) -> Result<()> {
+        store.update_locked(|file| {
+            let index = file
+                .pending_launches
+                .iter()
+                .position(|pending| pending.logical_id == expected.logical_id)
+                .ok_or_else(|| anyhow!("the pending launch is no longer present"))?;
+            let current = &file.pending_launches[index];
+            if current != expected {
+                bail!("the pending launch changed after confirmation; refresh and retry");
+            }
+            match self.reconcile_pending(current)? {
+                PendingLaunchState::Dead(_) => {
+                    file.pending_launches.remove(index);
+                    Ok(())
+                }
+                PendingLaunchState::Active(reason) => {
+                    bail!("pending launch creator is still active ({reason}); nothing was removed")
+                }
+                PendingLaunchState::Ambiguous(reason) => {
+                    bail!("pending launch remains ambiguous ({reason}); nothing was removed")
+                }
+            }
+        })
     }
 
     /// Remove one exact stale receipt without signalling any process. The
@@ -591,34 +1100,140 @@ impl LinuxSystemdBackend {
             if target_exists(&current.mux_target)? {
                 bail!("the exact multiplexer target is still present; no receipt was removed");
             }
+            if let Some(anchor) = current.workload_anchor.as_ref() {
+                remove_verified_workload_marker(anchor)?;
+            }
             file.bindings.remove(index);
             Ok(())
         })
     }
 
-    fn require_limit_capabilities(&self, limits: &SoftLimits) -> Result<()> {
+    fn preflight_session_policy(&self, kind: Option<SessionKind>) -> Result<()> {
+        if kind != Some(SessionKind::ClaudeCode) {
+            return Ok(());
+        }
+        let slice = self.api.claude_slice_info()?.ok_or_else(|| {
+            anyhow!("claude-code.slice is not loaded in the systemd user manager")
+        })?;
+        if !slice
+            .control_group
+            .ends_with("/claude.slice/claude-code.slice")
+        {
+            bail!(
+                "claude-code.slice reported unexpected placement {:?}",
+                slice.control_group
+            );
+        }
+        for (name, value) in [
+            ("MemoryHigh", slice.memory_high),
+            ("MemoryMax", slice.memory_max),
+            ("MemorySwapMax", slice.memory_swap_max),
+            ("CPUQuotaPerSecUSec", slice.cpu_quota_per_sec_usec),
+        ] {
+            if value == 0 || value == UINT64_MAX {
+                bail!("claude-code.slice has no finite positive {name}");
+            }
+        }
+        if slice.memory_high > slice.memory_max {
+            bail!("claude-code.slice MemoryHigh exceeds MemoryMax");
+        }
+        if slice.managed_oom_preference != "omit" {
+            bail!("claude-code.slice ManagedOOMPreference is not omit");
+        }
+        Ok(())
+    }
+
+    fn verify_service_policy(
+        &self,
+        identity: &SystemdUnitIdentity,
+        spec: &TransientServiceSpec,
+    ) -> Result<()> {
+        if spec
+            .requested_slice
+            .as_deref()
+            .is_some_and(|requested| identity.slice != requested)
+        {
+            bail!("systemd placed the service in an unexpected slice");
+        }
+        if spec.session_kind == Some(SessionKind::ClaudeCode)
+            && !is_direct_claude_service_cgroup(&identity.control_group)
+        {
+            bail!("Claude Code service is not directly beneath claude-code.slice");
+        }
+        for (name, expected, actual) in [
+            (
+                "MemoryHigh",
+                spec.limits.memory_high_bytes,
+                identity.memory_high,
+            ),
+            (
+                "MemoryMax",
+                spec.limits.memory_max_bytes,
+                identity.memory_max,
+            ),
+            (
+                "MemorySwapMax",
+                spec.limits.memory_swap_max_bytes,
+                identity.memory_swap_max,
+            ),
+            ("TasksMax", spec.limits.tasks_max, identity.tasks_max),
+        ] {
+            if expected.is_some_and(|expected| actual != expected) {
+                bail!("systemd read-back for {name} does not match the requested value");
+            }
+        }
+        if let Some(percent) = spec.limits.cpu_quota_percent {
+            let expected = (percent * 10_000.0).round() as u64;
+            if identity.cpu_quota_per_sec_usec != expected {
+                bail!("systemd CPU quota read-back does not match the requested value");
+            }
+        }
+        if spec.session_kind == Some(SessionKind::ClaudeCode)
+            && identity.managed_oom_preference != "omit"
+        {
+            bail!("Claude Code service ManagedOOMPreference is not omit");
+        }
+        Ok(())
+    }
+
+    fn require_limit_capabilities(&self, limits: &ResourceLimits) -> Result<()> {
         if limits.is_empty() {
             return Ok(());
         }
         let report = self.capabilities();
         for (requested, kind) in [
             (limits.memory_high_bytes.is_some(), LimitKind::MemoryHigh),
+            (limits.memory_max_bytes.is_some(), LimitKind::MemoryMax),
+            (
+                limits.memory_swap_max_bytes.is_some(),
+                LimitKind::MemorySwapMax,
+            ),
             (limits.cpu_quota_percent.is_some(), LimitKind::CpuQuota),
             (limits.tasks_max.is_some(), LimitKind::TasksMax),
         ] {
             if requested && report.limits.get(&kind) != Some(&CapabilityState::Supported) {
-                bail!("requested {kind:?} guardrail is not supported on this host");
+                bail!("requested {kind:?} resource limit is not supported on this host");
             }
         }
         Ok(())
     }
 
     fn verified_binding(&self, receipt: &BindingReceipt) -> Result<SystemdUnitIdentity> {
+        if receipt.schema_version == LEGACY_RECEIPT_SCHEMA_VERSION {
+            bail!("legacy v1 receipt is attach-only and requires restart for resource ownership");
+        }
         let identity = self.verified_identity(receipt)?;
         if !mux_target_exists(&receipt.mux_target)? {
             bail!("recorded multiplexer target is no longer present");
         }
-        Ok(identity)
+        let anchor = receipt
+            .workload_anchor
+            .as_ref()
+            .ok_or_else(|| anyhow!("current receipt is missing workload-anchor proof"))?;
+        match verify_workload_anchor(anchor, &receipt.control_group, &receipt.mux_target)? {
+            ContainmentStatus::Verified => Ok(identity),
+            ContainmentStatus::Split(reason) => bail!("split containment: {reason}"),
+        }
     }
 
     fn verified_identity(&self, receipt: &BindingReceipt) -> Result<SystemdUnitIdentity> {
@@ -649,7 +1264,82 @@ impl LinuxSystemdBackend {
         }
         let manager = self.api.manager_info()?;
         self.validated_cgroup_path(&manager.control_group, &identity.control_group)?;
+        if receipt.schema_version == RECEIPT_SCHEMA_VERSION {
+            if let Some(requested_slice) = &receipt.requested_slice {
+                if identity.slice != *requested_slice {
+                    bail!("systemd slice no longer matches the receipt");
+                }
+            }
+            for (name, expected, actual) in [
+                (
+                    "MemoryHigh",
+                    receipt.limits.memory_high_bytes,
+                    identity.memory_high,
+                ),
+                (
+                    "MemoryMax",
+                    receipt.limits.memory_max_bytes,
+                    identity.memory_max,
+                ),
+                (
+                    "MemorySwapMax",
+                    receipt.limits.memory_swap_max_bytes,
+                    identity.memory_swap_max,
+                ),
+                ("TasksMax", receipt.limits.tasks_max, identity.tasks_max),
+            ] {
+                if expected.is_some_and(|expected| expected != actual) {
+                    bail!("systemd {name} no longer matches the receipt");
+                }
+            }
+            if let Some(percent) = receipt.limits.cpu_quota_percent {
+                let expected = (percent * 10_000.0).round() as u64;
+                if identity.cpu_quota_per_sec_usec != expected {
+                    bail!("systemd CPU quota no longer matches the receipt");
+                }
+            }
+            if receipt.session_kind == Some(SessionKind::ClaudeCode)
+                && !is_direct_claude_service_cgroup(&identity.control_group)
+            {
+                bail!("Claude Code service is no longer directly beneath claude-code.slice");
+            }
+            if receipt.session_kind == Some(SessionKind::ClaudeCode)
+                && identity.managed_oom_preference != "omit"
+            {
+                bail!("Claude Code service no longer has ManagedOOMPreference=omit");
+            }
+        }
         Ok(Some(identity))
+    }
+
+    fn reconcile_legacy(&self, receipt: &BindingReceipt) -> OwnershipState {
+        let unit_present = match self.identity_if_present(receipt) {
+            Ok(unit) => unit.is_some(),
+            Err(error) => {
+                return OwnershipState::AmbiguousBinding(format!(
+                    "legacy unit identity could not be verified: {error:#}"
+                ))
+            }
+        };
+        let target_present = match mux_target_exists(&receipt.mux_target) {
+            Ok(present) => present,
+            Err(error) => {
+                return OwnershipState::AmbiguousBinding(format!(
+                    "legacy multiplexer target could not be probed: {error:#}"
+                ))
+            }
+        };
+        match (unit_present, target_present) {
+            (true, true) => OwnershipState::LegacyRestartRequired(
+                "v1 service remains attachable but has no workload-anchor proof; exit and relaunch to gain resource ownership".into(),
+            ),
+            (false, false) => OwnershipState::StaleBinding(
+                "legacy service and private multiplexer target are both absent".into(),
+            ),
+            _ => OwnershipState::AmbiguousBinding(
+                "legacy unit and private multiplexer target are only partially present".into(),
+            ),
+        }
     }
 
     fn wait_for_unit_exit(&self, invocation_id: &[u8], timeout: Duration) -> Result<bool> {
@@ -687,9 +1377,49 @@ impl SupervisionBackend for LinuxSystemdBackend {
     }
 
     fn reconcile(&self, receipt: &BindingReceipt) -> Result<OwnershipState> {
-        match self.verified_binding(receipt) {
-            Ok(_) => Ok(OwnershipState::OwnedVerified(Box::new(receipt.clone()))),
-            Err(error) => Ok(OwnershipState::StaleBinding(format!("{error:#}"))),
+        if receipt.is_legacy() {
+            return Ok(self.reconcile_legacy(receipt));
+        }
+        let unit_present = match self.identity_if_present(receipt) {
+            Ok(unit) => unit.is_some(),
+            Err(error) => {
+                return Ok(OwnershipState::AmbiguousBinding(format!(
+                    "unit identity could not be verified: {error:#}"
+                )))
+            }
+        };
+        let target_present = match mux_target_exists(&receipt.mux_target) {
+            Ok(present) => present,
+            Err(error) => {
+                return Ok(OwnershipState::AmbiguousBinding(format!(
+                    "multiplexer target could not be probed: {error:#}"
+                )))
+            }
+        };
+        match (unit_present, target_present) {
+            (false, false) => Ok(OwnershipState::StaleBinding(
+                "service and private multiplexer target are both absent".into(),
+            )),
+            (true, true) => {
+                let anchor = receipt
+                    .workload_anchor
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("current receipt is missing workload-anchor proof"))?;
+                match verify_workload_anchor(anchor, &receipt.control_group, &receipt.mux_target) {
+                    Ok(ContainmentStatus::Verified) => {
+                        Ok(OwnershipState::OwnedVerified(Box::new(receipt.clone())))
+                    }
+                    Ok(ContainmentStatus::Split(reason)) => {
+                        Ok(OwnershipState::SplitContainment(reason))
+                    }
+                    Err(error) => Ok(OwnershipState::AmbiguousBinding(format!(
+                        "workload-anchor proof could not be verified: {error:#}"
+                    ))),
+                }
+            }
+            _ => Ok(OwnershipState::AmbiguousBinding(
+                "service and private multiplexer target are only partially present".into(),
+            )),
         }
     }
 
@@ -705,16 +1435,16 @@ impl SupervisionBackend for LinuxSystemdBackend {
     }
 
     fn stop_unit(&self, receipt: &BindingReceipt) -> Result<ActionResult> {
+        let invocation_id = decode_hex(&receipt.invocation_id)?;
         if self.identity_if_present(receipt)?.is_none() {
             return Ok(ActionResult {
                 logical_id: receipt.logical_id.clone(),
                 requested: ActionStage::SystemdStop,
                 attempted: Vec::new(),
                 completed: true,
-                final_state: "verified invocation was already inactive".into(),
+                final_state: "verified systemd invocation was already inactive".into(),
             });
         }
-        let invocation_id = decode_hex(&receipt.invocation_id)?;
         self.api.stop_unit(&receipt.unit_name)?;
         let completed = self.wait_for_unit_exit(&invocation_id, STOP_OBSERVE_TIMEOUT)?;
         Ok(ActionResult {
@@ -732,15 +1462,7 @@ impl SupervisionBackend for LinuxSystemdBackend {
     }
 
     fn force_kill(&self, receipt: &BindingReceipt) -> Result<ActionResult> {
-        if self.identity_if_present(receipt)?.is_none() {
-            return Ok(ActionResult {
-                logical_id: receipt.logical_id.clone(),
-                requested: ActionStage::ForceKill,
-                attempted: Vec::new(),
-                completed: true,
-                final_state: "verified invocation was already inactive".into(),
-            });
-        }
+        self.verified_binding(receipt)?;
         let invocation_id = decode_hex(&receipt.invocation_id)?;
         self.api.kill_unit(&receipt.unit_name)?;
         let completed = self.wait_for_unit_exit(&invocation_id, KILL_OBSERVE_TIMEOUT)?;
@@ -819,6 +1541,14 @@ fn capability_report(api: &dyn SystemdApi, cgroup_root: &Path) -> CapabilityRepo
     actions.insert(ActionKind::ForceKill, CapabilityState::Supported);
     limits.insert(
         LimitKind::MemoryHigh,
+        controller_state(&controllers, "memory"),
+    );
+    limits.insert(
+        LimitKind::MemoryMax,
+        controller_state(&controllers, "memory"),
+    );
+    limits.insert(
+        LimitKind::MemorySwapMax,
         controller_state(&controllers, "memory"),
     );
     limits.insert(LimitKind::CpuQuota, controller_state(&controllers, "cpu"));
@@ -983,6 +1713,298 @@ impl MetricValueU64Ext for MetricValue<u64> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContainmentStatus {
+    Verified,
+    Split(String),
+}
+
+fn wait_for_workload_anchor(
+    expected: &ExpectedAnchor,
+    control_group: &str,
+    mux_target: &MuxTarget,
+    timeout: Duration,
+) -> Result<WorkloadAnchorProof> {
+    super::model::validate_workload_marker_shape(&expected.marker_path, &expected.nonce)?;
+    validate_runtime_workload_path(&expected.marker_path, &expected.nonce, "marker")?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match read_workload_marker(&expected.marker_path) {
+            Ok(marker) => {
+                if marker.nonce != expected.nonce {
+                    bail!("workload marker nonce does not match the launch specification");
+                }
+                let proof = WorkloadAnchorProof {
+                    protocol_version: marker.protocol_version,
+                    nonce: marker.nonce,
+                    marker_path: expected.marker_path.clone(),
+                    pid: marker.pid,
+                    start_time_ticks: marker.start_time_ticks,
+                };
+                match verify_workload_anchor(&proof, control_group, mux_target)? {
+                    ContainmentStatus::Verified => return Ok(proof),
+                    ContainmentStatus::Split(reason) => bail!("{reason}"),
+                }
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) if !expected.marker_path.exists() => {
+                let _ = error;
+            }
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            bail!("workload anchor did not appear within {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn read_workload_marker(path: &Path) -> Result<WorkloadMarker> {
+    let uid = rustix::process::geteuid().as_raw();
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o600
+    {
+        bail!("workload marker is not an owner-only regular file");
+    }
+    let marker: WorkloadMarker =
+        toml::from_str(&fs::read_to_string(path)?).context("parsing workload marker")?;
+    if marker.protocol_version != ANCHOR_PROTOCOL_VERSION || marker.nonce.len() < 32 {
+        bail!("unsupported workload marker protocol");
+    }
+    Ok(marker)
+}
+
+fn process_environment_value<'a>(environment: &'a [u8], key: &str) -> Option<&'a [u8]> {
+    let prefix = format!("{key}=");
+    environment
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+}
+
+fn verify_mux_anchor_with(
+    proof: &WorkloadAnchorProof,
+    mux_target: &MuxTarget,
+    environment: &[u8],
+    tmux_pane_pid: impl FnOnce(&Path, &str) -> Result<u32>,
+) -> Result<()> {
+    match mux_target {
+        MuxTarget::TmuxPrivate { socket, session } => {
+            let pane_pid = tmux_pane_pid(socket, session)?;
+            if pane_pid != proof.pid {
+                bail!(
+                    "workload root PID {} does not match exact tmux pane PID {pane_pid}",
+                    proof.pid
+                );
+            }
+        }
+        MuxTarget::TmuxShared { .. } => {
+            bail!("current workload proof cannot bind to a shared tmux target")
+        }
+        MuxTarget::Zellij {
+            session,
+            runtime_dir: Some(runtime_dir),
+        } => {
+            if process_environment_value(environment, "ZELLIJ_SESSION_NAME")
+                != Some(session.as_bytes())
+            {
+                bail!("workload root is not bound to the exact Zellij session");
+            }
+            if process_environment_value(environment, "XDG_RUNTIME_DIR")
+                != Some(runtime_dir.as_os_str().as_encoded_bytes())
+            {
+                bail!("workload root is not bound to the exact Zellij runtime directory");
+            }
+        }
+        MuxTarget::Zellij {
+            runtime_dir: None, ..
+        } => bail!("current workload proof requires an exact Zellij runtime directory"),
+    }
+    Ok(())
+}
+
+fn verify_workload_anchor(
+    proof: &WorkloadAnchorProof,
+    control_group: &str,
+    mux_target: &MuxTarget,
+) -> Result<ContainmentStatus> {
+    super::model::validate_workload_marker_shape(&proof.marker_path, &proof.nonce)?;
+    validate_runtime_workload_path(&proof.marker_path, &proof.nonce, "marker")?;
+    let marker = read_workload_marker(&proof.marker_path)?;
+    if !marker_matches_proof(&marker, proof) {
+        bail!("workload marker no longer matches the receipt");
+    }
+    if process_start_time_ticks(proof.pid)? != proof.start_time_ticks {
+        bail!("workload root PID was reused");
+    }
+    let environment = fs::read(format!("/proc/{}/environ", proof.pid))?;
+    let expected_nonce = format!("PORTAGENTY_WORKLOAD_NONCE={}", proof.nonce);
+    if !environment
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == expected_nonce.as_bytes())
+    {
+        bail!("workload root nonce is absent from /proc");
+    }
+    verify_mux_anchor_with(proof, mux_target, &environment, |socket, session| {
+        TmuxAdapter::with_socket(socket).pane_pid(session)
+    })?;
+    let root_cgroup = process_cgroup(proof.pid)?;
+    let descendants = bounded_descendants(proof.pid)?;
+    let mut descendant_cgroups = Vec::new();
+    for pid in descendants {
+        let cgroup = match process_cgroup(pid) {
+            Ok(cgroup) => cgroup,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        descendant_cgroups.push((pid, cgroup));
+    }
+    classify_containment_paths(control_group, &root_cgroup, &descendant_cgroups)
+}
+
+fn classify_pending_launch(
+    creator_alive: bool,
+    unit_present: bool,
+    target_present: bool,
+    marker_present: bool,
+) -> PendingLaunchState {
+    let evidence = format!(
+        "creator_alive={creator_alive}, unit_present={unit_present}, target_present={target_present}, marker_present={marker_present}"
+    );
+    if creator_alive {
+        PendingLaunchState::Active(evidence)
+    } else if !unit_present && !target_present && !marker_present {
+        PendingLaunchState::Dead(evidence)
+    } else {
+        PendingLaunchState::Ambiguous(evidence)
+    }
+}
+
+fn classify_containment_paths(
+    control_group: &str,
+    root_cgroup: &str,
+    descendants: &[(u32, String)],
+) -> Result<ContainmentStatus> {
+    if root_cgroup != control_group {
+        return Ok(ContainmentStatus::Split(format!(
+            "workload root escaped the receipted service cgroup into {root_cgroup}"
+        )));
+    }
+    for (pid, cgroup) in descendants {
+        if cgroup != control_group {
+            let label = if cgroup.contains("/background.slice/") {
+                "intentional external background scope"
+            } else {
+                "escaped descendant"
+            };
+            return Ok(ContainmentStatus::Split(format!(
+                "{label} PID {pid} is in {cgroup}; the complete workload is not owned"
+            )));
+        }
+    }
+    Ok(ContainmentStatus::Verified)
+}
+
+fn process_start_time_ticks(pid: u32) -> Result<u64> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let close = raw
+        .rfind(')')
+        .ok_or_else(|| anyhow!("malformed /proc/{pid}/stat"))?;
+    raw[close + 1..]
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow!("missing start time in /proc/{pid}/stat"))?
+        .parse()
+        .with_context(|| format!("parsing /proc/{pid}/stat start time"))
+}
+
+fn process_cgroup(pid: u32) -> Result<String> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    let mut unified = raw.lines().filter_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        let hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        (hierarchy == "0" && controllers.is_empty()).then(|| path.to_string())
+    });
+    let path = unified
+        .next()
+        .ok_or_else(|| anyhow!("PID {pid} has no unified cgroup-v2 entry"))?;
+    if unified.next().is_some() {
+        bail!("PID {pid} has multiple unified cgroup-v2 entries");
+    }
+    super::model::validate_control_group(&path)?;
+    Ok(path)
+}
+
+fn bounded_descendants(root: u32) -> Result<Vec<u32>> {
+    bounded_descendants_in(Path::new("/proc"), root)
+}
+
+fn bounded_descendants_in(proc_root: &Path, root: u32) -> Result<Vec<u32>> {
+    let mut queue = VecDeque::from([root]);
+    let mut seen = HashSet::from([root]);
+    let mut descendants = Vec::new();
+    while let Some(pid) = queue.pop_front() {
+        let task_dir = proc_root.join(pid.to_string()).join("task");
+        let entries = match fs::read_dir(&task_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && pid != root => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", task_dir.display()))
+            }
+        };
+        let mut tids = 0usize;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", task_dir.display()))?;
+            let Some(tid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|tid| tid.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            tids += 1;
+            if tids > MAX_DESCENDANTS {
+                bail!("workload thread walk exceeded {MAX_DESCENDANTS} threads for PID {pid}");
+            }
+            let children_path = task_dir.join(tid.to_string()).join("children");
+            let raw = match fs::read_to_string(&children_path) {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading {}", children_path.display()))
+                }
+            };
+            for child in raw.split_whitespace() {
+                let child: u32 = child
+                    .parse()
+                    .with_context(|| format!("parsing child PID in {}", children_path.display()))?;
+                if seen.insert(child) {
+                    if seen.len() > MAX_DESCENDANTS {
+                        bail!("workload descendant walk exceeded {MAX_DESCENDANTS} processes");
+                    }
+                    descendants.push(child);
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+    Ok(descendants)
+}
+
 fn wait_for_mux_target(target: &MuxTarget, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1066,10 +2088,46 @@ fn validated_runtime_dir() -> Result<PathBuf> {
     Ok(candidate)
 }
 
+fn validate_owner_private_dir(path: &Path, label: &str) -> Result<()> {
+    let uid = rustix::process::geteuid().as_raw();
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o700
+    {
+        bail!("{label} is not an owner-only regular directory");
+    }
+    Ok(())
+}
+
+fn create_owner_private_dir(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+                format!("setting private runtime permissions on {}", path.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("creating {}", path.display())),
+    }
+    validate_owner_private_dir(path, "runtime subdirectory")
+}
+
 fn ensure_private_runtime_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("setting private runtime permissions on {}", path.display()))
+    let runtime_dir = validated_runtime_dir()?;
+    let portagenty = runtime_dir.join("portagenty");
+    let allowed = [
+        portagenty.join("tmux"),
+        portagenty.join("zellij"),
+        portagenty.join("workloads"),
+    ];
+    if !allowed.iter().any(|candidate| candidate == path) {
+        bail!("private runtime directory is outside the exact Portagenty namespace");
+    }
+    create_owner_private_dir(&portagenty)?;
+    create_owner_private_dir(path)
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
@@ -1089,6 +2147,25 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = fs::remove_file(path);
     }
     result
+}
+
+fn supervised_tmux_environments(
+    overrides: &BTreeMap<String, String>,
+    runtime_dir: &Path,
+) -> Result<(Vec<String>, BTreeMap<String, String>)> {
+    let runtime = path_to_utf8(runtime_dir, "runtime directory")?;
+    let mut pane_environment = overrides.clone();
+    pane_environment.insert("XDG_RUNTIME_DIR".into(), runtime.clone());
+    pane_environment.insert(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        format!("unix:path={runtime}/bus"),
+    );
+
+    let mut server_environment = sanitized_environment(overrides)?;
+    server_environment.retain(|entry| {
+        !entry.starts_with("XDG_RUNTIME_DIR=") && !entry.starts_with("DBUS_SESSION_BUS_ADDRESS=")
+    });
+    Ok((server_environment, pane_environment))
 }
 
 fn sanitized_environment_with_runtime(
@@ -1222,8 +2299,85 @@ mod tests {
         assert_eq!(size.ws_col, 80);
     }
 
+    #[test]
+    fn descendant_walk_reads_children_from_every_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        for (pid, tids) in [(10, vec![10, 11]), (20, vec![20]), (30, vec![30])] {
+            for tid in tids {
+                fs::create_dir_all(temp.path().join(format!("{pid}/task/{tid}"))).unwrap();
+                fs::write(temp.path().join(format!("{pid}/task/{tid}/children")), "").unwrap();
+            }
+        }
+        fs::write(temp.path().join("10/task/11/children"), "20").unwrap();
+        fs::write(temp.path().join("20/task/20/children"), "30").unwrap();
+
+        assert_eq!(
+            bounded_descendants_in(temp.path(), 10).unwrap(),
+            vec![20, 30]
+        );
+    }
+
+    #[test]
+    fn mux_anchor_proof_binds_to_exact_tmux_and_zellij_targets() {
+        let proof = WorkloadAnchorProof {
+            protocol_version: ANCHOR_PROTOCOL_VERSION,
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            marker_path: PathBuf::from(
+                "/run/user/1000/portagenty/workloads/0123456789abcdef0123456789abcdef.marker.toml",
+            ),
+            pid: 123,
+            start_time_ticks: 456,
+        };
+        let socket = PathBuf::from("/run/user/1000/portagenty/test/tmux.sock");
+        let tmux = MuxTarget::TmuxPrivate {
+            socket: socket.clone(),
+            session: "exact-session".into(),
+        };
+        verify_mux_anchor_with(&proof, &tmux, b"", |actual_socket, actual_session| {
+            assert_eq!(actual_socket, socket);
+            assert_eq!(actual_session, "exact-session");
+            Ok(123)
+        })
+        .unwrap();
+        assert!(verify_mux_anchor_with(&proof, &tmux, b"", |_, _| Ok(999)).is_err());
+
+        let zellij = MuxTarget::Zellij {
+            session: "exact-zellij".into(),
+            runtime_dir: Some(PathBuf::from("/run/user/1000/portagenty/zellij")),
+        };
+        let environment =
+            b"ZELLIJ_SESSION_NAME=exact-zellij\0XDG_RUNTIME_DIR=/run/user/1000/portagenty/zellij\0";
+        verify_mux_anchor_with(&proof, &zellij, environment, |_, _| Ok(0)).unwrap();
+        let replaced =
+            b"ZELLIJ_SESSION_NAME=replaced\0XDG_RUNTIME_DIR=/run/user/1000/portagenty/zellij\0";
+        assert!(verify_mux_anchor_with(&proof, &zellij, replaced, |_, _| Ok(0)).is_err());
+    }
+
+    #[test]
+    fn supervised_tmux_hides_user_bus_from_server_and_restores_it_to_pane() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("DBUS_SESSION_BUS_ADDRESS".into(), "malicious".into());
+        overrides.insert("XDG_RUNTIME_DIR".into(), "/tmp/malicious".into());
+        overrides.insert("CUSTOM".into(), "kept".into());
+        let runtime = Path::new("/run/user/1000");
+        let (server, pane) = supervised_tmux_environments(&overrides, runtime).unwrap();
+        assert!(!server.iter().any(|entry| {
+            entry.starts_with("DBUS_SESSION_BUS_ADDRESS=") || entry.starts_with("XDG_RUNTIME_DIR=")
+        }));
+        assert!(server.iter().any(|entry| entry == "CUSTOM=kept"));
+        assert_eq!(
+            pane.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1000")
+        );
+        assert_eq!(
+            pane.get("DBUS_SESSION_BUS_ADDRESS").map(String::as_str),
+            Some("unix:path=/run/user/1000/bus")
+        );
+    }
+
     struct FakeSystemd {
         manager: ManagerInfo,
+        claude_slice: Option<ClaudeSliceIdentity>,
         unit: Mutex<Option<SystemdUnitIdentity>>,
         stops: Mutex<Vec<String>>,
         kills: Mutex<Vec<String>>,
@@ -1232,6 +2386,10 @@ mod tests {
     impl SystemdApi for FakeSystemd {
         fn manager_info(&self) -> Result<ManagerInfo> {
             Ok(self.manager.clone())
+        }
+
+        fn claude_slice_info(&self) -> Result<Option<ClaudeSliceIdentity>> {
+            Ok(self.claude_slice.clone())
         }
 
         fn start_transient_service(
@@ -1243,6 +2401,15 @@ mod tests {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| anyhow!("no fake unit"))
+        }
+
+        fn unit_by_name(&self, unit_name: &str) -> Result<Option<SystemdUnitIdentity>> {
+            Ok(self
+                .unit
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|unit| unit.unit_name == unit_name))
         }
 
         fn unit_by_invocation_id(
@@ -1268,6 +2435,40 @@ mod tests {
         }
     }
 
+    fn fake_unit(
+        unit_name: impl Into<String>,
+        invocation_id: Vec<u8>,
+        control_group: impl Into<String>,
+    ) -> SystemdUnitIdentity {
+        SystemdUnitIdentity {
+            unit_name: unit_name.into(),
+            invocation_id,
+            control_group: control_group.into(),
+            active_state: "active".into(),
+            sub_state: "running".into(),
+            transient: true,
+            slice: "app.slice".into(),
+            memory_high: UINT64_MAX,
+            memory_max: UINT64_MAX,
+            memory_swap_max: UINT64_MAX,
+            cpu_quota_per_sec_usec: UINT64_MAX,
+            tasks_max: UINT64_MAX,
+            managed_oom_preference: "none".into(),
+        }
+    }
+
+    fn standard_claude_slice(manager_control_group: &str) -> ClaudeSliceIdentity {
+        ClaudeSliceIdentity {
+            control_group: format!("{manager_control_group}/claude.slice/claude-code.slice"),
+            memory_high: 8 * ResourceLimits::GIB,
+            memory_max: 10 * ResourceLimits::GIB,
+            memory_swap_max: ResourceLimits::GIB,
+            cpu_quota_per_sec_usec: 16 * 1_000_000,
+            tasks_max: 4096,
+            managed_oom_preference: "omit".into(),
+        }
+    }
+
     fn session() -> Session {
         Session {
             name: "agent".into(),
@@ -1279,9 +2480,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn new_binding_receipts_use_v2_workload_evidence() {
+        let logical_id =
+            LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "shell").unwrap();
+        let nonce = "0123456789abcdef0123456789abcdef".to_string();
+        let marker_path = PathBuf::from(format!("/tmp/portagenty/workloads/{nonce}.marker.toml"));
+        let prepared = PreparedLaunch {
+            logical_id: logical_id.clone(),
+            spec: TransientServiceSpec {
+                unit_name: "portagenty-wtest.service".into(),
+                session_kind: Some(SessionKind::Shell),
+                requested_slice: None,
+                executable: PathBuf::from("/usr/bin/tmux"),
+                args: vec!["new-session".into()],
+                working_directory: PathBuf::from("/tmp"),
+                environment: Vec::new(),
+                limits: ResourceLimits::default(),
+                pty_stdio: None,
+            },
+            mux_target: MuxTarget::TmuxPrivate {
+                socket: PathBuf::from("/tmp/portagenty-test.sock"),
+                session: "main".into(),
+            },
+            expected_anchor: ExpectedAnchor {
+                nonce: nonce.clone(),
+                marker_path: marker_path.clone(),
+            },
+            cleanup_paths: Vec::new(),
+        };
+        let identity = fake_unit(
+            "portagenty-wtest.service",
+            vec![1; 16],
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/portagenty-wtest.service",
+        );
+        let receipt = current_binding_receipt(
+            &prepared,
+            &identity,
+            WorkloadAnchorProof {
+                protocol_version: ANCHOR_PROTOCOL_VERSION,
+                nonce,
+                marker_path,
+                pid: 123,
+                start_time_ticks: 456,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(receipt.schema_version, RECEIPT_SCHEMA_VERSION);
+        assert_eq!(receipt.logical_id, logical_id);
+        assert!(receipt.workload_anchor.is_some());
+    }
+
     fn stale_receipt() -> BindingReceipt {
         BindingReceipt {
-            schema_version: RECEIPT_SCHEMA_VERSION,
+            schema_version: LEGACY_RECEIPT_SCHEMA_VERSION,
             logical_id: LogicalSessionId::new(
                 "550e8400-e29b-41d4-a716-446655440000",
                 "shell",
@@ -1296,7 +2549,10 @@ mod tests {
                 session: "opaque-target".into(),
             },
             observed_at_unix_ms: 1,
-            limits: SoftLimits::default(),
+            limits: ResourceLimits::default(),
+            session_kind: None,
+            requested_slice: None,
+            workload_anchor: None,
         }
     }
 
@@ -1307,6 +2563,7 @@ mod tests {
                     version: "259".into(),
                     control_group: "/user.slice/user-1000.slice/user@1000.service".into(),
                 },
+                claude_slice: None,
                 unit: Mutex::new(unit),
                 stops: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
@@ -1315,16 +2572,36 @@ mod tests {
         )
     }
 
+    fn fake_backend_with_slice(slice: ClaudeSliceIdentity) -> LinuxSystemdBackend {
+        LinuxSystemdBackend::with_api(
+            Arc::new(FakeSystemd {
+                manager: ManagerInfo {
+                    version: "259".into(),
+                    control_group: "/user.slice/user-1000.slice/user@1000.service".into(),
+                },
+                claude_slice: Some(slice),
+                unit: Mutex::new(None),
+                stops: Mutex::new(Vec::new()),
+                kills: Mutex::new(Vec::new()),
+            }),
+            PathBuf::from("/sys/fs/cgroup"),
+        )
+    }
+
     #[test]
-    fn service_properties_include_soft_limits_and_safe_stop_policy() {
+    fn service_properties_include_all_resource_limits_and_safe_stop_policy() {
         let spec = TransientServiceSpec {
             unit_name: "portagenty-wx-gy.service".into(),
+            session_kind: Some(SessionKind::ClaudeCode),
+            requested_slice: Some(CLAUDE_CODE_SLICE.into()),
             executable: PathBuf::from("/usr/bin/tmux"),
             args: vec!["new-session".into()],
             working_directory: PathBuf::from("/tmp"),
             environment: vec!["PATH=/usr/bin".into()],
-            limits: SoftLimits {
+            limits: ResourceLimits {
                 memory_high_bytes: Some(1024),
+                memory_max_bytes: Some(2048),
+                memory_swap_max_bytes: Some(512),
                 cpu_quota_percent: Some(250.0),
                 tasks_max: Some(50),
             },
@@ -1340,7 +2617,11 @@ mod tests {
             "SendSIGKILL",
             "OOMPolicy",
             "ExecStart",
+            "Slice",
+            "ManagedOOMPreference",
             "MemoryHigh",
+            "MemoryMax",
+            "MemorySwapMax",
             "CPUQuotaPerSecUSec",
             "TasksMax",
         ] {
@@ -1349,14 +2630,125 @@ mod tests {
     }
 
     #[test]
+    fn generic_service_omits_claude_only_properties() {
+        let spec = TransientServiceSpec {
+            unit_name: "portagenty-wx-gy.service".into(),
+            session_kind: Some(SessionKind::Shell),
+            requested_slice: None,
+            executable: PathBuf::from("/usr/bin/tmux"),
+            args: vec!["new-session".into()],
+            working_directory: PathBuf::from("/tmp"),
+            environment: Vec::new(),
+            limits: ResourceLimits {
+                memory_high_bytes: Some(1024),
+                memory_max_bytes: Some(2048),
+                memory_swap_max_bytes: Some(512),
+                cpu_quota_percent: Some(100.0),
+                tasks_max: Some(50),
+            },
+            pty_stdio: None,
+        };
+        let properties = service_properties(&spec).unwrap();
+        let names: std::collections::HashSet<&str> =
+            properties.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert!(!names.contains("Slice"));
+        assert!(!names.contains("ManagedOOMPreference"));
+        for resource_limit in [
+            "MemoryHigh",
+            "MemoryMax",
+            "MemorySwapMax",
+            "CPUQuotaPerSecUSec",
+            "TasksMax",
+        ] {
+            assert!(names.contains(resource_limit), "missing {resource_limit}");
+        }
+    }
+
+    #[test]
+    fn claude_slice_preflight_rejects_weak_or_malformed_aggregate_policy() {
+        let manager = "/user.slice/user-1000.slice/user@1000.service";
+        let healthy = standard_claude_slice(manager);
+        fake_backend_with_slice(healthy.clone())
+            .preflight_session_policy(Some(SessionKind::ClaudeCode))
+            .unwrap();
+
+        let mut unlimited = healthy.clone();
+        unlimited.memory_max = UINT64_MAX;
+        assert!(fake_backend_with_slice(unlimited)
+            .preflight_session_policy(Some(SessionKind::ClaudeCode))
+            .is_err());
+
+        let mut inconsistent = healthy.clone();
+        inconsistent.memory_high = inconsistent.memory_max + 1;
+        assert!(fake_backend_with_slice(inconsistent)
+            .preflight_session_policy(Some(SessionKind::ClaudeCode))
+            .is_err());
+
+        let mut wrong_hierarchy = healthy.clone();
+        wrong_hierarchy.control_group = format!("{manager}/app.slice/claude-code.slice");
+        assert!(fake_backend_with_slice(wrong_hierarchy)
+            .preflight_session_policy(Some(SessionKind::ClaudeCode))
+            .is_err());
+
+        let mut wrong_oomd = healthy;
+        wrong_oomd.managed_oom_preference = "none".into();
+        assert!(fake_backend_with_slice(wrong_oomd)
+            .preflight_session_policy(Some(SessionKind::ClaudeCode))
+            .is_err());
+    }
+
+    #[test]
+    fn service_policy_readback_rejects_wrong_limit_or_nested_slice_placement() {
+        let spec = TransientServiceSpec {
+            unit_name: "portagenty-wx-gy.service".into(),
+            session_kind: Some(SessionKind::ClaudeCode),
+            requested_slice: Some(CLAUDE_CODE_SLICE.into()),
+            executable: PathBuf::from("/usr/bin/tmux"),
+            args: vec!["new-session".into()],
+            working_directory: PathBuf::from("/tmp"),
+            environment: Vec::new(),
+            limits: ResourceLimits::claude_defaults(),
+            pty_stdio: None,
+        };
+        let mut identity = fake_unit(
+            spec.unit_name.clone(),
+            vec![1; 16],
+            "/user.slice/user-1000.slice/user@1000.service/claude.slice/claude-code.slice/portagenty-wx-gy.service",
+        );
+        identity.slice = CLAUDE_CODE_SLICE.into();
+        identity.memory_high = 3 * ResourceLimits::GIB;
+        identity.memory_max = 5 * ResourceLimits::GIB;
+        identity.memory_swap_max = 512 * ResourceLimits::MIB;
+        identity.cpu_quota_per_sec_usec = 8_000_000;
+        identity.tasks_max = 1200;
+        identity.managed_oom_preference = "omit".into();
+        fake_backend(None)
+            .verify_service_policy(&identity, &spec)
+            .unwrap();
+
+        identity.memory_max += 1;
+        assert!(fake_backend(None)
+            .verify_service_policy(&identity, &spec)
+            .is_err());
+        identity.memory_max = 5 * ResourceLimits::GIB;
+        identity.control_group = "/user.slice/user-1000.slice/user@1000.service/claude.slice/claude-code.slice/nested.slice/portagenty-wx-gy.service".into();
+        assert!(fake_backend(None)
+            .verify_service_policy(&identity, &spec)
+            .is_err());
+    }
+
+    #[test]
     fn pty_stdio_becomes_controlling_terminal_properties() {
         let spec = TransientServiceSpec {
             unit_name: "portagenty-wx-gy.service".into(),
+            session_kind: None,
+            requested_slice: None,
             executable: PathBuf::from("/usr/bin/zellij"),
             args: vec!["--session".into(), "test".into()],
             working_directory: PathBuf::from("/tmp"),
             environment: vec!["PATH=/usr/bin".into()],
-            limits: SoftLimits::default(),
+            limits: ResourceLimits::default(),
             pty_stdio: Some(open_pty_stdio().unwrap()),
         };
         let properties = service_properties(&spec).unwrap();
@@ -1410,6 +2802,7 @@ mod tests {
                 version: "259".into(),
                 control_group: manager.into(),
             },
+            claude_slice: None,
             unit: Mutex::new(None),
             stops: Mutex::new(Vec::new()),
             kills: Mutex::new(Vec::new()),
@@ -1432,20 +2825,18 @@ mod tests {
                 version: "259".into(),
                 control_group: manager_cgroup.into(),
             },
-            unit: Mutex::new(Some(SystemdUnitIdentity {
-                unit_name: "portagenty-wx-gy.service".into(),
-                invocation_id: vec![1, 2, 3],
-                control_group: unit_cgroup.clone(),
-                active_state: "active".into(),
-                sub_state: "running".into(),
-                transient: true,
-            })),
+            claude_slice: None,
+            unit: Mutex::new(Some(fake_unit(
+                "portagenty-wx-gy.service",
+                vec![1, 2, 3],
+                unit_cgroup.clone(),
+            ))),
             stops: Mutex::new(Vec::new()),
             kills: Mutex::new(Vec::new()),
         });
         let backend = LinuxSystemdBackend::with_api(api, temp.path().to_path_buf());
         let receipt = BindingReceipt {
-            schema_version: RECEIPT_SCHEMA_VERSION,
+            schema_version: LEGACY_RECEIPT_SCHEMA_VERSION,
             logical_id: LogicalSessionId::new(
                 "550e8400-e29b-41d4-a716-446655440000",
                 session().name,
@@ -1460,12 +2851,47 @@ mod tests {
                 session: "main".into(),
             },
             observed_at_unix_ms: 0,
-            limits: SoftLimits::default(),
+            limits: ResourceLimits::default(),
+            session_kind: None,
+            requested_slice: None,
+            workload_anchor: None,
         };
         assert!(matches!(
             backend.reconcile(&receipt).unwrap(),
-            OwnershipState::StaleBinding(_)
+            OwnershipState::AmbiguousBinding(_)
         ));
+    }
+
+    #[test]
+    fn pending_is_dead_only_when_creator_and_all_artifacts_are_absent() {
+        assert!(matches!(
+            classify_pending_launch(false, false, false, false),
+            PendingLaunchState::Dead(_)
+        ));
+        assert!(matches!(
+            classify_pending_launch(true, false, false, false),
+            PendingLaunchState::Active(_)
+        ));
+        for evidence in [
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+            (false, true, true, true),
+        ] {
+            assert!(matches!(
+                classify_pending_launch(evidence.0, evidence.1, evidence.2, evidence.3),
+                PendingLaunchState::Ambiguous(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn non_force_stop_treats_an_absent_exact_invocation_as_complete() {
+        let receipt = stale_receipt();
+        let backend = fake_backend(None);
+        let result = backend.stop_unit(&receipt).unwrap();
+        assert!(result.completed);
+        assert!(result.attempted.is_empty());
     }
 
     #[test]
@@ -1480,6 +2906,59 @@ mod tests {
             .unwrap();
 
         assert!(store.find(&receipt.logical_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn verified_marker_cleanup_requires_exact_path_and_content() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let workloads = temp.path().join("portagenty/workloads");
+        fs::create_dir_all(&workloads).unwrap();
+        fs::set_permissions(
+            temp.path().join("portagenty"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(&workloads, fs::Permissions::from_mode(0o700)).unwrap();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let marker_path = workloads.join(format!("{nonce}.marker.toml"));
+        let proof = WorkloadAnchorProof {
+            protocol_version: ANCHOR_PROTOCOL_VERSION,
+            nonce: nonce.into(),
+            marker_path: marker_path.clone(),
+            pid: 123,
+            start_time_ticks: 456,
+        };
+        write_private_file(
+            &marker_path,
+            toml::to_string(&WorkloadMarker {
+                protocol_version: ANCHOR_PROTOCOL_VERSION,
+                nonce: nonce.into(),
+                pid: 999,
+                start_time_ticks: 456,
+            })
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(remove_verified_workload_marker_in(temp.path(), &proof).is_err());
+        assert!(marker_path.exists());
+
+        fs::remove_file(&marker_path).unwrap();
+        write_private_file(
+            &marker_path,
+            toml::to_string(&WorkloadMarker {
+                protocol_version: ANCHOR_PROTOCOL_VERSION,
+                nonce: nonce.into(),
+                pid: 123,
+                start_time_ticks: 456,
+            })
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
+        remove_verified_workload_marker_in(temp.path(), &proof).unwrap();
+        assert!(!marker_path.exists());
     }
 
     #[test]
@@ -1512,14 +2991,12 @@ mod tests {
                 version: "259".into(),
                 control_group: "/user.slice/user-1000.slice/user@1000.service".into(),
             },
-            unit: Mutex::new(Some(SystemdUnitIdentity {
-                unit_name: receipt.unit_name.clone(),
-                invocation_id: decode_hex(&receipt.invocation_id).unwrap(),
-                control_group: receipt.control_group.clone(),
-                active_state: "active".into(),
-                sub_state: "running".into(),
-                transient: true,
-            })),
+            claude_slice: None,
+            unit: Mutex::new(Some(fake_unit(
+                receipt.unit_name.clone(),
+                decode_hex(&receipt.invocation_id).unwrap(),
+                receipt.control_group.clone(),
+            ))),
             stops: Mutex::new(Vec::new()),
             kills: Mutex::new(Vec::new()),
         });
@@ -1533,6 +3010,43 @@ mod tests {
 
         assert!(format!("{error:#}").contains("still present"));
         assert!(store.find(&receipt.logical_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn containment_classifier_rejects_escaped_root_and_background_descendant() {
+        let expected = "/user.slice/u/app.slice/example.service";
+        assert!(matches!(
+            classify_containment_paths(
+                expected,
+                "/user.slice/u/background.slice/run.scope",
+                &[],
+            )
+            .unwrap(),
+            ContainmentStatus::Split(reason) if reason.contains("workload root escaped")
+        ));
+        assert!(matches!(
+            classify_containment_paths(
+                expected,
+                expected,
+                &[(42, "/user.slice/u/background.slice/build.scope".into())],
+            )
+            .unwrap(),
+            ContainmentStatus::Split(reason)
+                if reason.contains("intentional external background scope")
+                    && reason.contains("not owned")
+        ));
+        assert_eq!(
+            classify_containment_paths(expected, expected, &[(42, expected.into())]).unwrap(),
+            ContainmentStatus::Verified
+        );
+    }
+
+    #[test]
+    fn current_process_proc_identity_is_parseable_without_global_scan() {
+        let pid = std::process::id();
+        assert!(process_start_time_ticks(pid).unwrap() > 0);
+        assert!(process_cgroup(pid).unwrap().starts_with('/'));
+        assert!(!bounded_descendants(pid).unwrap().contains(&pid));
     }
 
     #[test]

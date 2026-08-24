@@ -5,7 +5,11 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
+use crate::domain::SessionKind;
+
+pub const LEGACY_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const RECEIPT_SCHEMA_VERSION: u32 = 2;
+pub const CLAUDE_CODE_SLICE: &str = "claude-code.slice";
 
 /// Stable, user-facing identity for one declared session.
 ///
@@ -89,6 +93,8 @@ pub enum ActionKind {
 #[serde(rename_all = "kebab-case")]
 pub enum LimitKind {
     MemoryHigh,
+    MemoryMax,
+    MemorySwapMax,
     CpuQuota,
     TasksMax,
 }
@@ -157,34 +163,145 @@ impl ActionKind {
 }
 
 impl LimitKind {
-    pub const ALL: [Self; 3] = [Self::MemoryHigh, Self::CpuQuota, Self::TasksMax];
+    pub const ALL: [Self; 5] = [
+        Self::MemoryHigh,
+        Self::MemoryMax,
+        Self::MemorySwapMax,
+        Self::CpuQuota,
+        Self::TasksMax,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub struct SoftLimits {
+pub struct ResourceLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_high_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_swap_max_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_quota_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks_max: Option<u64>,
 }
 
-impl SoftLimits {
-    /// Recommended guardrails for one-click TUI launches. This is deliberately
-    /// not `Default`: scriptable CLI launches remain explicit and unset unless
-    /// the caller supplies supervision flags.
-    pub fn recommended_tui_launch() -> Self {
+impl ResourceLimits {
+    pub const GIB: u64 = 1024 * 1024 * 1024;
+    pub const MIB: u64 = 1024 * 1024;
+
+    pub fn claude_defaults() -> Self {
         Self {
-            memory_high_bytes: Some(12 * 1024 * 1024 * 1024),
-            cpu_quota_percent: Some(300.0),
+            memory_high_bytes: Some(3 * Self::GIB),
+            memory_max_bytes: Some(5 * Self::GIB),
+            memory_swap_max_bytes: Some(512 * Self::MIB),
+            cpu_quota_percent: Some(800.0),
             tasks_max: Some(1200),
         }
     }
 
+    pub fn defaults_for_kind(kind: Option<SessionKind>) -> Self {
+        if kind == Some(SessionKind::ClaudeCode) {
+            Self::claude_defaults()
+        } else {
+            Self::default()
+        }
+    }
+
+    pub fn resolve_for_kind(&self, kind: Option<SessionKind>) -> Result<Self> {
+        let resolved = if kind == Some(SessionKind::ClaudeCode) {
+            let defaults = Self::claude_defaults();
+            Self {
+                memory_high_bytes: self.memory_high_bytes.or(defaults.memory_high_bytes),
+                memory_max_bytes: self.memory_max_bytes.or(defaults.memory_max_bytes),
+                memory_swap_max_bytes: self
+                    .memory_swap_max_bytes
+                    .or(defaults.memory_swap_max_bytes),
+                cpu_quota_percent: self.cpu_quota_percent.or(defaults.cpu_quota_percent),
+                tasks_max: self.tasks_max.or(defaults.tasks_max),
+            }
+        } else {
+            self.clone()
+        };
+        resolved.validate_consistency()?;
+        if kind == Some(SessionKind::ClaudeCode) {
+            let defaults = Self::claude_defaults();
+            for (name, actual, ceiling) in [
+                (
+                    "MemoryHigh",
+                    resolved.memory_high_bytes,
+                    defaults.memory_high_bytes,
+                ),
+                (
+                    "MemoryMax",
+                    resolved.memory_max_bytes,
+                    defaults.memory_max_bytes,
+                ),
+                (
+                    "MemorySwapMax",
+                    resolved.memory_swap_max_bytes,
+                    defaults.memory_swap_max_bytes,
+                ),
+                ("TasksMax", resolved.tasks_max, defaults.tasks_max),
+            ] {
+                if actual
+                    .zip(ceiling)
+                    .is_some_and(|(actual, ceiling)| actual > ceiling)
+                {
+                    return Err(anyhow!(
+                        "Claude Code {name} override is weaker than the standard policy"
+                    ));
+                }
+            }
+            if resolved
+                .cpu_quota_percent
+                .zip(defaults.cpu_quota_percent)
+                .is_some_and(|(actual, ceiling)| actual > ceiling)
+            {
+                return Err(anyhow!(
+                    "Claude Code CPU quota override is weaker than the standard policy"
+                ));
+            }
+        }
+        Ok(resolved)
+    }
+
+    pub fn validate_consistency(&self) -> Result<()> {
+        if self
+            .memory_high_bytes
+            .zip(self.memory_max_bytes)
+            .is_some_and(|(high, max)| high > max)
+        {
+            return Err(anyhow!(
+                "MemoryHigh must be less than or equal to MemoryMax"
+            ));
+        }
+        if self
+            .cpu_quota_percent
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(anyhow!("CPU quota must be a positive finite percentage"));
+        }
+        if [
+            self.memory_high_bytes,
+            self.memory_max_bytes,
+            self.memory_swap_max_bytes,
+            self.tasks_max,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value == 0)
+        {
+            return Err(anyhow!("resource limits must be greater than zero"));
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.memory_high_bytes.is_none()
+            && self.memory_max_bytes.is_none()
+            && self.memory_swap_max_bytes.is_none()
             && self.cpu_quota_percent.is_none()
             && self.tasks_max.is_none()
     }
@@ -194,7 +311,7 @@ impl SoftLimits {
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum SupervisionMode {
     Normal,
-    Supervised { limits: SoftLimits },
+    Supervised { limits: ResourceLimits },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +331,48 @@ pub enum MuxTarget {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WorkloadAnchorProof {
+    pub protocol_version: u32,
+    pub nonce: String,
+    pub marker_path: PathBuf,
+    pub pid: u32,
+    pub start_time_ticks: u64,
+}
+
+pub(crate) fn validate_workload_marker_shape(path: &Path, nonce: &str) -> Result<()> {
+    if nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(anyhow!(
+            "workload nonce must be 32 lowercase hexadecimal characters"
+        ));
+    }
+    let expected_filename = format!("{nonce}.marker.toml");
+    if !path.is_absolute()
+        || path.file_name().and_then(|name| name.to_str()) != Some(expected_filename.as_str())
+        || path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some("workloads")
+        || path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some("portagenty")
+    {
+        return Err(anyhow!(
+            "workload marker must use the exact portagenty/workloads/<nonce>.marker.toml shape"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct BindingReceipt {
@@ -226,16 +385,28 @@ pub struct BindingReceipt {
     pub mux_target: MuxTarget,
     pub observed_at_unix_ms: u64,
     #[serde(default)]
-    pub limits: SoftLimits,
+    pub limits: ResourceLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<SessionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_slice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_anchor: Option<WorkloadAnchorProof>,
 }
 
 impl BindingReceipt {
+    pub fn is_legacy(&self) -> bool {
+        self.schema_version == LEGACY_RECEIPT_SCHEMA_VERSION
+    }
+
     pub fn validate_shape(&self) -> Result<()> {
-        if self.schema_version != RECEIPT_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            LEGACY_RECEIPT_SCHEMA_VERSION | RECEIPT_SCHEMA_VERSION
+        ) {
             return Err(anyhow!(
-                "unsupported supervision receipt schema {} (expected {})",
-                self.schema_version,
-                RECEIPT_SCHEMA_VERSION
+                "unsupported supervision receipt schema {}",
+                self.schema_version
             ));
         }
         self.logical_id.workspace_uuid()?;
@@ -246,6 +417,37 @@ impl BindingReceipt {
             return Err(anyhow!("supervision receipt has an empty invocation id"));
         }
         validate_control_group(&self.control_group)?;
+        self.limits.validate_consistency()?;
+        if self.schema_version == RECEIPT_SCHEMA_VERSION {
+            let anchor = self
+                .workload_anchor
+                .as_ref()
+                .ok_or_else(|| anyhow!("current receipt is missing workload-anchor proof"))?;
+            if anchor.protocol_version != 1 {
+                return Err(anyhow!("invalid workload-anchor proof"));
+            }
+            validate_workload_marker_shape(&anchor.marker_path, &anchor.nonce)?;
+            match self.session_kind {
+                Some(SessionKind::ClaudeCode) => {
+                    if self.requested_slice.as_deref() != Some(CLAUDE_CODE_SLICE) {
+                        return Err(anyhow!(
+                            "Claude Code receipt is missing its requested slice"
+                        ));
+                    }
+                    if self.limits.resolve_for_kind(self.session_kind)? != self.limits {
+                        return Err(anyhow!(
+                            "Claude Code receipt contains a weak resource policy"
+                        ));
+                    }
+                }
+                _ if self.requested_slice.is_some() => {
+                    return Err(anyhow!(
+                        "generic receipt unexpectedly requests a Claude slice"
+                    ));
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 }
@@ -255,6 +457,9 @@ impl BindingReceipt {
 pub enum OwnershipState {
     IdleSupported,
     OwnedVerified(Box<BindingReceipt>),
+    LegacyRestartRequired(String),
+    SplitContainment(String),
+    AmbiguousBinding(String),
     ExistingUnverified,
     Unmanaged,
     StaleBinding(String),
@@ -525,16 +730,46 @@ mod tests {
     }
 
     #[test]
-    fn recommended_tui_limits_do_not_change_empty_default() {
-        assert!(SoftLimits::default().is_empty());
+    fn claude_defaults_are_selected_only_by_explicit_kind() {
+        assert!(ResourceLimits::default().is_empty());
+        assert!(ResourceLimits::defaults_for_kind(None).is_empty());
+        assert!(ResourceLimits::defaults_for_kind(Some(SessionKind::Shell)).is_empty());
         assert_eq!(
-            SoftLimits::recommended_tui_launch(),
-            SoftLimits {
-                memory_high_bytes: Some(12 * 1024_u64.pow(3)),
-                cpu_quota_percent: Some(300.0),
+            ResourceLimits::defaults_for_kind(Some(SessionKind::ClaudeCode)),
+            ResourceLimits {
+                memory_high_bytes: Some(3 * 1024_u64.pow(3)),
+                memory_max_bytes: Some(5 * 1024_u64.pow(3)),
+                memory_swap_max_bytes: Some(512 * 1024_u64.pow(2)),
+                cpu_quota_percent: Some(800.0),
                 tasks_max: Some(1200),
             }
         );
+    }
+
+    #[test]
+    fn claude_overrides_must_be_equal_or_stricter_and_consistent() {
+        assert!(ResourceLimits {
+            memory_high_bytes: Some(4 * ResourceLimits::GIB),
+            ..ResourceLimits::default()
+        }
+        .resolve_for_kind(Some(SessionKind::ClaudeCode))
+        .is_err());
+        assert!(ResourceLimits {
+            memory_high_bytes: Some(4 * ResourceLimits::GIB),
+            memory_max_bytes: Some(3 * ResourceLimits::GIB),
+            ..ResourceLimits::default()
+        }
+        .validate_consistency()
+        .is_err());
+        assert!(ResourceLimits {
+            memory_high_bytes: Some(2 * ResourceLimits::GIB),
+            memory_max_bytes: Some(4 * ResourceLimits::GIB),
+            memory_swap_max_bytes: Some(256 * ResourceLimits::MIB),
+            cpu_quota_percent: Some(400.0),
+            tasks_max: Some(600),
+        }
+        .resolve_for_kind(Some(SessionKind::ClaudeCode))
+        .is_ok());
     }
 
     #[test]

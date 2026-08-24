@@ -171,40 +171,44 @@ integration workflows.
 
 On supported Linux hosts, Portagenty includes a first-party, capability-aware
 supervision backend. It launches an eligible session as a transient systemd user
-service, places the complete workload in one cgroup v2 boundary, and records an
-exact machine-local ownership receipt for its private tmux or Zellij target.
+service and records a machine-local receipt for its private tmux or Zellij target.
+Whole-workload ownership is claimed only when v2 evidence proves the exact workload
+root and every bounded descendant remains in the service cgroup.
 
 <CardGrid>
-  <Card title="Supervision-first TUI launch" icon="rocket">
-    Enter on an eligible idle UUID-backed row first attempts a supervised launch
-    with recommended `12G` Memory High, `300%` CPU, and `1200` tasks. `S` remains
-    the advanced route for editing limits, upgrading a legacy workspace ID, or
-    confirming a restart under supervision.
+  <Card title="Explicit Claude policy" icon="rocket">
+    Only `kind = "claude-code"` selects Claude placement and defaults: `3G`
+    MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, and `1200`
+    tasks. Names and command strings never imply Claude policy; custom Claude
+    values may only be equal or stricter.
   </Card>
   <Card title="Explicit scriptable controls" icon="seti:config">
-    CLI launches remain ordinary unless `--supervise` or a guardrail flag is
-    supplied. CLI limits stay unset unless requested, keeping scripts backward
-    compatible and policy explicit.
+    CLI launches remain ordinary unless `--supervise` or a resource-limit flag is
+    supplied. Generic sessions receive no Claude defaults and stay in normal
+    user-manager placement.
   </Card>
-  <Card title="Soft guardrails" icon="setting">
-    `MemoryHigh` asks the kernel to reclaim memory before pressure becomes severe;
-    it is not a hard memory cap. CPU quota limits aggregate CPU time, and
-    `TasksMax` bounds the cgroup's processes and threads.
+  <Card title="Soft and hard limits" icon="setting">
+    `MemoryHigh` asks the kernel to reclaim memory. `MemoryMax` and
+    `MemorySwapMax` are hard ceilings. CPU quota limits aggregate CPU time, and
+    `TasksMax` bounds processes and threads.
   </Card>
-  <Card title="Current resource inspection" icon="magnifier">
-    Inspect CPU totals and rates, memory and swap, task counts, aggregate I/O,
-    pressure-stall information, cgroup state, applied limits, and event deltas
-    such as memory-high, OOM, task-limit, and CPU-throttling events.
+  <Card title="Structural Claude placement" icon="magnifier">
+    Claude services request `claude-code.slice`, `ManagedOOMPreference=omit`, and
+    finite per-service `TasksMax`. Portagenty requires finite aggregate memory and
+    CPU controls, while aggregate `TasksMax` is optional and may be infinity. It
+    reads back service placement and limits but never creates or modifies the slice.
   </Card>
-  <Card title="Proof-based control" icon="approve-check">
-    Graceful stop and separately confirmed whole-cgroup force-kill are available
-    only after exact receipt, systemd invocation, cgroup, and private target
-    ownership are revalidated.
+  <Card title="Workload-anchor proof" icon="approve-check">
+    The shared tmux/Zellij anchor records a nonce, exact PID, and process start
+    time, then binds proof to the exact tmux pane or Zellij session/runtime target.
+    Portagenty checks the exact cgroup and walks every thread's bounded `/proc`
+    children edges before metrics or control are allowed.
   </Card>
-  <Card title="Safe coexistence" icon="random">
-    Live ordinary sessions attach normally and are never retroactively claimed or
-    migrated. Ambiguous receipts and failures after supervised creation may have
-    begun remain fail-closed.
+  <Card title="Safe transitions and escapes" icon="random">
+    Live v1 services are legacy/restart-required exact-target attach-only. Escaped
+    descendants produce split containment; external `build-contained` children in
+    `background.slice` stay externally bounded and prevent whole-workload control.
+    Partial unit/target presence remains ambiguous and fail-closed.
   </Card>
 </CardGrid>
 
@@ -220,8 +224,10 @@ unattended telemetry.
 If routine TUI Enter reaches an ownership-safe, non-creating preflight failure, it
 announces the reason and may fall back to an ordinary unsupervised launch. Explicit
 `S`, stale replacement, CLI supervision, receipt ambiguity, and failures after
-backend creation may have begun do not silently fall back. Stale cleanup removes
-only an exactly confirmed dead receipt and sends no signal.
+backend creation may have begun do not silently fall back. A pending-launch journal
+protects the creation-to-receipt gap. Stale cleanup removes only an exactly
+confirmed dead receipt and marker and sends no signal; partial presence never
+stale-cleans.
 
 Use [`pa resources`](/portagenty/reference/commands/#pa-resources) for capability,
 status, graceful-stop, and force-kill details. The [schema reference](/portagenty/reference/schema/#id)

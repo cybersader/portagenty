@@ -120,8 +120,11 @@ selection order + `pa claim`'s default session.
   [session commands](#session-commands-aliases-vs-real-binaries)
   section below).
 - **`kind`** (optional) — one of `claude-code`, `opencode`,
-  `editor`, `dev-server`, `shell`, `other`. Drives the TUI's per-row
-  glyph (display-only in v1.x).
+  `editor`, `dev-server`, `shell`, `other`. Drives the TUI's per-row glyph and
+  documented kind-specific launch behavior. Exactly `claude-code` selects
+  kind-aware resume plus the supervised Claude slice/default resource policy.
+  Session names and command strings are never inspected to infer that policy;
+  absent and other kinds remain generic.
 - **`description`** (optional) — a human-readable note about what
   the session is for. Display-only — never affects launch. Shown
   dimmed in the TUI: in the detail column on wide terminals (in

@@ -317,6 +317,17 @@ fn receipts_for_workspace(
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn pending_for_workspace(
+    workspace_id: Option<&str>,
+    pending_launches: Vec<crate::supervision::PendingLaunch>,
+) -> Vec<crate::supervision::PendingLaunch> {
+    pending_launches
+        .into_iter()
+        .filter(|pending| workspace_id == Some(pending.logical_id.workspace_id.as_str()))
+        .collect()
+}
+
 fn declared_selection(
     workspace: &crate::domain::Workspace,
     session_name: &str,
@@ -388,13 +399,14 @@ fn run_session_tui(
     let mut app = App::new(workspace, mux, live);
     #[cfg(target_os = "linux")]
     {
-        match crate::supervision::ReceiptStore::standard().and_then(|store| store.list()) {
-            Ok(all_receipts) => {
-                let receipts = receipts_for_workspace(app.workspace_id(), all_receipts);
-                app = app.with_receipts(receipts);
+        match crate::supervision::ReceiptStore::standard().and_then(|store| store.load()) {
+            Ok(file) => {
+                let receipts = receipts_for_workspace(app.workspace_id(), file.bindings);
+                let pending = pending_for_workspace(app.workspace_id(), file.pending_launches);
+                app = app.with_supervision_evidence(receipts, pending);
             }
-            Err(error) => app.set_persistent_status(format!(
-                "ownership receipts unavailable; idle supervision is fail-closed: {error:#}"
+            Err(error) => app.fail_closed_supervision(format!(
+                "ownership and pending-launch evidence unavailable; idle supervision is fail-closed: {error:#}"
             )),
         }
     }
@@ -572,12 +584,20 @@ fn run_session_tui(
 fn supervision_fallback_notice(
     workspace_name: &str,
     session_name: &str,
-    limits: &crate::supervision::SoftLimits,
+    limits: &crate::supervision::ResourceLimits,
     reason: &anyhow::Error,
 ) -> String {
     let memory = limits
         .memory_high_bytes
         .map(|bytes| format!("{:.0} GiB", bytes as f64 / 1024_f64.powi(3)))
+        .unwrap_or_else(|| "unset".into());
+    let memory_max = limits
+        .memory_max_bytes
+        .map(|bytes| format!("{:.0} GiB", bytes as f64 / 1024_f64.powi(3)))
+        .unwrap_or_else(|| "unset".into());
+    let swap_max = limits
+        .memory_swap_max_bytes
+        .map(|bytes| format!("{:.0} MiB", bytes as f64 / 1024_f64.powi(2)))
         .unwrap_or_else(|| "unset".into());
     let cpu = limits
         .cpu_quota_percent
@@ -588,7 +608,7 @@ fn supervision_fallback_notice(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unset".into());
     format!(
-        "  pa: RESOURCE SUPERVISION UNAVAILABLE\n      launching {:?} ordinarily without cgroup guardrails\n      omitted guardrails: MemoryHigh {memory} · CPU {cpu} · TasksMax {tasks}\n      reason: {reason:#}",
+        "  pa: RESOURCE SUPERVISION UNAVAILABLE\n      launching {:?} ordinarily without cgroup resource limits\n      omitted limits: MemoryHigh {memory} · MemoryMax {memory_max} · SwapMax {swap_max} · CPU {cpu} · TasksMax {tasks}\n      reason: {reason:#}",
         format!("{workspace_name} / {session_name}")
     )
 }
@@ -596,7 +616,7 @@ fn supervision_fallback_notice(
 fn print_supervision_fallback_notice(
     workspace_name: &str,
     session_name: &str,
-    limits: &crate::supervision::SoftLimits,
+    limits: &crate::supervision::ResourceLimits,
     reason: &anyhow::Error,
 ) {
     eprintln!();
@@ -707,7 +727,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn receipt(workspace_id: &str, session_name: &str) -> crate::supervision::BindingReceipt {
         crate::supervision::BindingReceipt {
-            schema_version: crate::supervision::model::RECEIPT_SCHEMA_VERSION,
+            schema_version: crate::supervision::model::LEGACY_RECEIPT_SCHEMA_VERSION,
             logical_id: crate::supervision::LogicalSessionId::new(workspace_id, session_name)
                 .unwrap(),
             backend: crate::supervision::BackendKind::SystemdUserService,
@@ -720,23 +740,28 @@ mod tests {
                 session: session_name.into(),
             },
             observed_at_unix_ms: 1,
-            limits: crate::supervision::SoftLimits::default(),
+            limits: crate::supervision::ResourceLimits::default(),
+            session_kind: None,
+            requested_slice: None,
+            workload_anchor: None,
         }
     }
 
     #[test]
-    fn loud_fallback_notice_names_identity_and_omitted_guardrails() {
+    fn loud_fallback_notice_names_identity_and_omitted_limits() {
         let notice = supervision_fallback_notice(
             "workspace",
             "shell",
-            &crate::supervision::SoftLimits::recommended_tui_launch(),
+            &crate::supervision::ResourceLimits::claude_defaults(),
             &anyhow::anyhow!("systemd unavailable"),
         );
         assert!(notice.contains("RESOURCE SUPERVISION UNAVAILABLE"));
         assert!(notice.contains("workspace / shell"));
-        assert!(notice.contains("ordinarily without cgroup guardrails"));
-        assert!(notice.contains("MemoryHigh 12 GiB"));
-        assert!(notice.contains("CPU 300%"));
+        assert!(notice.contains("ordinarily without cgroup resource limits"));
+        assert!(notice.contains("MemoryHigh 3 GiB"));
+        assert!(notice.contains("MemoryMax 5 GiB"));
+        assert!(notice.contains("SwapMax 512 MiB"));
+        assert!(notice.contains("CPU 800%"));
         assert!(notice.contains("TasksMax 1200"));
         assert!(notice.contains("systemd unavailable"));
     }

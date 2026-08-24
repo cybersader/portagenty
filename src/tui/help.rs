@@ -171,7 +171,7 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(Line::raw(""));
             lines.push(row(
                 "supervisable",
-                "idle UUID-backed; Enter uses recommended guardrails",
+                "idle UUID-backed; Enter uses kind-selected limits",
             ));
             lines.push(row(
                 "needs ID",

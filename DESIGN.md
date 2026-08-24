@@ -149,7 +149,7 @@ portagenty splits what it knows into two categories:
 - Last-attached timestamps
 - User's most recent TUI view preference
 
-**Machine-local ownership receipts**: Linux supervised launches use `$XDG_STATE_HOME/portagenty/supervision.toml`. This versioned, lock-protected file records the stable logical session ID, opaque transient-unit name, systemd `InvocationID`, exact `ControlGroup`, exact private multiplexer target, and applied guardrails. It is not workspace configuration and must never be committed or synced as authority.
+**Machine-local ownership receipts**: Linux supervised launches use `$XDG_STATE_HOME/portagenty/supervision.toml`. This versioned, lock-protected file records the stable logical session ID, opaque transient-unit name, systemd `InvocationID`, exact `ControlGroup`, exact private multiplexer target, resolved resource limits, slice selection, and v2 workload-anchor proof. It also journals pending launches before transient-unit creation. It is not workspace configuration and must never be committed or synced as authority.
 
 **Live, rebuilt on every run**: not persisted anywhere.
 
@@ -210,12 +210,14 @@ clear "use tmux or zellij" message.
 
 When the user selects a session and hits Enter, ownership and live state determine the path:
 
-1. An owned-and-verified row attaches to the exact private target in its receipt.
-2. A live ordinary or untracked target attaches in place; Enter never kills, migrates, or retroactively claims it.
-3. An idle UUID-backed `supervisable` row uses supervision-first creation with the TUI recommendations (`12G` Memory High, `300%` CPU, `1200` tasks).
-4. An idle legacy/no-ID, malformed-ID, or genuinely unsupported row retains ordinary `create_and_attach`; malformed identity remains ineligible for supervision.
-5. An idle stale declared row can confirm exact signal-free stale-receipt removal plus a fresh supervised relaunch. A stale receipt beside a real live ordinary target follows rule 2 instead.
-6. A receipt still awaiting exact reconciliation is non-attachable until it becomes owned or stale.
+1. An owned-and-verified v2 row attaches to the exact private target in its receipt.
+2. A live legacy-v1 row attaches to its exact private target but is restart-required and attach-only; Portagenty never upgrades, stops, or migrates it automatically.
+3. A split-containment row may attach to its exact private target, but Portagenty withholds whole-workload resource ownership and control.
+4. A live ordinary or untracked target attaches in place; Enter never kills, migrates, or retroactively claims it.
+5. An idle UUID-backed `supervisable` row uses supervision-first creation. `kind = "claude-code"` selects the Claude defaults (`3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, `1200` tasks); generic kinds remain generic and receive no implied Claude policy.
+6. An idle legacy/no-ID, malformed-ID, or genuinely unsupported row retains ordinary `create_and_attach`; malformed identity remains ineligible for supervision.
+7. An idle stale declared row can confirm exact signal-free stale-receipt removal plus a fresh supervised relaunch. A stale receipt beside a real live ordinary target follows rule 4 instead.
+8. A pending or ambiguous binding is non-attachable until exact reconciliation reaches a safe state.
 
 This is imperative, on-demand. A workspace with 20 sessions defined never costs you 20 processes worth of startup. It costs you one process when you open one session.
 
@@ -223,51 +225,51 @@ This is imperative, on-demand. A workspace with 20 sessions defined never costs 
 
 ### Experimental Linux resource supervision
 
-TUI Enter is supervision-first only for idle UUID-backed rows; ordinary `pa launch` remains ordinary unless `--supervise` or a guardrail flag is supplied. `S` is the advanced/custom path: it edits launch-local limits, can confirm-add a UUID to a writable legacy workspace, and can separately confirm termination of one exact live ordinary target before fresh supervised relaunch. Malformed IDs still fail closed for supervision. The backend is currently implemented only where a systemd user manager and unified cgroup v2 provide the required guarantees; other platforms report unsupported capability states rather than silently weakening containment.
+TUI Enter is supervision-first only for idle UUID-backed rows; ordinary `pa launch` remains ordinary unless `--supervise` or a resource-limit flag is supplied. `S` is the advanced/custom path: it edits launch-local limits, can confirm-add a UUID to a writable legacy workspace, and can separately confirm termination of one exact live ordinary target before fresh supervised relaunch. Malformed IDs still fail closed for supervision. The backend is currently implemented only where a systemd user manager and unified cgroup v2 provide the required guarantees; other platforms report unsupported capability states rather than silently weakening containment.
 
-The launch lifecycle has three typed boundaries: non-creating preflight, creation that may have begun, and a multiplexer client that actually ran and returned. Routine Enter may fall back loudly to ordinary creation only when preflight has already proved the receipt store readable, no binding requires preservation, no ordinary target exists, and supervision capability/runtime is unavailable. Receipt ambiguity, identity/target races, explicit `S`, stale replacement, CLI supervision, and every error after backend creation is invoked remain fail-closed. A pre-client setup failure reopens the same workspace and logical row; a client that returns normally, nonzero, by signal, or after forced disconnection prints the human `workspace / session` identity before abnormal diagnostics.
+`Session.kind` is the only selector for kind-specific policy. Exactly `kind = "claude-code"` selects Claude placement and defaults; a session named `claude` or running `command = "claude"` remains generic when the kind is absent or different. Claude overrides must be equal to or stricter than every standard value and internally consistent (`MemoryHigh <= MemoryMax`). Generic supervised sessions remain in normal user-manager placement and use only explicitly requested limits.
 
-A supervised launch creates a transient **systemd user service**, not a scope and not a Portagenty daemon. The service uses `Type=exec`, `ExitType=cgroup`, `KillMode=control-group`, `SendSIGKILL=no`, `Restart=no`, `OOMPolicy=continue`, explicit accounting, and an exact working directory/environment/argv. The existing systemd user manager owns the workload lifetime after `pa` exits. Portagenty opens no listener and retains no resident process.
+The launch lifecycle has three typed boundaries: non-creating preflight, creation that may have begun, and a multiplexer client that actually ran and returned. Routine Enter may fall back loudly to ordinary creation only when preflight has already proved the receipt store readable, no binding or pending launch requires preservation, no ordinary target exists, and supervision capability/runtime is unavailable. Receipt ambiguity, identity/target races, explicit `S`, stale replacement, CLI supervision, and every error after backend creation is invoked remain fail-closed. A pending-launch journal records the creator PID/start time and protects the gap between transient-unit creation and durable v2 receipt persistence. Pending evidence blocks attach, ordinary fallback, creation, stop, and kill. Signal-free `pa resources cleanup` removes it only when the creator is gone and the exact unit, target, and marker are all absent; partial presence stays ambiguous. A pre-client setup failure reopens the same workspace and logical row; a client that returns normally, nonzero, by signal, or after forced disconnection prints the human `workspace / session` identity before abnormal diagnostics.
+
+A supervised launch creates a transient **systemd user service**, not a scope and not a Portagenty daemon. The service uses `Type=exec`, `ExitType=cgroup`, `KillMode=control-group`, `SendSIGKILL=no`, `Restart=no`, `OOMPolicy=continue`, explicit accounting, and an exact working directory/environment/argv. A Claude-kind service also sets `Slice=claude-code.slice`, `ManagedOOMPreference=omit`, `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, CPU quota, and a finite per-service `TasksMax`. Before creation, Portagenty structurally verifies that the externally provisioned aggregate slice exists beneath `/claude.slice/claude-code.slice`, has finite positive `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, has consistent memory limits, and uses `ManagedOOMPreference=omit`; aggregate `TasksMax` is optional and may remain infinity. Portagenty observes but never creates or modifies that slice. For tmux 3.7b and later, the transient service deliberately withholds `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` from the private tmux server to prevent sibling `tmux-spawn-*.scope` creation, then restores the exact user-bus values only in the pane environment. The existing systemd user manager owns the workload lifetime after `pa` exits. Portagenty opens no listener and retains no resident process.
 
 Ownership is proof-based:
 
 1. Stable logical identity is `workspace UUID + exact declared session name`.
-2. A fresh launch gets an opaque unit and private tmux/Zellij target.
-3. The machine-local receipt records unit name, `InvocationID`, `ControlGroup`, target, and guardrails atomically while holding the receipt lock.
-4. Every snapshot or systemd action resolves the invocation again and requires exact unit-name, invocation-ID, control-group, canonical cgroup path, user-manager subtree, and target agreement.
-5. Missing or mismatched evidence becomes stale/ambiguous and controls fail closed. Existing shared sessions are `existing-unverified`; they are never retroactively claimed. Idle stale Enter can replace only the exact confirmed dead receipt after locked revalidation proves both its invocation and private target absent; cleanup sends no signal, and fresh creation begins only afterward. Pressing `S` may explicitly terminate only the exact ordinary multiplexer target and then offer a fresh supervised launch after idle revalidation, but it never migrates or assigns ownership to the old process tree.
+2. A fresh launch gets an opaque unit, private tmux/Zellij target, one-shot owner-only launch spec, and random workload nonce.
+3. The shared hidden workload anchor used by both multiplexers atomically records its exact PID and `/proc` start time before executing the declared command. Proof also binds to the exact private tmux socket/session/pane PID or exact Zellij session/runtime identity, so an edited or replaced target cannot reconcile.
+4. The v2 machine-local receipt records unit name, `InvocationID`, `ControlGroup`, target, resolved limits, requested slice, nonce, marker path, PID, and start time atomically while holding the receipt lock. Launch specs and markers are constrained to owner-only `$XDG_RUNTIME_DIR/portagenty/workloads/<nonce>.*.toml`; marker content is reverified before unlink.
+5. Before receipt finalization, every snapshot, and every control action, Portagenty reads back service placement and limits, checks the exact root PID/start-time/nonce/cgroup, and traverses descendants only through bounded `/proc/<pid>/task/<tid>/children` edges for every thread ID. It never performs a global `/proc` scan.
+6. A root outside the service cgroup cannot reconcile as owned. Descendants outside it produce split containment; a descendant deliberately launched by `build-contained` beneath `background.slice` is reported as an external bounded scope rather than misreported as service-owned.
+7. Missing or mismatched evidence becomes stale, split, legacy/restart-required, or ambiguous and controls fail closed. Both the unit and exact target absent may stale-clean; partial presence is ambiguous. Existing shared sessions remain unverified and are never retroactively claimed.
 
-Optional soft guardrails are `MemoryHigh`, `CPUQuotaPerSecUSec`, and `TasksMax`. Routine eligible Enter uses launch-local recommendations (`12G`, `300%`, and `1200`); the interactive `S` modal exposes the same typed values for editing or clearing. CLI flags stay unset unless explicitly supplied. These controls reclaim/throttle or reject new tasks; they are not hard memory/swap caps or persisted workspace policy. `OOMPolicy=continue` allows a child OOM kill to be observed without automatically destroying the remaining session. Hard caps remain deferred until synthetic destructive testing is explicitly approved.
+The resource model includes `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `CPUQuotaPerSecUSec`, and `TasksMax`. MemoryHigh is a reclaim threshold; MemoryMax and MemorySwapMax are hard ceilings; CPU throttles aggregate CPU time; TasksMax rejects additional tasks. `OOMPolicy=continue` allows a child OOM kill to be observed without automatically destroying the remaining session. These are launch-local controls, not persisted workspace policy.
 
-Resource snapshots read the verified cgroup: cumulative CPU plus sampled rate, charged memory current/peak/events, swap current/peak/events, tasks current/peak/events, aggregate I/O plus sampled rates, CPU/memory/I/O PSI, and cgroup populated/frozen state. `memory.current` is cgroup-charged memory rather than root-process RSS; `pids.current` counts tasks/threads; CPU rate may exceed 100% on multicore systems. CLI/TUI notices surface deltas such as `memory.events high/oom/oom_kill`, `pids.events max`, and CPU quota throttling. Snapshots are ephemeral—there is no history database, log monitor, or unattended telemetry collector.
+Resource snapshots read only an owned-and-verified v2 service cgroup: cumulative CPU plus sampled rate, charged memory current/peak/events, swap current/peak/events, tasks current/peak/events, aggregate I/O plus sampled rates, CPU/memory/I/O PSI, and cgroup populated/frozen state. `memory.current` is cgroup-charged memory rather than root-process RSS; `pids.current` counts tasks/threads; CPU rate may exceed 100% on multicore systems. CLI/TUI notices surface deltas such as `memory.events high/oom/oom_kill`, `pids.events max`, and CPU quota throttling. Snapshots are ephemeral—there is no history database, log monitor, or unattended telemetry collector.
 
-The control ladder stays explicit:
+The control ladder stays explicit and is available only for complete owned-and-verified containment:
 
 1. Gracefully stop the exact recorded multiplexer target.
 2. Revalidate and request non-force systemd `StopUnit`.
 3. Only a separately confirmed force action may call whole-cgroup `KillUnit(..., SIGKILL)`.
 
-Picker-wide stop partitions targets by capability: verified owned workloads use steps 1–2, unmanaged shared sessions use multiplexer-native kill, and stale/ambiguous receipts are shown and skipped. Bulk control never force-escalates.
+Picker-wide stop partitions targets by capability: verified owned workloads use steps 1–2, unmanaged shared sessions use multiplexer-native kill, and legacy, split, stale, or ambiguous receipts are shown and skipped. A pending-launch journal blocks another supervised creation for the same logical session but is not treated as an owned control target. Bulk control never force-escalates.
 
 ---
 
-## 7. Agent integration — agnostic core
+## 7. Agent integration — agnostic core, explicit policy selectors
 
-v1 does not know what Claude Code is. A session is a command; `command = "claude"` and `command = "vim"` are indistinguishable to the core.
-
-That choice is deliberate. It's what keeps portagenty durable as the agent ecosystem shifts: new CLIs (Aider, Codex, something-else-in-six-months) don't require core changes. You just write a new session.
-
-An optional `kind:` field on a session can unlock niceties later. Sketch:
+The core never guesses from command text. A session named `claude` or running `command = "claude"` remains generic unless its optional `kind` explicitly selects a documented integration. This keeps new CLIs usable without parser changes while avoiding accidental policy based on executable aliases or names.
 
 ```
 [[session]]
 name = "claude"
 cwd = "."
 command = "cc"
-kind = "claude-code"    # v1.x hook; ignored in v1
+kind = "claude-code"
 ```
 
-Planned `kind:` values: `claude-code`, `opencode`, `shell`, `editor`, `dev-server`. Effects (when implemented): agent-running indicators in the TUI, smart resume (`--continue` flags), session-coloring.
+Implemented kind values are `claude-code`, `opencode`, `shell`, `editor`, `dev-server`, and `other`. Kinds drive TUI markers; `claude-code` also drives kind-aware resume and, for supervised launches, the Claude slice/default resource policy. No other kind and no command/name inference may select that policy.
 
 A full plugin runtime — where third-party adapters register themselves via some extension mechanism — is a v2+ question. Not a v1 problem.
 

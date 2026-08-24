@@ -6,6 +6,7 @@
 //! socket for exact ownership and isolation.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -75,6 +76,25 @@ impl TmuxAdapter {
         session: &Session,
         name: &str,
     ) -> Result<Vec<OsString>> {
+        self.create_detached_args_with_command(session, name, &session.command)
+    }
+
+    pub(crate) fn create_detached_args_with_command(
+        &self,
+        session: &Session,
+        name: &str,
+        command: &str,
+    ) -> Result<Vec<OsString>> {
+        self.create_detached_args_with_command_and_environment(session, name, command, &session.env)
+    }
+
+    pub(crate) fn create_detached_args_with_command_and_environment(
+        &self,
+        session: &Session,
+        name: &str,
+        command: &str,
+        pane_environment: &BTreeMap<String, String>,
+    ) -> Result<Vec<OsString>> {
         ensure_cwd_exists(&session.cwd)?;
         let mut args = Vec::new();
         if let Some(socket) = &self.socket {
@@ -90,14 +110,40 @@ impl TmuxAdapter {
         // -e KEY=VAL flags: tmux applies these to the session's
         // environment, so the spawned shell + child processes see
         // them. Order is deterministic because session.env is BTreeMap.
-        for (key, value) in &session.env {
+        for (key, value) in pane_environment {
             args.push(OsString::from("-e"));
             args.push(OsString::from(format!("{key}={value}")));
         }
         args.push(OsString::from("-c"));
         args.push(session.cwd.as_os_str().to_owned());
-        args.push(OsString::from(&session.command));
+        args.push(OsString::from(command));
         Ok(args)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pane_pid(&self, session: &str) -> Result<u32> {
+        let output = self
+            .cmd()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{session}:0.0"),
+                "#{pane_pid}",
+            ])
+            .output()
+            .map_err(|error| friendly_io_err("querying tmux pane PID", error))?;
+        if !output.status.success() {
+            bail!(
+                "tmux pane PID query failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        String::from_utf8(output.stdout)
+            .context("tmux pane PID output was not UTF-8")?
+            .trim()
+            .parse::<u32>()
+            .context("parsing tmux pane PID")
     }
 
     fn create_detached_with_name(
@@ -389,6 +435,51 @@ mod tests {
         assert_eq!(
             args,
             vec!["new-session", "-d", "-s", "s", "-c", "/tmp", "echo hi"]
+        );
+    }
+
+    #[test]
+    fn supervised_args_use_the_explicit_pane_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = Session {
+            name: "agent".into(),
+            cwd: temp.path().to_path_buf(),
+            command: "ignored".into(),
+            kind: None,
+            env: BTreeMap::from([("ORIGINAL".into(), "not-forwarded".into())]),
+            description: None,
+        };
+        let pane_environment = BTreeMap::from([
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            ),
+            ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+        ]);
+        let args = TmuxAdapter::with_socket("/tmp/private.sock")
+            .create_detached_args_with_command_and_environment(
+                &session,
+                "exact",
+                "exec workload-anchor",
+                &pane_environment,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "-e",
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+            ]
+        }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-e", "XDG_RUNTIME_DIR=/run/user/1000"]));
+        assert!(!args.iter().any(|arg| arg.starts_with("ORIGINAL=")));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("exec workload-anchor")
         );
     }
 }

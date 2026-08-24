@@ -69,14 +69,18 @@ Untracked = the tmux/zellij session you started manually last week
 that `pa` can see via `list-sessions` and let you re-attach to.
 
 Idle behavior is ownership-aware. A valid workspace UUID produces a stable logical
-session ID, so Enter can create a private supervised target with `12G` Memory High,
-`300%` CPU, and `1200` tasks. Missing IDs keep ordinary Enter and can be upgraded
-explicitly with `S`; malformed IDs require manual correction. Owned rows attach to
-the exact receipt target, live ordinary rows attach without relaunch or ownership,
-and an idle stale receipt can be exactly replaced only after signal-free proof that
-its old invocation and target are absent. If non-creating capability preflight fails
-with ownership already known safe, routine Enter announces an ordinary unsupervised
-fallback; later or ambiguous failures remain fail-closed.
+session ID, so Enter can create a private supervised target. For explicit
+`kind = "claude-code"`, the launch policy is `3G` MemoryHigh, `5G` MemoryMax,
+`512MiB` MemorySwapMax, `800%` CPU, and `1200` tasks; generic kinds receive no
+implied Claude defaults. Missing IDs keep ordinary Enter and can be upgraded
+explicitly with `S`; malformed IDs require manual correction. Owned v2 rows attach
+to the exact receipt target. Live v1 rows are legacy/restart-required exact-target
+attach-only. Split-containment rows may attach, but whole-workload metrics and
+control are withheld. An idle stale receipt can be exactly replaced only after
+signal-free proof that both its old invocation and target are absent; partial
+presence is ambiguous. If non-creating capability preflight fails with ownership
+already known safe, routine Enter announces an ordinary unsupervised fallback;
+later or ambiguous failures remain fail-closed.
 
 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.5rem 0;">
   <div style="border: 2px solid var(--sl-color-gray-4); border-radius: 10px; padding: 1rem; background: var(--sl-color-gray-6);">
@@ -113,14 +117,16 @@ fallback; later or ambiguous failures remain fail-closed.
   </div>
 </div>
 
-## Kind hint
+## Kind selector
 
 Optional `kind:` field on a session: `claude-code`, `opencode`,
 `editor`, `dev-server`, `shell`, or `other`. The TUI shows a
 one-letter colored glyph (C / O / E / D) next to the state marker.
 For `kind = "claude-code"`, `pa launch --resume` and
-`pa claim --resume` append `--continue` before launch so Claude
-picks up its prior conversation. Other kinds get a one-line hint.
+`pa claim --resume` append `--continue`, and supervised launches select the
+Claude slice/default resource policy. This explicit field is the only selector:
+a name or command containing `claude` never implies Claude policy. Other and
+absent kinds remain generic.
 
 ## Multiplexer / adapter
 

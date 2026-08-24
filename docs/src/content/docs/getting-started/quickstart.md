@@ -22,6 +22,7 @@ projects = ["~/code/portagenty"]
 name = "claude"
 cwd = "~/code/portagenty"
 command = "claude"
+kind = "claude-code"
 ```
 
 ## 2. Open the TUI
@@ -48,13 +49,16 @@ Nothing is launched yet.
 | `S` | Edit supervision limits or use the advanced upgrade/restart paths |
 | `q` / `Esc` / `Ctrl-C` | Quit the TUI |
 
-For the UUID-backed idle row above, `Enter` first attempts an experimental
-Linux supervised launch with `12G` Memory High, `300%` CPU, and `1200` tasks.
-If ownership-safe, non-creating preflight proves that supervision is unavailable,
-Portagenty announces a loud ordinary/unsupervised fallback. Ambiguous ownership
-and failures after creation may have begun stay fail-closed. Existing live ordinary
-sessions attach in place and are never retroactively claimed; workspace files with
-no ID retain ordinary Enter.
+For the UUID-backed Claude-kind row above, `Enter` first attempts an experimental
+Linux supervised launch with `3G` MemoryHigh, `5G` MemoryMax, `512MiB`
+MemorySwapMax, `800%` CPU, and `1200` tasks beneath the pre-provisioned aggregate
+Claude slice. `kind = "claude-code"` is the only selector for that policy; naming a
+session or command `claude` without the kind remains generic. If ownership-safe,
+non-creating preflight proves that supervision is unavailable, Portagenty announces
+a loud ordinary/unsupervised fallback. Ambiguous ownership and failures after
+creation may have begun stay fail-closed. Existing live ordinary sessions attach in
+place and are never retroactively claimed; workspace files with no ID retain
+ordinary Enter.
 
 The TUI restores the terminal before handing the TTY to tmux. Detach with the
 multiplexer's normal binding (`Ctrl-b d` for tmux). After any client return—normal,

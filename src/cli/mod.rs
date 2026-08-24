@@ -15,7 +15,7 @@ use crate::mux::{
 use crate::supervision::model::{parse_cpu_quota, parse_memory_size, parse_tasks_max};
 use crate::supervision::{
     BindingReceipt, CapabilityState, LimitKind, LogicalSessionId, MetricValue, MuxTarget,
-    OwnershipState, ResourceSnapshot, SoftLimits, SupervisionBackend,
+    OwnershipState, ResourceLimits, ResourceSnapshot, SupervisionBackend,
 };
 
 #[derive(Debug, Parser)]
@@ -88,10 +88,18 @@ pub enum Command {
         #[arg(long = "supervise")]
         supervise: bool,
 
-        /// Soft memory-pressure threshold (IEC sizes such as 12G or 512MiB).
+        /// Memory-reclaim threshold (IEC sizes such as 3G or 512MiB).
         /// Implies --supervise; this is MemoryHigh, not a hard OOM limit.
         #[arg(long = "memory-high")]
         memory_high: Option<String>,
+
+        /// Hard memory limit (IEC sizes such as 5G or 4096MiB). Implies --supervise.
+        #[arg(long = "memory-max")]
+        memory_max: Option<String>,
+
+        /// Hard swap limit (IEC sizes such as 512MiB). Implies --supervise.
+        #[arg(long = "memory-swap-max")]
+        memory_swap_max: Option<String>,
 
         /// CPU quota as a percentage. Values above 100 use multiple cores.
         /// Implies --supervise.
@@ -265,6 +273,11 @@ pub enum Command {
     /// workspace in the current directory, picks a multiplexer,
     /// optionally pre-populates a Claude Code session. Safe to re-run.
     Onboard,
+    #[command(name = "__workload-anchor", hide = true)]
+    WorkloadAnchor {
+        #[arg(long)]
+        spec: PathBuf,
+    },
     /// Emit a shell completion script for the named shell. Pipe it
     /// into the completion file your shell loads — see the commands
     /// reference for per-shell install hints.
@@ -326,7 +339,7 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum ResourcesCommand {
-    /// Report backend, metric, control, and soft-limit capabilities.
+    /// Report backend, metric, control, and resource-limit capabilities.
     Capabilities,
     /// Show ownership and current cgroup metrics for one or all declared sessions.
     Status {
@@ -337,6 +350,13 @@ pub enum ResourcesCommand {
     /// Gracefully stop the exact receipted multiplexer target, then stop its
     /// verified systemd unit if descendants remain. Never sends SIGKILL.
     Stop {
+        session: String,
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
+    /// Remove only proven-dead pending evidence or a proven-stale receipt.
+    /// Never signals a process or stops a unit.
+    Cleanup {
         session: String,
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<PathBuf>,
@@ -355,6 +375,8 @@ pub enum ResourcesCommand {
 pub struct LaunchSupervisionOptions<'a> {
     pub enabled: bool,
     pub memory_high: Option<&'a str>,
+    pub memory_max: Option<&'a str>,
+    pub memory_swap_max: Option<&'a str>,
     pub cpu_quota: Option<&'a str>,
     pub tasks_max: Option<&'a str>,
 }
@@ -542,12 +564,15 @@ pub fn launch(
         apply_resume_modifier(&mut sess)?;
     }
 
-    let limits = parse_soft_limits(
+    let limits = parse_resource_limits(
         supervision.memory_high,
+        supervision.memory_max,
+        supervision.memory_swap_max,
         supervision.cpu_quota,
         supervision.tasks_max,
     )?;
     if supervision.enabled || !limits.is_empty() {
+        let limits = limits.resolve_for_kind(sess.kind)?;
         let workspace_name = ws.name.clone();
         let session_name = sess.name.clone();
         let result = launch_supervised_resolved(sess, ws, dry_run, mode, fresh, limits)?;
@@ -648,16 +673,22 @@ pub(crate) fn finish_client_return(
     }
 }
 
-fn parse_soft_limits(
+fn parse_resource_limits(
     memory_high: Option<&str>,
+    memory_max: Option<&str>,
+    memory_swap_max: Option<&str>,
     cpu_quota: Option<&str>,
     tasks_max: Option<&str>,
-) -> Result<SoftLimits> {
-    Ok(SoftLimits {
+) -> Result<ResourceLimits> {
+    let limits = ResourceLimits {
         memory_high_bytes: memory_high.map(parse_memory_size).transpose()?,
+        memory_max_bytes: memory_max.map(parse_memory_size).transpose()?,
+        memory_swap_max_bytes: memory_swap_max.map(parse_memory_size).transpose()?,
         cpu_quota_percent: cpu_quota.map(parse_cpu_quota).transpose()?,
         tasks_max: tasks_max.map(parse_tasks_max).transpose()?,
-    })
+    };
+    limits.validate_consistency()?;
+    Ok(limits)
 }
 
 pub(crate) enum RoutineSupervisedLaunch {
@@ -672,7 +703,7 @@ pub(crate) fn launch_supervised_resolved(
     dry_run: bool,
     mode: AttachMode,
     fresh: bool,
-    limits: SoftLimits,
+    limits: ResourceLimits,
 ) -> Result<ClientCompletion<()>> {
     match launch_supervised_inner(sess, ws, dry_run, mode, fresh, limits, false)? {
         RoutineSupervisedLaunch::ClientReturned(completion) => Ok(completion),
@@ -685,7 +716,7 @@ pub(crate) fn launch_supervised_routine_resolved(
     sess: Session,
     ws: Workspace,
     mode: AttachMode,
-    limits: SoftLimits,
+    limits: ResourceLimits,
 ) -> Result<RoutineSupervisedLaunch> {
     launch_supervised_inner(sess, ws, false, mode, false, limits, true)
 }
@@ -697,7 +728,7 @@ fn launch_supervised_inner(
     dry_run: bool,
     mode: AttachMode,
     fresh: bool,
-    limits: SoftLimits,
+    limits: ResourceLimits,
     allow_fallback: bool,
 ) -> Result<RoutineSupervisedLaunch> {
     let workspace_id = ws.id.as_deref().ok_or_else(|| {
@@ -731,6 +762,16 @@ fn launch_supervised_inner(
     }
 
     let store = crate::supervision::ReceiptStore::standard()?;
+    if let Some(pending) = store.find_pending(&logical_id)? {
+        bail!(
+            "a pending supervision launch blocks ordinary fallback and new creation: unit={:?}, target={:?}, last_error={:?}; inspect with `pa resources status {:?}` and clear only proven-dead evidence with `pa resources cleanup {:?}`",
+            pending.unit_name,
+            pending.mux_target,
+            pending.last_error,
+            sess.name,
+            sess.name
+        );
+    }
     let existing = store.find(&logical_id)?;
     let ordinary_target = crate::mux::workspace_session_name(&ws.name, &sess.name);
     if existing.is_none() {
@@ -760,6 +801,11 @@ fn launch_supervised_inner(
     } else {
         [
             (LimitKind::MemoryHigh, limits.memory_high_bytes.is_some()),
+            (LimitKind::MemoryMax, limits.memory_max_bytes.is_some()),
+            (
+                LimitKind::MemorySwapMax,
+                limits.memory_swap_max_bytes.is_some(),
+            ),
             (LimitKind::CpuQuota, limits.cpu_quota_percent.is_some()),
             (LimitKind::TasksMax, limits.tasks_max.is_some()),
         ]
@@ -770,7 +816,7 @@ fn launch_supervised_inner(
             }
             let state = capabilities.limits.get(&kind);
             (state != Some(&CapabilityState::Supported))
-                .then(|| anyhow!("requested {kind:?} guardrail is unavailable: {state:?}"))
+                .then(|| anyhow!("requested {kind:?} resource limit is unavailable: {state:?}"))
         })
     };
     if let Some(error) = unavailable {
@@ -786,9 +832,25 @@ fn launch_supervised_inner(
         );
     }
     if let Some(receipt) = &existing {
+        match backend.reconcile(receipt)? {
+            OwnershipState::LegacyRestartRequired(reason) => {
+                eprintln!("pa: legacy supervised service is attach-only: {reason}");
+                return Ok(RoutineSupervisedLaunch::ClientReturned(
+                    attach_receipted_target(&receipt.mux_target, mode)?,
+                ));
+            }
+            OwnershipState::SplitContainment(reason) => {
+                eprintln!("pa: split containment; attaching without resource ownership: {reason}");
+                return Ok(RoutineSupervisedLaunch::ClientReturned(
+                    attach_receipted_target(&receipt.mux_target, mode)?,
+                ));
+            }
+            OwnershipState::OwnedVerified(_) => {}
+            state => bail!("existing supervision receipt is not attachable: {state:?}"),
+        }
         if !allow_fallback && !limits.is_empty() && receipt.limits != limits {
             bail!(
-                "this supervised session already exists with different guardrails; stop it before launching with new limits"
+                "this supervised session already exists with different resource limits; stop it before launching with new limits"
             );
         }
     } else {
@@ -826,7 +888,7 @@ pub(crate) fn launch_supervised_resolved(
     _dry_run: bool,
     _mode: AttachMode,
     _fresh: bool,
-    _limits: SoftLimits,
+    _limits: ResourceLimits,
 ) -> Result<ClientCompletion<()>> {
     bail!(
         "resource supervision is currently implemented only on Linux with systemd user services and cgroup v2"
@@ -838,11 +900,23 @@ pub(crate) fn launch_supervised_routine_resolved(
     _sess: Session,
     _ws: Workspace,
     _mode: AttachMode,
-    _limits: SoftLimits,
+    _limits: ResourceLimits,
 ) -> Result<RoutineSupervisedLaunch> {
     Ok(RoutineSupervisedLaunch::FallbackSafe(anyhow!(
         "resource supervision is currently implemented only on Linux with systemd user services and cgroup v2"
     )))
+}
+
+fn effective_stale_replacement_limits(
+    kind: Option<crate::domain::SessionKind>,
+    legacy_receipt: bool,
+    requested: ResourceLimits,
+) -> Result<ResourceLimits> {
+    if legacy_receipt {
+        Ok(ResourceLimits::defaults_for_kind(kind))
+    } else {
+        requested.resolve_for_kind(kind)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -851,8 +925,9 @@ pub(crate) fn replace_stale_supervised_resolved(
     ws: Workspace,
     expected: BindingReceipt,
     mode: AttachMode,
-    limits: SoftLimits,
+    limits: ResourceLimits,
 ) -> Result<ClientCompletion<()>> {
+    let limits = effective_stale_replacement_limits(sess.kind, expected.is_legacy(), limits)?;
     let workspace_id = ws
         .id
         .as_deref()
@@ -862,6 +937,9 @@ pub(crate) fn replace_stale_supervised_resolved(
         bail!("the confirmed stale receipt does not match the selected workspace/session");
     }
     let store = crate::supervision::ReceiptStore::standard()?;
+    if store.find_pending(&logical_id)?.is_some() {
+        bail!("a pending supervision launch exists; no stale receipt was removed");
+    }
     if store.find(&logical_id)?.as_ref() != Some(&expected) {
         bail!("the ownership receipt changed after confirmation; refresh and retry");
     }
@@ -882,12 +960,17 @@ pub(crate) fn replace_stale_supervised_resolved(
     }
     for (kind, requested) in [
         (LimitKind::MemoryHigh, limits.memory_high_bytes.is_some()),
+        (LimitKind::MemoryMax, limits.memory_max_bytes.is_some()),
+        (
+            LimitKind::MemorySwapMax,
+            limits.memory_swap_max_bytes.is_some(),
+        ),
         (LimitKind::CpuQuota, limits.cpu_quota_percent.is_some()),
         (LimitKind::TasksMax, limits.tasks_max.is_some()),
     ] {
         if requested && capabilities.limits.get(&kind) != Some(&CapabilityState::Supported) {
             bail!(
-                "requested {kind:?} guardrail is unavailable: {:?}; no stale receipt was removed",
+                "requested {kind:?} resource limit is unavailable: {:?}; no stale receipt was removed",
                 capabilities.limits.get(&kind)
             );
         }
@@ -924,7 +1007,7 @@ pub(crate) fn replace_stale_supervised_resolved(
     _ws: Workspace,
     _expected: BindingReceipt,
     _mode: AttachMode,
-    _limits: SoftLimits,
+    _limits: ResourceLimits,
 ) -> Result<ClientCompletion<()>> {
     bail!("stale supervised replacement is currently supported only on Linux")
 }
@@ -954,12 +1037,28 @@ pub(crate) fn attach_receipted_target(
     bail!("receipted resource targets are currently supported only on Linux")
 }
 
-fn print_limits(out: &mut impl Write, limits: &SoftLimits) -> Result<()> {
+fn print_limits(out: &mut impl Write, limits: &ResourceLimits) -> Result<()> {
     writeln!(
         out,
         "  memory high: {}",
         limits
             .memory_high_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "not set".into())
+    )?;
+    writeln!(
+        out,
+        "  memory max:  {}",
+        limits
+            .memory_max_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "not set".into())
+    )?;
+    writeln!(
+        out,
+        "  swap max:    {}",
+        limits
+            .memory_swap_max_bytes
             .map(format_bytes)
             .unwrap_or_else(|| "not set".into())
     )?;
@@ -1048,7 +1147,7 @@ fn print_resource_event_notice(previous: Option<&ResourceSnapshot>, current: &Re
         for notice in notices {
             eprintln!("  - {notice}");
         }
-        eprintln!("  Run `pa resources status` for the current counters and guardrails.");
+        eprintln!("  Run `pa resources status` for the current counters and limits.");
     }
 }
 
@@ -1060,6 +1159,9 @@ pub fn resources(command: ResourcesCommand) -> Result<()> {
         }
         ResourcesCommand::Stop { session, workspace } => {
             resources_stop(&session, workspace.as_ref())
+        }
+        ResourcesCommand::Cleanup { session, workspace } => {
+            resources_cleanup(&session, workspace.as_ref())
         }
         ResourcesCommand::Kill {
             session,
@@ -1081,7 +1183,7 @@ fn resources_capabilities() -> Result<()> {
     for (kind, state) in report.actions {
         println!("  {kind:?}: {}", capability_label(&state));
     }
-    println!("soft limits:");
+    println!("resource limits:");
     for (kind, state) in report.limits {
         println!("  {kind:?}: {}", capability_label(&state));
     }
@@ -1149,6 +1251,39 @@ fn print_resource_status(
         return Ok(());
     };
     let logical_id = LogicalSessionId::new(workspace_id, session.name.clone())?;
+    if let Some(pending) = store.find_pending(&logical_id)? {
+        println!("ownership: pending-launch");
+        println!("unit: {}", pending.unit_name);
+        println!("target: {:?}", pending.mux_target);
+        println!("marker: {}", pending.marker_path.display());
+        println!(
+            "creator: pid={} start-time-ticks={}",
+            pending.creator_pid, pending.creator_start_time_ticks
+        );
+        if let Some(error) = &pending.last_error {
+            println!("last error: {error}");
+        }
+        match backend.reconcile_pending(&pending)? {
+            crate::supervision::PendingLaunchState::Active(reason) => {
+                println!("pending state: active");
+                println!("evidence: {reason}");
+            }
+            crate::supervision::PendingLaunchState::Dead(reason) => {
+                println!("pending state: dead-cleanable");
+                println!("evidence: {reason}");
+                println!(
+                    "note: run `pa resources cleanup {:?}` to remove this signal-free journal entry",
+                    session.name
+                );
+            }
+            crate::supervision::PendingLaunchState::Ambiguous(reason) => {
+                println!("pending state: ambiguous");
+                println!("evidence: {reason}");
+                println!("note: attach, fallback, creation, stop, and kill remain blocked");
+            }
+        }
+        return Ok(());
+    }
     let Some(receipt) = store.find(&logical_id)? else {
         let ordinary_target = crate::mux::workspace_session_name(&ws.name, &session.name);
         let live = build_mux(ws.multiplexer)
@@ -1182,6 +1317,22 @@ fn print_resource_status(
             drop(out);
             let snapshot = backend.snapshot(&receipt, None)?;
             print_snapshot(&snapshot);
+        }
+        OwnershipState::LegacyRestartRequired(reason) => {
+            println!("ownership: legacy-restart-required");
+            println!("reason: {reason}");
+            println!("target: {:?}", receipt.mux_target);
+            println!("note: attach is allowed; metrics and resource control are withheld");
+        }
+        OwnershipState::SplitContainment(reason) => {
+            println!("ownership: split-containment");
+            println!("reason: {reason}");
+            println!("target: {:?}", receipt.mux_target);
+            println!("note: attach is allowed; external descendants are not covered by service stop or force-kill");
+        }
+        OwnershipState::AmbiguousBinding(reason) => {
+            println!("ownership: ambiguous-binding");
+            println!("reason: {reason}");
         }
         OwnershipState::StaleBinding(reason) => {
             println!("ownership: stale-binding");
@@ -1290,6 +1441,14 @@ fn owned_resource_binding(
         .ok_or_else(|| anyhow!("resource control requires a workspace UUID"))?;
     let logical_id = LogicalSessionId::new(workspace_id, declared.name)?;
     let store = crate::supervision::ReceiptStore::standard()?;
+    if let Some(pending) = store.find_pending(&logical_id)? {
+        bail!(
+            "refusing resource control while a pending launch exists: unit={:?}, target={:?}; use `pa resources status {:?}`",
+            pending.unit_name,
+            pending.mux_target,
+            session
+        );
+    }
     let receipt = store
         .find(&logical_id)?
         .ok_or_else(|| anyhow!("session {session:?} has no Portagenty supervision receipt"))?;
@@ -1315,6 +1474,39 @@ pub(crate) fn graceful_stop_target(target: &MuxTarget) -> Result<()> {
         } => ZellijAdapter::with_runtime_dir(runtime_dir).kill(session),
         _ => bail!("receipt does not contain an exact controllable multiplexer target"),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn resources_cleanup(session: &str, workspace: Option<&PathBuf>) -> Result<()> {
+    let (declared, ws) = resolve(session, workspace)?;
+    let workspace_id = ws
+        .id
+        .as_deref()
+        .ok_or_else(|| anyhow!("resource cleanup requires a workspace UUID"))?;
+    let logical_id = LogicalSessionId::new(workspace_id, declared.name)?;
+    let store = crate::supervision::ReceiptStore::standard()?;
+    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+    if let Some(pending) = store.find_pending(&logical_id)? {
+        backend.remove_dead_pending(&store, &pending)?;
+        println!("removed proven-dead pending launch evidence without signalling any process");
+        return Ok(());
+    }
+    let receipt = store
+        .find(&logical_id)?
+        .ok_or_else(|| anyhow!("session {session:?} has no supervision evidence to clean"))?;
+    match backend.reconcile(&receipt)? {
+        OwnershipState::StaleBinding(_) => {
+            backend.remove_stale_binding(&store, &receipt)?;
+            println!("removed proven-stale supervision receipt without signalling any process");
+            Ok(())
+        }
+        state => bail!("refusing signal-free cleanup for ownership state {state:?}"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resources_cleanup(_session: &str, _workspace: Option<&PathBuf>) -> Result<()> {
+    bail!("resource cleanup is currently implemented only on Linux")
 }
 
 #[cfg(target_os = "linux")]
@@ -2550,6 +2742,35 @@ mod return_banner_tests {
         assert_eq!(
             return_banner("21 - Teaching", "shell"),
             "pa ← returned from \"21 - Teaching / shell\""
+        );
+    }
+
+    #[test]
+    fn stale_replacement_limits_use_current_kind_policy_before_cleanup() {
+        let legacy_claude = ResourceLimits {
+            memory_high_bytes: Some(12 * ResourceLimits::GIB),
+            memory_max_bytes: Some(12 * ResourceLimits::GIB),
+            memory_swap_max_bytes: None,
+            cpu_quota_percent: None,
+            tasks_max: None,
+        };
+        assert_eq!(
+            effective_stale_replacement_limits(
+                Some(crate::domain::SessionKind::ClaudeCode),
+                true,
+                legacy_claude,
+            )
+            .unwrap(),
+            ResourceLimits::claude_defaults()
+        );
+        assert_eq!(
+            effective_stale_replacement_limits(
+                Some(crate::domain::SessionKind::Shell),
+                true,
+                ResourceLimits::claude_defaults(),
+            )
+            .unwrap(),
+            ResourceLimits::default()
         );
     }
 

@@ -134,6 +134,7 @@ multiplexer = "tmux"
 name = "claude"
 cwd = "."
 command = "echo hi"
+kind = "claude-code"
 "#,
         )
         .unwrap();
@@ -141,7 +142,7 @@ command = "echo hi"
 }
 
 #[test]
-fn supervised_launch_dry_run_prints_guardrails() {
+fn supervised_launch_dry_run_prints_resource_limits() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let ws_path = write_supervised_workspace(&tmp);
 
@@ -152,9 +153,13 @@ fn supervised_launch_dry_run_prints_guardrails() {
             "--dry-run",
             "--supervise",
             "--memory-high",
-            "12G",
+            "3G",
+            "--memory-max",
+            "5G",
+            "--memory-swap-max",
+            "512MiB",
             "--cpu-quota",
-            "300",
+            "800",
             "--tasks-max",
             "1200",
         ])
@@ -163,8 +168,10 @@ fn supervised_launch_dry_run_prints_guardrails() {
         .assert()
         .success()
         .stdout(contains("systemd user supervision"))
-        .stdout(contains("12.00 GiB"))
-        .stdout(contains("300%"))
+        .stdout(contains("3.00 GiB"))
+        .stdout(contains("5.00 GiB"))
+        .stdout(contains("512.00 MiB"))
+        .stdout(contains("800%"))
         .stdout(contains("1200"));
 }
 
@@ -180,6 +187,49 @@ fn guardrail_flag_implies_supervision() {
         .assert()
         .success()
         .stdout(contains("systemd user supervision"));
+}
+
+#[test]
+fn claude_policy_rejects_weaker_override() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws_path = write_supervised_workspace(&tmp);
+
+    pa_cmd()
+        .args(["launch", "claude", "--dry-run", "--memory-max", "6G"])
+        .arg("--workspace")
+        .arg(&ws_path)
+        .assert()
+        .failure()
+        .stderr(contains("weaker than the standard policy"));
+}
+
+#[test]
+fn generic_session_does_not_inherit_claude_defaults_from_its_name() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let path = tmp.child("generic.portagenty.toml");
+    path.write_str(
+        r#"
+name = "Generic"
+id = "550e8400-e29b-41d4-a716-446655440000"
+multiplexer = "tmux"
+
+[[session]]
+name = "claude"
+cwd = "."
+command = "claude"
+"#,
+    )
+    .unwrap();
+
+    pa_cmd()
+        .args(["launch", "claude", "--dry-run", "--supervise"])
+        .arg("--workspace")
+        .arg(path.path())
+        .assert()
+        .success()
+        .stdout(contains("memory high: not set"))
+        .stdout(contains("memory max:  not set"))
+        .stdout(contains("swap max:    not set"));
 }
 
 #[test]
@@ -204,6 +254,7 @@ fn resources_help_lists_safe_control_commands() {
         .success()
         .stdout(contains("capabilities"))
         .stdout(contains("status"))
+        .stdout(contains("cleanup"))
         .stdout(contains("stop"))
         .stdout(contains("kill"));
 }

@@ -50,22 +50,44 @@ cgroup v2. Portagenty does not gain root privileges, open a network listener, or
 leave a resident Portagenty process behind. The systemd user manager already has
 the same user-level authority needed to launch and stop the workload.
 
-Ownership is fail-closed. A machine-local receipt under
+Ownership is fail-closed. A machine-local v2 receipt under
 `$XDG_STATE_HOME/portagenty/` records the logical workspace/session identity,
 opaque transient-unit name, systemd `InvocationID`, exact `ControlGroup`, exact
-private multiplexer target, and applied limits. The store uses a private
-directory, mode-`0600` files, advisory locking, same-directory temporary writes,
-fsync, and atomic rename. Before every snapshot or systemd control action,
-Portagenty resolves the invocation again and requires exact unit-name,
-invocation-ID, control-group, canonical cgroup path, user-manager subtree, and
-multiplexer-target agreement. Traversal and symlink escapes from `/sys/fs/cgroup`
-are rejected. A stale or ambiguous receipt disables control rather than widening
-it.
+private multiplexer target, resolved limits, requested slice, and workload-anchor
+evidence (nonce, marker, PID, and `/proc` start time). A pending-launch journal
+protects the interval between transient-unit creation and durable receipt
+persistence. The store uses a private directory, mode-`0600` files, advisory
+locking, same-directory temporary writes, fsync, and atomic rename.
+
+Before receipt finalization, every snapshot, and every systemd control action,
+Portagenty reads back service placement and limits, resolves the invocation again,
+and requires exact unit-name, invocation-ID, control-group, canonical cgroup path,
+user-manager subtree, exact private tmux socket/session/pane PID or Zellij session/runtime target, workload PID/start-time/nonce, and exact
+root cgroup agreement. Descendants are followed only through bounded
+`/proc/<pid>/task/<tid>/children` traversal for every thread ID; there is no global `/proc` scan.
+Traversal and symlink escapes from `/sys/fs/cgroup` are rejected. An escaped root
+cannot become owned. Escaped descendants produce split containment, withholding
+whole-workload metrics and control; a `build-contained` descendant in
+`background.slice` is identified as an external bounded scope rather than claimed.
+
+Existing v1 services remain legacy/restart-required exact-target attach-only until
+they exit and are launched normally under v2. Portagenty does not auto-stop,
+upgrade, or migrate them. Both the stored unit and target absent may permit
+signal-free stale cleanup; partial presence is ambiguous and disables control.
+Pending launches record exact creator process proof and block attach, fallback,
+creation, stop, and kill. They may be signal-free cleaned only when the creator,
+exact unit, exact target, and exact owner-runtime marker are all absent. Existing
+shared tmux/Zellij sessions are never retroactively claimed.
 
 Supervised tmux uses a private mode-`0700` runtime/socket directory and one server
 per logical session. Supervised Zellij uses an exact validated runtime directory,
 a mode-`0600` generated layout, and PTY file descriptors passed through D-Bus.
-Existing shared tmux/Zellij sessions are never retroactively claimed.
+Both launch the same owner-only one-shot workload-anchor protocol. Launch specs
+and markers are constrained to `$XDG_RUNTIME_DIR/portagenty/workloads` with exact
+nonce filenames; marker protocol, nonce, PID, and start time are verified before
+unlink. The private tmux server receives neither `XDG_RUNTIME_DIR` nor
+`DBUS_SESSION_BUS_ADDRESS`, preventing tmux-created sibling scopes, while the pane
+receives exact restored user-bus values.
 
 The transient service receives typed argv and an explicitly constructed
 environment. Multiplexer/systemd activation variables such as `TMUX*`,
@@ -74,11 +96,25 @@ stripped before launch; a validated runtime directory and declared session env
 remain. Workspace commands are still user-authored code and execute with the
 user's permissions.
 
-`MemoryHigh`, CPU quota, and `TasksMax` are soft preventive controls, not a data
-safety guarantee. Ordinary stop performs exact multiplexer shutdown followed by
-revalidated non-force `StopUnit`; `SendSIGKILL=no` prevents implicit escalation.
-Whole-cgroup SIGKILL is a separate explicitly confirmed action. Bulk stop never
-force-escalates and skips stale/ambiguous targets.
+Only explicit `kind = "claude-code"` selects Claude containment; names and
+commands do not. Claude-kind services request `claude-code.slice`,
+`ManagedOOMPreference=omit`, `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, CPU quota,
+and a finite per-service `TasksMax`. Portagenty first verifies that the externally managed aggregate
+slice exists beneath `/claude.slice/claude-code.slice` with finite positive
+`MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, consistent memory
+controls, and oomd-omit metadata. Aggregate `TasksMax` is optional and may remain
+infinity; Portagenty never creates or modifies that slice. Claude overrides may only tighten the standard `3G`/`5G`/`512MiB`/
+`800%`/`1200` policy. Generic sessions remain outside the Claude slice and receive
+no inferred defaults.
+
+`MemoryHigh` is a reclaim threshold; `MemoryMax` and `MemorySwapMax` are hard
+ceilings; CPU quota throttles aggregate CPU; `TasksMax` rejects new tasks. These
+limits reduce damage but are not a data-safety guarantee. Ordinary stop performs
+exact multiplexer shutdown followed by revalidated non-force `StopUnit`;
+`SendSIGKILL=no` prevents implicit escalation. Whole-cgroup SIGKILL is a separate
+explicitly confirmed action available only for complete owned-and-verified v2
+containment. Bulk stop never force-escalates and skips legacy, split, pending,
+stale, and ambiguous targets.
 
 Resource observation reads numeric cgroup files only. Portagenty does not inspect
 terminal contents, prompts, command output, or agent logs, and does not retain
