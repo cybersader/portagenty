@@ -93,6 +93,15 @@ pub enum AppOutcome {
     OpenShellAt(std::path::PathBuf),
 }
 
+/// Final state handed back to the outer coordinator after the event loop.
+/// The workspace may differ from the input when the TUI upgrades a legacy
+/// manifest with a stable UUID before launching a supervised session.
+pub struct AppRunResult {
+    pub outcome: AppOutcome,
+    pub mux: Box<dyn Multiplexer>,
+    pub workspace: Workspace,
+}
+
 /// Internal action dispatch. Returned from [`App::handle_key`] so the
 /// event loop can translate a key press into either continued
 /// in-TUI work or a reason to exit the loop.
@@ -575,13 +584,10 @@ impl App {
     }
 
     /// Consume the app: run the event loop until the user either quits
-    /// or picks a session to launch. Returns the outcome and hands
-    /// back the multiplexer so the outer entry point can call
-    /// [`Multiplexer::create_and_attach`] after restoring the terminal.
-    pub fn run(
-        mut self,
-        terminal: &mut DefaultTerminal,
-    ) -> Result<(AppOutcome, Box<dyn Multiplexer>)> {
+    /// or picks a session to launch. Returns the outcome, multiplexer, and
+    /// final workspace so the outer entry point sees in-TUI manifest upgrades
+    /// before it launches or resumes after a setup failure.
+    pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<AppRunResult> {
         loop {
             // Auto-age the status line so a "cancelled" or "deleted X"
             // message doesn't sit forever when the user walks away.
@@ -606,9 +612,17 @@ impl App {
             // burning CPU.
             if event::poll(std::time::Duration::from_millis(250))? {
                 if let Some(outcome) = self.handle_event()? {
-                    return Ok((outcome, self.mux));
+                    return Ok(self.finish(outcome));
                 }
             }
+        }
+    }
+
+    fn finish(self, outcome: AppOutcome) -> AppRunResult {
+        AppRunResult {
+            outcome,
+            mux: self.mux,
+            workspace: self.workspace,
         }
     }
 
@@ -4444,7 +4458,15 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("# preserved workspace comment"));
         let parsed: crate::config::WorkspaceFile = crate::config::load_toml(&path).unwrap();
-        uuid::Uuid::parse_str(parsed.id.as_deref().unwrap()).unwrap();
+        let assigned_id = parsed.id.unwrap();
+        uuid::Uuid::parse_str(&assigned_id).unwrap();
+
+        let run_result = app.finish(AppOutcome::Back);
+        assert_eq!(
+            run_result.workspace.id.as_deref(),
+            Some(assigned_id.as_str()),
+            "the outer coordinator must receive the workspace reloaded after UUID assignment"
+        );
     }
 
     #[test]

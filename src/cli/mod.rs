@@ -702,7 +702,7 @@ fn launch_supervised_inner(
 ) -> Result<RoutineSupervisedLaunch> {
     let workspace_id = ws.id.as_deref().ok_or_else(|| {
         anyhow!(
-            "supervised launch requires a workspace UUID; re-save or reinitialize this workspace before using --supervise"
+            "supervised launch requires a workspace UUID; open the workspace in the TUI, press `S` on an idle session, and confirm adding a stable ID (reopen before retrying only if you cancel after assignment)"
         )
     })?;
     let logical_id = LogicalSessionId::new(workspace_id, sess.name.clone())?;

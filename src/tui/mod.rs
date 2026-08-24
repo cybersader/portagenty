@@ -12,7 +12,9 @@ pub mod picker;
 pub mod resources;
 pub mod view;
 
-pub use app::{Action, App, AppOutcome, LaunchKind, RowSelectionIdentity, SupervisionIntent};
+pub use app::{
+    Action, App, AppOutcome, AppRunResult, LaunchKind, RowSelectionIdentity, SupervisionIntent,
+};
 pub use view::{build_rows, SessionRow, SessionState};
 
 use anyhow::{Context, Result};
@@ -358,10 +360,6 @@ fn run_session_tui(
     resume_selection: Option<&RowSelectionIdentity>,
     resume_notice: Option<String>,
 ) -> Result<SessionRunOutcome> {
-    let workspace_file = workspace.file_path.clone();
-    let workspace_name = workspace.name.clone();
-    let workspace_for_resume = workspace.clone();
-    let workspace_for_supervision = workspace.clone();
     let mpx_kind = workspace.multiplexer;
     let mux: Box<dyn crate::mux::Multiplexer> = match workspace.multiplexer {
         crate::domain::Multiplexer::Tmux => Box::new(TmuxAdapter::new()),
@@ -406,7 +404,15 @@ fn run_session_tui(
     if let Some(notice) = resume_notice {
         app.set_persistent_status(notice);
     }
-    let (outcome, mux) = app.run(terminal)?;
+    let AppRunResult {
+        outcome,
+        mux,
+        workspace,
+    } = app.run(terminal)?;
+    let workspace_file = workspace.file_path.clone();
+    let workspace_name = workspace.name.clone();
+    let workspace_for_resume = workspace.clone();
+    let workspace_for_supervision = workspace;
 
     let mode = crate::mux::AttachMode::Takeover;
     Ok(match outcome {
