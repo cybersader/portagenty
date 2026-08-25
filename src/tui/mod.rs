@@ -464,6 +464,7 @@ fn run_session_tui(
                         mode,
                         limits.clone(),
                     ) {
+                        #[cfg(target_os = "linux")]
                         Ok(crate::cli::RoutineSupervisedLaunch::ClientReturned(completion)) => {
                             Ok(completion)
                         }
