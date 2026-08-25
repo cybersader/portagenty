@@ -5,6 +5,17 @@ use assert_fs::prelude::*;
 use portagenty::config::{load, LoadOptions};
 use portagenty::domain::Multiplexer;
 
+fn walkup_isolated_tempdir() -> assert_fs::TempDir {
+    #[cfg(unix)]
+    {
+        assert_fs::TempDir::new_in("/tmp").unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        assert_fs::TempDir::new().unwrap()
+    }
+}
+
 #[test]
 fn load_explicit_path_end_to_end() {
     let tmp = assert_fs::TempDir::new().unwrap();
@@ -85,7 +96,7 @@ multiplexer = "tmux"
 
 #[test]
 fn load_errors_when_no_workspace_found() {
-    let tmp = assert_fs::TempDir::new().unwrap();
+    let tmp = walkup_isolated_tempdir();
     let empty = tmp.child("empty");
     empty.create_dir_all().unwrap();
 

@@ -53,10 +53,17 @@ pub fn workspace_in_dir(dir: &Path) -> Option<PathBuf> {
 /// Returns `None` after reaching the filesystem root without a hit.
 /// The returned path is the one found, not the directory containing it.
 pub fn walk_up_from(start: &Path) -> Option<PathBuf> {
+    walk_up_from_with_ceiling(start, None)
+}
+
+fn walk_up_from_with_ceiling(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
     let mut cur: Option<&Path> = Some(start);
     while let Some(dir) = cur {
         if let Some(found) = workspace_in_dir(dir) {
             return Some(found);
+        }
+        if ceiling.is_some_and(|ceiling| dir == ceiling) {
+            return None;
         }
         cur = dir.parent();
     }
@@ -175,9 +182,9 @@ mod tests {
         let tmp = assert_fs::TempDir::new().unwrap();
         let sub = tmp.child("sub");
         sub.create_dir_all().unwrap();
-        // No *.portagenty.toml anywhere from `sub` up (the walk stops at
-        // the filesystem root; no match is expected).
-        assert!(walk_up_from(sub.path()).is_none());
+        // Bound the test at its fixture root so a real workspace file in an
+        // ancestor of the test runner's temp directory cannot leak in.
+        assert!(walk_up_from_with_ceiling(sub.path(), Some(tmp.path())).is_none());
     }
 
     #[test]

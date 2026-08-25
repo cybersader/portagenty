@@ -16,6 +16,7 @@ pub mod protocol;
 pub mod scaffold;
 pub mod snippets;
 pub mod state;
+pub mod supervision;
 pub mod tui;
 pub mod workspace_edit;
 
@@ -36,7 +37,28 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             shared,
             resume,
             fresh,
-        }) => cli::launch(&session, workspace.as_ref(), dry_run, shared, resume, fresh),
+            supervise,
+            memory_high,
+            memory_max,
+            memory_swap_max,
+            cpu_quota,
+            tasks_max,
+        }) => cli::launch(
+            &session,
+            workspace.as_ref(),
+            dry_run,
+            shared,
+            resume,
+            fresh,
+            cli::LaunchSupervisionOptions {
+                enabled: supervise,
+                memory_high: memory_high.as_deref(),
+                memory_max: memory_max.as_deref(),
+                memory_swap_max: memory_swap_max.as_deref(),
+                cpu_quota: cpu_quota.as_deref(),
+                tasks_max: tasks_max.as_deref(),
+            },
+        ),
         Some(Command::Claim {
             session,
             workspace,
@@ -50,6 +72,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             resume,
             fresh,
         ),
+        Some(Command::Resources(command)) => cli::resources(command),
         Some(Command::List { workspace }) => cli::list(workspace.as_ref()),
         Some(Command::Export {
             workspace,
@@ -64,6 +87,17 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }) => cli::init(name, mpx, force, with_agent_hooks),
         Some(Command::Snippets(cmd)) => cli::snippets(cmd),
         Some(Command::Onboard) => cli::onboard(),
+        Some(Command::WorkloadAnchor { spec }) => {
+            #[cfg(target_os = "linux")]
+            {
+                supervision::linux_systemd::run_workload_anchor(&spec)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = spec;
+                anyhow::bail!("workload anchors are supported only on Linux")
+            }
+        }
         Some(Command::Completions { shell }) => cli::completions(shell),
         Some(Command::Add {
             name,

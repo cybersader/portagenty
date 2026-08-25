@@ -4,12 +4,20 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::config::{load, LoadOptions};
 use crate::domain::{Multiplexer as MpxEnum, Session, Workspace};
-use crate::mux::{AttachMode, Multiplexer, TmuxAdapter, ZellijAdapter};
+use crate::mux::{
+    AttachMode, ClientCompletion, ClientExit, Multiplexer, TmuxAdapter, ZellijAdapter,
+};
+use crate::supervision::model::{parse_cpu_quota, parse_memory_size, parse_tasks_max};
+use crate::supervision::{BindingReceipt, CapabilityState, MuxTarget, ResourceLimits};
+#[cfg(target_os = "linux")]
+use crate::supervision::{
+    LimitKind, LogicalSessionId, MetricValue, OwnershipState, ResourceSnapshot, SupervisionBackend,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -74,6 +82,34 @@ pub enum Command {
         /// state (reset to the workspace's declared command).
         #[arg(long = "fresh")]
         fresh: bool,
+
+        /// Launch this session in an owned systemd user service with
+        /// cgroup-v2 resource attribution. Currently implemented only on
+        /// Linux hosts with a systemd user manager.
+        #[arg(long = "supervise")]
+        supervise: bool,
+
+        /// Memory-reclaim threshold (IEC sizes such as 3G or 512MiB).
+        /// Implies --supervise; this is MemoryHigh, not a hard OOM limit.
+        #[arg(long = "memory-high")]
+        memory_high: Option<String>,
+
+        /// Hard memory limit (IEC sizes such as 5G or 4096MiB). Implies --supervise.
+        #[arg(long = "memory-max")]
+        memory_max: Option<String>,
+
+        /// Hard swap limit (IEC sizes such as 512MiB). Implies --supervise.
+        #[arg(long = "memory-swap-max")]
+        memory_swap_max: Option<String>,
+
+        /// CPU quota as a percentage. Values above 100 use multiple cores.
+        /// Implies --supervise.
+        #[arg(long = "cpu-quota")]
+        cpu_quota: Option<String>,
+
+        /// Maximum tasks/threads in the owned cgroup. Implies --supervise.
+        #[arg(long = "tasks-max")]
+        tasks_max: Option<String>,
     },
     /// "Make this device the main session." Short-form alias for
     /// `launch --takeover` that defaults the session name to the
@@ -103,6 +139,9 @@ pub enum Command {
         #[arg(long = "fresh")]
         fresh: bool,
     },
+    /// Inspect and safely control Portagenty-owned resource containers.
+    #[command(subcommand)]
+    Resources(ResourcesCommand),
     /// Print the currently-resolved workspace (name, multiplexer,
     /// sessions) to stdout.
     List {
@@ -235,6 +274,11 @@ pub enum Command {
     /// workspace in the current directory, picks a multiplexer,
     /// optionally pre-populates a Claude Code session. Safe to re-run.
     Onboard,
+    #[command(name = "__workload-anchor", hide = true)]
+    WorkloadAnchor {
+        #[arg(long)]
+        spec: PathBuf,
+    },
     /// Emit a shell completion script for the named shell. Pipe it
     /// into the completion file your shell loads — see the commands
     /// reference for per-shell install hints.
@@ -292,6 +336,50 @@ pub enum Command {
         #[arg(value_name = "PCONV_ARGS")]
         args: Vec<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ResourcesCommand {
+    /// Report backend, metric, control, and resource-limit capabilities.
+    Capabilities,
+    /// Show ownership and current cgroup metrics for one or all declared sessions.
+    Status {
+        session: Option<String>,
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
+    /// Gracefully stop the exact receipted multiplexer target, then stop its
+    /// verified systemd unit if descendants remain. Never sends SIGKILL.
+    Stop {
+        session: String,
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
+    /// Remove only proven-dead pending evidence or a proven-stale receipt.
+    /// Never signals a process or stops a unit.
+    Cleanup {
+        session: String,
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
+    /// Force-kill the exact verified systemd control group. Requires --force.
+    Kill {
+        session: String,
+        #[arg(long = "force", required = true)]
+        force: bool,
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchSupervisionOptions<'a> {
+    pub enabled: bool,
+    pub memory_high: Option<&'a str>,
+    pub memory_max: Option<&'a str>,
+    pub memory_swap_max: Option<&'a str>,
+    pub cpu_quota: Option<&'a str>,
+    pub tasks_max: Option<&'a str>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -464,6 +552,7 @@ pub fn launch(
     shared: bool,
     resume: bool,
     fresh: bool,
+    supervision: LaunchSupervisionOptions<'_>,
 ) -> Result<()> {
     let (mut sess, ws) = resolve(session, workspace)?;
     let mode = if shared {
@@ -476,6 +565,26 @@ pub fn launch(
         apply_resume_modifier(&mut sess)?;
     }
 
+    let limits = parse_resource_limits(
+        supervision.memory_high,
+        supervision.memory_max,
+        supervision.memory_swap_max,
+        supervision.cpu_quota,
+        supervision.tasks_max,
+    )?;
+    if supervision.enabled || !limits.is_empty() {
+        let limits = limits.resolve_for_kind(sess.kind)?;
+        let workspace_name = ws.name.clone();
+        let session_name = sess.name.clone();
+        let result = launch_supervised_resolved(sess, ws, dry_run, mode, fresh, limits)?;
+        if dry_run {
+            return Ok(());
+        }
+        return finish_client_return(result, &workspace_name, &session_name);
+    }
+
+    let workspace_name = ws.name.clone();
+    let session_name = sess.name.clone();
     let mux = build_mux(ws.multiplexer)?;
     let mpx_name = crate::mux::workspace_session_name(&ws.name, &sess.name);
 
@@ -521,8 +630,934 @@ pub fn launch(
         let _ = crate::state::record_launch(path, &sess.name);
     }
 
-    mux.create_and_attach(&sess, &mpx_name, mode)
-        .with_context(|| format!("launching session {:?}", sess.name))
+    let completion = mux
+        .create_and_attach(&sess, &mpx_name, mode)
+        .with_context(|| format!("launching session {:?}", sess.name))?
+        .map(|_| ());
+    finish_client_return(completion, &workspace_name, &session_name)
+}
+
+pub(crate) fn return_banner(workspace_name: &str, session_name: &str) -> String {
+    format!(
+        "pa ← returned from {:?}",
+        format!("{workspace_name} / {session_name}")
+    )
+}
+
+pub(crate) fn print_return_banner(workspace_name: &str, session_name: &str) {
+    eprintln!();
+    eprintln!("  {}", return_banner(workspace_name, session_name));
+    eprintln!();
+}
+
+pub(crate) fn client_exit_message(exit: ClientExit) -> String {
+    match (exit.code, exit.signal) {
+        (Some(code), _) => format!("multiplexer client exited abnormally with code {code}"),
+        (None, Some(signal)) => format!("multiplexer client was terminated by signal {signal}"),
+        (None, None) => "multiplexer client exited abnormally".into(),
+    }
+}
+
+pub(crate) fn finish_client_return(
+    completion: ClientCompletion<()>,
+    workspace_name: &str,
+    session_name: &str,
+) -> Result<()> {
+    print_return_banner(workspace_name, session_name);
+    match completion {
+        ClientCompletion::Returned(()) => Ok(()),
+        ClientCompletion::Abnormal(exit) => {
+            let message = client_exit_message(exit);
+            eprintln!("  pa: {message}");
+            Err(anyhow!(message))
+        }
+    }
+}
+
+fn parse_resource_limits(
+    memory_high: Option<&str>,
+    memory_max: Option<&str>,
+    memory_swap_max: Option<&str>,
+    cpu_quota: Option<&str>,
+    tasks_max: Option<&str>,
+) -> Result<ResourceLimits> {
+    let limits = ResourceLimits {
+        memory_high_bytes: memory_high.map(parse_memory_size).transpose()?,
+        memory_max_bytes: memory_max.map(parse_memory_size).transpose()?,
+        memory_swap_max_bytes: memory_swap_max.map(parse_memory_size).transpose()?,
+        cpu_quota_percent: cpu_quota.map(parse_cpu_quota).transpose()?,
+        tasks_max: tasks_max.map(parse_tasks_max).transpose()?,
+    };
+    limits.validate_consistency()?;
+    Ok(limits)
+}
+
+pub(crate) enum RoutineSupervisedLaunch {
+    #[cfg(target_os = "linux")]
+    ClientReturned(ClientCompletion<()>),
+    FallbackSafe(anyhow::Error),
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_supervised_resolved(
+    sess: Session,
+    ws: Workspace,
+    dry_run: bool,
+    mode: AttachMode,
+    fresh: bool,
+    limits: ResourceLimits,
+) -> Result<ClientCompletion<()>> {
+    match launch_supervised_inner(sess, ws, dry_run, mode, fresh, limits, false)? {
+        RoutineSupervisedLaunch::ClientReturned(completion) => Ok(completion),
+        RoutineSupervisedLaunch::FallbackSafe(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_supervised_routine_resolved(
+    sess: Session,
+    ws: Workspace,
+    mode: AttachMode,
+    limits: ResourceLimits,
+) -> Result<RoutineSupervisedLaunch> {
+    launch_supervised_inner(sess, ws, false, mode, false, limits, true)
+}
+
+#[cfg(target_os = "linux")]
+fn launch_supervised_inner(
+    sess: Session,
+    ws: Workspace,
+    dry_run: bool,
+    mode: AttachMode,
+    fresh: bool,
+    limits: ResourceLimits,
+    allow_fallback: bool,
+) -> Result<RoutineSupervisedLaunch> {
+    let workspace_id = ws.id.as_deref().ok_or_else(|| {
+        anyhow!(
+            "supervised launch requires a workspace UUID; open the workspace in the TUI, press `S` on an idle session, and confirm adding a stable ID (reopen before retrying only if you cancel after assignment)"
+        )
+    })?;
+    let logical_id = LogicalSessionId::new(workspace_id, sess.name.clone())?;
+
+    if dry_run {
+        let out = io::stdout();
+        let mut out = out.lock();
+        writeln!(
+            out,
+            "would launch {:?} under Linux systemd user supervision",
+            sess.name
+        )?;
+        writeln!(out, "  multiplexer: {:?}", ws.multiplexer)?;
+        writeln!(out, "  cwd:         {}", sess.cwd.display())?;
+        writeln!(out, "  command:     {}", sess.command)?;
+        print_limits(&mut out, &limits)?;
+        if fresh {
+            writeln!(
+                out,
+                "  fresh:       refused if an owned supervision receipt already exists"
+            )?;
+        }
+        return Ok(RoutineSupervisedLaunch::ClientReturned(
+            ClientCompletion::Returned(()),
+        ));
+    }
+
+    let store = crate::supervision::ReceiptStore::standard()?;
+    if let Some(pending) = store.find_pending(&logical_id)? {
+        bail!(
+            "a pending supervision launch blocks ordinary fallback and new creation: unit={:?}, target={:?}, last_error={:?}; inspect with `pa resources status {:?}` and clear only proven-dead evidence with `pa resources cleanup {:?}`",
+            pending.unit_name,
+            pending.mux_target,
+            pending.last_error,
+            sess.name,
+            sess.name
+        );
+    }
+    let existing = store.find(&logical_id)?;
+    let ordinary_target = crate::mux::workspace_session_name(&ws.name, &sess.name);
+    if existing.is_none() {
+        let ordinary_mux = build_mux(ws.multiplexer)?;
+        if ordinary_mux.has_session(&ordinary_target)? {
+            bail!(
+                "an existing unverified multiplexer session {ordinary_target:?} is already live; Portagenty will not claim it as supervised"
+            );
+        }
+    }
+
+    let backend = match crate::supervision::LinuxSystemdBackend::connect() {
+        Ok(backend) => backend,
+        Err(error) if allow_fallback && existing.is_none() => {
+            return Ok(RoutineSupervisedLaunch::FallbackSafe(error.context(
+                "connecting to Linux systemd user supervision before any workload was created",
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let capabilities = backend.capabilities();
+    let unavailable = if capabilities.overall != CapabilityState::Supported {
+        Some(anyhow!(
+            "resource supervision is unavailable: {:?}",
+            capabilities.overall
+        ))
+    } else {
+        [
+            (LimitKind::MemoryHigh, limits.memory_high_bytes.is_some()),
+            (LimitKind::MemoryMax, limits.memory_max_bytes.is_some()),
+            (
+                LimitKind::MemorySwapMax,
+                limits.memory_swap_max_bytes.is_some(),
+            ),
+            (LimitKind::CpuQuota, limits.cpu_quota_percent.is_some()),
+            (LimitKind::TasksMax, limits.tasks_max.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(kind, requested)| {
+            if !requested {
+                return None;
+            }
+            let state = capabilities.limits.get(&kind);
+            (state != Some(&CapabilityState::Supported))
+                .then(|| anyhow!("requested {kind:?} resource limit is unavailable: {state:?}"))
+        })
+    };
+    if let Some(error) = unavailable {
+        if allow_fallback && existing.is_none() {
+            return Ok(RoutineSupervisedLaunch::FallbackSafe(error));
+        }
+        return Err(error);
+    }
+    if fresh && existing.is_some() {
+        bail!(
+            "--fresh cannot replace an owned supervised workload; use `pa resources stop {:?}` first",
+            sess.name
+        );
+    }
+    if let Some(receipt) = &existing {
+        match backend.reconcile(receipt)? {
+            OwnershipState::LegacyRestartRequired(reason) => {
+                eprintln!("pa: legacy supervised service is attach-only: {reason}");
+                return Ok(RoutineSupervisedLaunch::ClientReturned(
+                    attach_receipted_target(&receipt.mux_target, mode)?,
+                ));
+            }
+            OwnershipState::SplitContainment(reason) => {
+                eprintln!("pa: split containment; attaching without resource ownership: {reason}");
+                return Ok(RoutineSupervisedLaunch::ClientReturned(
+                    attach_receipted_target(&receipt.mux_target, mode)?,
+                ));
+            }
+            OwnershipState::OwnedVerified(_) => {}
+            state => bail!("existing supervision receipt is not attachable: {state:?}"),
+        }
+        if !allow_fallback && !limits.is_empty() && receipt.limits != limits {
+            bail!(
+                "this supervised session already exists with different resource limits; stop it before launching with new limits"
+            );
+        }
+    } else {
+        let ordinary_mux = build_mux(ws.multiplexer)?;
+        if ordinary_mux.has_session(&ordinary_target)? {
+            bail!(
+                "an existing unverified multiplexer session {ordinary_target:?} appeared during supervised preflight; Portagenty will not claim it"
+            );
+        }
+    }
+
+    if let Some(path) = &ws.file_path {
+        let _ = crate::state::record_launch(path, &sess.name);
+    }
+    let receipt = match ws.multiplexer {
+        MpxEnum::Tmux => backend.create_tmux_binding(&store, logical_id, &sess, limits)?,
+        MpxEnum::Zellij => {
+            backend.create_zellij_binding(&store, logical_id, &ws.name, &sess, limits)?
+        }
+        MpxEnum::Wezterm => bail!("supervised WezTerm sessions are not supported"),
+    };
+    let before = backend.snapshot(&receipt, None).ok();
+    let completion = attach_receipted_target(&receipt.mux_target, mode)
+        .with_context(|| format!("attaching to supervised session {:?}", sess.name))?;
+    if let Ok(after) = backend.snapshot(&receipt, before.as_ref()) {
+        print_resource_event_notice(before.as_ref(), &after);
+    }
+    Ok(RoutineSupervisedLaunch::ClientReturned(completion))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn launch_supervised_resolved(
+    _sess: Session,
+    _ws: Workspace,
+    _dry_run: bool,
+    _mode: AttachMode,
+    _fresh: bool,
+    _limits: ResourceLimits,
+) -> Result<ClientCompletion<()>> {
+    bail!(
+        "resource supervision is currently implemented only on Linux with systemd user services and cgroup v2"
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn launch_supervised_routine_resolved(
+    _sess: Session,
+    _ws: Workspace,
+    _mode: AttachMode,
+    _limits: ResourceLimits,
+) -> Result<RoutineSupervisedLaunch> {
+    Ok(RoutineSupervisedLaunch::FallbackSafe(anyhow!(
+        "resource supervision is currently implemented only on Linux with systemd user services and cgroup v2"
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn effective_stale_replacement_limits(
+    kind: Option<crate::domain::SessionKind>,
+    legacy_receipt: bool,
+    requested: ResourceLimits,
+) -> Result<ResourceLimits> {
+    if legacy_receipt {
+        Ok(ResourceLimits::defaults_for_kind(kind))
+    } else {
+        requested.resolve_for_kind(kind)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn replace_stale_supervised_resolved(
+    sess: Session,
+    ws: Workspace,
+    expected: BindingReceipt,
+    mode: AttachMode,
+    limits: ResourceLimits,
+) -> Result<ClientCompletion<()>> {
+    let limits = effective_stale_replacement_limits(sess.kind, expected.is_legacy(), limits)?;
+    let workspace_id = ws
+        .id
+        .as_deref()
+        .ok_or_else(|| anyhow!("stale supervised replacement requires a valid workspace UUID"))?;
+    let logical_id = LogicalSessionId::new(workspace_id, sess.name.clone())?;
+    if expected.logical_id != logical_id {
+        bail!("the confirmed stale receipt does not match the selected workspace/session");
+    }
+    let store = crate::supervision::ReceiptStore::standard()?;
+    if store.find_pending(&logical_id)?.is_some() {
+        bail!("a pending supervision launch exists; no stale receipt was removed");
+    }
+    if store.find(&logical_id)?.as_ref() != Some(&expected) {
+        bail!("the ownership receipt changed after confirmation; refresh and retry");
+    }
+    let ordinary_target = crate::mux::workspace_session_name(&ws.name, &sess.name);
+    let ordinary_mux = build_mux(ws.multiplexer)?;
+    if ordinary_mux.has_session(&ordinary_target)? {
+        bail!(
+            "an ordinary multiplexer target {ordinary_target:?} is live; no stale receipt was removed"
+        );
+    }
+    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+    let capabilities = backend.capabilities();
+    if capabilities.overall != CapabilityState::Supported {
+        bail!(
+            "resource supervision is unavailable: {:?}; no stale receipt was removed",
+            capabilities.overall
+        );
+    }
+    for (kind, requested) in [
+        (LimitKind::MemoryHigh, limits.memory_high_bytes.is_some()),
+        (LimitKind::MemoryMax, limits.memory_max_bytes.is_some()),
+        (
+            LimitKind::MemorySwapMax,
+            limits.memory_swap_max_bytes.is_some(),
+        ),
+        (LimitKind::CpuQuota, limits.cpu_quota_percent.is_some()),
+        (LimitKind::TasksMax, limits.tasks_max.is_some()),
+    ] {
+        if requested && capabilities.limits.get(&kind) != Some(&CapabilityState::Supported) {
+            bail!(
+                "requested {kind:?} resource limit is unavailable: {:?}; no stale receipt was removed",
+                capabilities.limits.get(&kind)
+            );
+        }
+    }
+
+    backend.remove_stale_binding(&store, &expected)?;
+    if ordinary_mux.has_session(&ordinary_target)? {
+        bail!(
+            "an ordinary multiplexer target {ordinary_target:?} appeared after stale cleanup; refusing supervised creation"
+        );
+    }
+    if let Some(path) = &ws.file_path {
+        let _ = crate::state::record_launch(path, &sess.name);
+    }
+    let receipt = match ws.multiplexer {
+        MpxEnum::Tmux => backend.create_tmux_binding(&store, logical_id, &sess, limits)?,
+        MpxEnum::Zellij => {
+            backend.create_zellij_binding(&store, logical_id, &ws.name, &sess, limits)?
+        }
+        MpxEnum::Wezterm => bail!("supervised WezTerm sessions are not supported"),
+    };
+    let before = backend.snapshot(&receipt, None).ok();
+    let completion = attach_receipted_target(&receipt.mux_target, mode)
+        .with_context(|| format!("attaching to supervised session {:?}", sess.name))?;
+    if let Ok(after) = backend.snapshot(&receipt, before.as_ref()) {
+        print_resource_event_notice(before.as_ref(), &after);
+    }
+    Ok(completion)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn replace_stale_supervised_resolved(
+    _sess: Session,
+    _ws: Workspace,
+    _expected: BindingReceipt,
+    _mode: AttachMode,
+    _limits: ResourceLimits,
+) -> Result<ClientCompletion<()>> {
+    bail!("stale supervised replacement is currently supported only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_receipted_target(
+    target: &MuxTarget,
+    mode: AttachMode,
+) -> Result<ClientCompletion<()>> {
+    match target {
+        MuxTarget::TmuxPrivate { socket, session } => {
+            TmuxAdapter::with_socket(socket).attach(session, mode)
+        }
+        MuxTarget::Zellij {
+            session,
+            runtime_dir: Some(runtime_dir),
+        } => ZellijAdapter::with_runtime_dir(runtime_dir).attach(session, mode),
+        _ => bail!("receipt does not contain an exact supervised multiplexer target"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn attach_receipted_target(
+    _target: &MuxTarget,
+    _mode: AttachMode,
+) -> Result<ClientCompletion<()>> {
+    bail!("receipted resource targets are currently supported only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn print_limits(out: &mut impl Write, limits: &ResourceLimits) -> Result<()> {
+    writeln!(
+        out,
+        "  memory high: {}",
+        limits
+            .memory_high_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "not set".into())
+    )?;
+    writeln!(
+        out,
+        "  memory max:  {}",
+        limits
+            .memory_max_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "not set".into())
+    )?;
+    writeln!(
+        out,
+        "  swap max:    {}",
+        limits
+            .memory_swap_max_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "not set".into())
+    )?;
+    writeln!(
+        out,
+        "  CPU quota:  {}",
+        limits
+            .cpu_quota_percent
+            .map(|value| format!("{value}%"))
+            .unwrap_or_else(|| "not set".into())
+    )?;
+    writeln!(
+        out,
+        "  tasks max:  {}",
+        limits
+            .tasks_max
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "not set".into())
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn format_bytes(value: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let value_f64 = value as f64;
+    if value_f64 >= GIB {
+        format!("{:.2} GiB", value_f64 / GIB)
+    } else if value_f64 >= MIB {
+        format!("{:.2} MiB", value_f64 / MIB)
+    } else if value_f64 >= KIB {
+        format!("{:.2} KiB", value_f64 / KIB)
+    } else {
+        format!("{value} B")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn metric_counter(snapshot: &ResourceSnapshot, group: &str, key: &str) -> Option<u64> {
+    let metric = match group {
+        "memory" => &snapshot.memory_events,
+        "swap" => &snapshot.swap_events,
+        "tasks" => &snapshot.tasks_events,
+        _ => return None,
+    };
+    match metric {
+        MetricValue::Value(values) => values.get(key).copied(),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn print_resource_event_notice(previous: Option<&ResourceSnapshot>, current: &ResourceSnapshot) {
+    let Some(previous) = previous else {
+        return;
+    };
+    let mut notices = Vec::new();
+    for (group, key, label) in [
+        ("memory", "high", "MemoryHigh reclaim events"),
+        ("memory", "oom", "cgroup OOM events"),
+        ("memory", "oom_kill", "kernel OOM kills"),
+        ("tasks", "max", "TasksMax rejections"),
+    ] {
+        let old = metric_counter(previous, group, key).unwrap_or(0);
+        let new = metric_counter(current, group, key).unwrap_or(0);
+        if new > old {
+            notices.push(format!("{label}: +{}", new - old));
+        }
+    }
+    let old_throttled = match &previous.cpu {
+        MetricValue::Value(cpu) => cpu.extra.get("nr_throttled").copied().unwrap_or(0),
+        _ => 0,
+    };
+    let new_throttled = match &current.cpu {
+        MetricValue::Value(cpu) => cpu.extra.get("nr_throttled").copied().unwrap_or(0),
+        _ => 0,
+    };
+    if new_throttled > old_throttled {
+        notices.push(format!(
+            "CPU quota throttle periods: +{}",
+            new_throttled - old_throttled
+        ));
+    }
+    if !notices.is_empty() {
+        eprintln!();
+        eprintln!("  pa: resource events occurred while this session was attached:");
+        for notice in notices {
+            eprintln!("  - {notice}");
+        }
+        eprintln!("  Run `pa resources status` for the current counters and limits.");
+    }
+}
+
+pub fn resources(command: ResourcesCommand) -> Result<()> {
+    match command {
+        ResourcesCommand::Capabilities => resources_capabilities(),
+        ResourcesCommand::Status { session, workspace } => {
+            resources_status(session.as_deref(), workspace.as_ref())
+        }
+        ResourcesCommand::Stop { session, workspace } => {
+            resources_stop(&session, workspace.as_ref())
+        }
+        ResourcesCommand::Cleanup { session, workspace } => {
+            resources_cleanup(&session, workspace.as_ref())
+        }
+        ResourcesCommand::Kill {
+            session,
+            force,
+            workspace,
+        } => resources_kill(&session, force, workspace.as_ref()),
+    }
+}
+
+fn resources_capabilities() -> Result<()> {
+    let report = crate::supervision::platform_backend().capabilities();
+    println!("backend: {:?}", report.backend);
+    println!("overall: {}", capability_label(&report.overall));
+    println!("metrics:");
+    for (kind, state) in report.metrics {
+        println!("  {kind:?}: {}", capability_label(&state));
+    }
+    println!("actions:");
+    for (kind, state) in report.actions {
+        println!("  {kind:?}: {}", capability_label(&state));
+    }
+    println!("resource limits:");
+    for (kind, state) in report.limits {
+        println!("  {kind:?}: {}", capability_label(&state));
+    }
+    for note in report.notes {
+        println!("note: {note}");
+    }
+    Ok(())
+}
+
+fn capability_label(state: &CapabilityState) -> String {
+    match state {
+        CapabilityState::Supported => "supported".into(),
+        CapabilityState::Unavailable(reason) => format!("unavailable: {reason}"),
+        CapabilityState::NotImplemented => "not implemented".into(),
+        CapabilityState::Unsupported => "unsupported".into(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resources_status(session: Option<&str>, workspace: Option<&PathBuf>) -> Result<()> {
+    let ws = load(&LoadOptions {
+        workspace_path: workspace.cloned(),
+        ..Default::default()
+    })?;
+    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+    let store = crate::supervision::ReceiptStore::standard()?;
+    let sessions: Vec<&Session> = match session {
+        Some(name) => vec![ws
+            .sessions
+            .iter()
+            .find(|candidate| candidate.name == name)
+            .ok_or_else(|| anyhow!("no session named {name:?} in workspace {:?}", ws.name))?],
+        None => ws.sessions.iter().collect(),
+    };
+    if sessions.is_empty() {
+        println!("workspace {:?} has no declared sessions", ws.name);
+        return Ok(());
+    }
+    for (index, declared) in sessions.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        print_resource_status(&ws, declared, &backend, &store)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resources_status(_session: Option<&str>, _workspace: Option<&PathBuf>) -> Result<()> {
+    bail!(
+        "resource status is currently implemented only on Linux with systemd user services and cgroup v2"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn print_resource_status(
+    ws: &Workspace,
+    session: &Session,
+    backend: &crate::supervision::LinuxSystemdBackend,
+    store: &crate::supervision::ReceiptStore,
+) -> Result<()> {
+    println!("session: {}", session.name);
+    let Some(workspace_id) = ws.id.as_deref() else {
+        println!("ownership: unsupported (workspace has no UUID)");
+        return Ok(());
+    };
+    let logical_id = LogicalSessionId::new(workspace_id, session.name.clone())?;
+    if let Some(pending) = store.find_pending(&logical_id)? {
+        println!("ownership: pending-launch");
+        println!("unit: {}", pending.unit_name);
+        println!("target: {:?}", pending.mux_target);
+        println!("marker: {}", pending.marker_path.display());
+        println!(
+            "creator: pid={} start-time-ticks={}",
+            pending.creator_pid, pending.creator_start_time_ticks
+        );
+        if let Some(error) = &pending.last_error {
+            println!("last error: {error}");
+        }
+        match backend.reconcile_pending(&pending)? {
+            crate::supervision::PendingLaunchState::Active(reason) => {
+                println!("pending state: active");
+                println!("evidence: {reason}");
+            }
+            crate::supervision::PendingLaunchState::Dead(reason) => {
+                println!("pending state: dead-cleanable");
+                println!("evidence: {reason}");
+                println!(
+                    "note: run `pa resources cleanup {:?}` to remove this signal-free journal entry",
+                    session.name
+                );
+            }
+            crate::supervision::PendingLaunchState::Ambiguous(reason) => {
+                println!("pending state: ambiguous");
+                println!("evidence: {reason}");
+                println!("note: attach, fallback, creation, stop, and kill remain blocked");
+            }
+        }
+        return Ok(());
+    }
+    let Some(receipt) = store.find(&logical_id)? else {
+        let ordinary_target = crate::mux::workspace_session_name(&ws.name, &session.name);
+        let live = build_mux(ws.multiplexer)
+            .and_then(|mux| mux.has_session(&ordinary_target))
+            .unwrap_or(false);
+        println!(
+            "ownership: {}",
+            if live {
+                "existing-unverified"
+            } else {
+                "idle-supported"
+            }
+        );
+        if live {
+            println!(
+                "note: live multiplexer target {ordinary_target:?} is not cgroup-owned by Portagenty"
+            );
+        }
+        return Ok(());
+    };
+
+    match backend.reconcile(&receipt)? {
+        OwnershipState::OwnedVerified(_) => {
+            println!("ownership: owned-and-verified");
+            println!("unit: {}", receipt.unit_name);
+            println!("invocation: {}", receipt.invocation_id);
+            println!("control group: {}", receipt.control_group);
+            println!("target: {:?}", receipt.mux_target);
+            let mut out = io::stdout().lock();
+            print_limits(&mut out, &receipt.limits)?;
+            drop(out);
+            let snapshot = backend.snapshot(&receipt, None)?;
+            print_snapshot(&snapshot);
+        }
+        OwnershipState::LegacyRestartRequired(reason) => {
+            println!("ownership: legacy-restart-required");
+            println!("reason: {reason}");
+            println!("target: {:?}", receipt.mux_target);
+            println!("note: attach is allowed; metrics and resource control are withheld");
+        }
+        OwnershipState::SplitContainment(reason) => {
+            println!("ownership: split-containment");
+            println!("reason: {reason}");
+            println!("target: {:?}", receipt.mux_target);
+            println!("note: attach is allowed; external descendants are not covered by service stop or force-kill");
+        }
+        OwnershipState::AmbiguousBinding(reason) => {
+            println!("ownership: ambiguous-binding");
+            println!("reason: {reason}");
+        }
+        OwnershipState::StaleBinding(reason) => {
+            println!("ownership: stale-binding");
+            println!("reason: {reason}");
+        }
+        state => println!("ownership: {state:?}"),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn print_snapshot(snapshot: &ResourceSnapshot) {
+    println!(
+        "captured at: {} ms since epoch",
+        snapshot.captured_at_unix_ms
+    );
+    println!("CPU: {}", metric_debug(&snapshot.cpu));
+    println!("CPU rate: {}", metric_number(&snapshot.cpu_percent, "%"));
+    println!(
+        "memory current: {}",
+        metric_bytes(&snapshot.memory_current_bytes)
+    );
+    println!("memory peak: {}", metric_bytes(&snapshot.memory_peak_bytes));
+    println!("memory events: {}", metric_debug(&snapshot.memory_events));
+    println!(
+        "swap current: {}",
+        metric_bytes(&snapshot.swap_current_bytes)
+    );
+    println!("swap peak: {}", metric_bytes(&snapshot.swap_peak_bytes));
+    println!("swap events: {}", metric_debug(&snapshot.swap_events));
+    println!(
+        "tasks/threads current: {}",
+        metric_u64(&snapshot.tasks_current)
+    );
+    println!("tasks/threads peak: {}", metric_u64(&snapshot.tasks_peak));
+    println!("tasks events: {}", metric_debug(&snapshot.tasks_events));
+    println!("I/O totals: {}", metric_debug(&snapshot.io_totals));
+    println!(
+        "I/O read rate: {}",
+        metric_number(&snapshot.io_read_bytes_per_sec, " B/s")
+    );
+    println!(
+        "I/O write rate: {}",
+        metric_number(&snapshot.io_write_bytes_per_sec, " B/s")
+    );
+    println!("CPU pressure: {}", metric_debug(&snapshot.cpu_pressure));
+    println!(
+        "memory pressure: {}",
+        metric_debug(&snapshot.memory_pressure)
+    );
+    println!("I/O pressure: {}", metric_debug(&snapshot.io_pressure));
+    println!("cgroup state: {}", metric_debug(&snapshot.cgroup_state));
+    println!(
+        "note: memory is cgroup-charged usage; tasks count threads; one-shot rates require a prior sample"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn metric_bytes(metric: &MetricValue<u64>) -> String {
+    match metric {
+        MetricValue::Value(value) => format_bytes(*value),
+        MetricValue::Unsupported => "unsupported".into(),
+        MetricValue::Unavailable(reason) => format!("unavailable: {reason}"),
+        MetricValue::Error(reason) => format!("error: {reason}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn metric_u64(metric: &MetricValue<u64>) -> String {
+    match metric {
+        MetricValue::Value(value) => value.to_string(),
+        MetricValue::Unsupported => "unsupported".into(),
+        MetricValue::Unavailable(reason) => format!("unavailable: {reason}"),
+        MetricValue::Error(reason) => format!("error: {reason}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn metric_number(metric: &MetricValue<f64>, suffix: &str) -> String {
+    match metric {
+        MetricValue::Value(value) => format!("{value:.2}{suffix}"),
+        MetricValue::Unsupported => "unsupported".into(),
+        MetricValue::Unavailable(reason) => format!("unavailable: {reason}"),
+        MetricValue::Error(reason) => format!("error: {reason}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn metric_debug<T: std::fmt::Debug>(metric: &MetricValue<T>) -> String {
+    match metric {
+        MetricValue::Value(value) => format!("{value:?}"),
+        MetricValue::Unsupported => "unsupported".into(),
+        MetricValue::Unavailable(reason) => format!("unavailable: {reason}"),
+        MetricValue::Error(reason) => format!("error: {reason}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn owned_resource_binding(
+    session: &str,
+    workspace: Option<&PathBuf>,
+) -> Result<(
+    BindingReceipt,
+    crate::supervision::LinuxSystemdBackend,
+    crate::supervision::ReceiptStore,
+)> {
+    let (declared, ws) = resolve(session, workspace)?;
+    let workspace_id = ws
+        .id
+        .as_deref()
+        .ok_or_else(|| anyhow!("resource control requires a workspace UUID"))?;
+    let logical_id = LogicalSessionId::new(workspace_id, declared.name)?;
+    let store = crate::supervision::ReceiptStore::standard()?;
+    if let Some(pending) = store.find_pending(&logical_id)? {
+        bail!(
+            "refusing resource control while a pending launch exists: unit={:?}, target={:?}; use `pa resources status {:?}`",
+            pending.unit_name,
+            pending.mux_target,
+            session
+        );
+    }
+    let receipt = store
+        .find(&logical_id)?
+        .ok_or_else(|| anyhow!("session {session:?} has no Portagenty supervision receipt"))?;
+    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+    match backend.reconcile(&receipt)? {
+        OwnershipState::OwnedVerified(_) => Ok((receipt, backend, store)),
+        OwnershipState::StaleBinding(reason) => {
+            bail!("refusing resource control for a stale binding: {reason}")
+        }
+        state => bail!("refusing resource control for ownership state {state:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn graceful_stop_target(target: &MuxTarget) -> Result<()> {
+    match target {
+        MuxTarget::TmuxPrivate { socket, session } => {
+            TmuxAdapter::with_socket(socket).kill(session)
+        }
+        MuxTarget::Zellij {
+            session,
+            runtime_dir: Some(runtime_dir),
+        } => ZellijAdapter::with_runtime_dir(runtime_dir).kill(session),
+        _ => bail!("receipt does not contain an exact controllable multiplexer target"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resources_cleanup(session: &str, workspace: Option<&PathBuf>) -> Result<()> {
+    let (declared, ws) = resolve(session, workspace)?;
+    let workspace_id = ws
+        .id
+        .as_deref()
+        .ok_or_else(|| anyhow!("resource cleanup requires a workspace UUID"))?;
+    let logical_id = LogicalSessionId::new(workspace_id, declared.name)?;
+    let store = crate::supervision::ReceiptStore::standard()?;
+    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+    if let Some(pending) = store.find_pending(&logical_id)? {
+        backend.remove_dead_pending(&store, &pending)?;
+        println!("removed proven-dead pending launch evidence without signalling any process");
+        return Ok(());
+    }
+    let receipt = store
+        .find(&logical_id)?
+        .ok_or_else(|| anyhow!("session {session:?} has no supervision evidence to clean"))?;
+    match backend.reconcile(&receipt)? {
+        OwnershipState::StaleBinding(_) => {
+            backend.remove_stale_binding(&store, &receipt)?;
+            println!("removed proven-stale supervision receipt without signalling any process");
+            Ok(())
+        }
+        state => bail!("refusing signal-free cleanup for ownership state {state:?}"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resources_cleanup(_session: &str, _workspace: Option<&PathBuf>) -> Result<()> {
+    bail!("resource cleanup is currently implemented only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn resources_stop(session: &str, workspace: Option<&PathBuf>) -> Result<()> {
+    let (receipt, backend, store) = owned_resource_binding(session, workspace)?;
+    if let Err(error) = graceful_stop_target(&receipt.mux_target) {
+        eprintln!("warning: graceful multiplexer shutdown failed: {error:#}");
+        eprintln!("continuing with a non-force systemd stop for the verified control group");
+    }
+    let result = backend.stop_unit(&receipt)?;
+    println!("{}", result.final_state);
+    if result.completed {
+        let _ = store.remove(&receipt.logical_id)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resources_stop(_session: &str, _workspace: Option<&PathBuf>) -> Result<()> {
+    bail!("resource control is currently implemented only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn resources_kill(session: &str, force: bool, workspace: Option<&PathBuf>) -> Result<()> {
+    if !force {
+        bail!("force-kill requires the explicit --force flag");
+    }
+    let (receipt, backend, store) = owned_resource_binding(session, workspace)?;
+    let result = backend.force_kill(&receipt)?;
+    println!("{}", result.final_state);
+    if result.completed {
+        let _ = store.remove(&receipt.logical_id)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resources_kill(_session: &str, _force: bool, _workspace: Option<&PathBuf>) -> Result<()> {
+    bail!("resource control is currently implemented only on Linux")
 }
 
 /// Mutate the session's command in-place to resume prior state,
@@ -588,7 +1623,13 @@ pub fn claim(
 
     // Always takeover; that's the whole point of the verb.
     launch(
-        name, workspace, dry_run, /* shared = */ false, resume, fresh,
+        name,
+        workspace,
+        dry_run,
+        /* shared = */ false,
+        resume,
+        fresh,
+        LaunchSupervisionOptions::default(),
     )
 }
 
@@ -1569,7 +2610,15 @@ pub fn open_url(url: &str) -> Result<()> {
             session,
         } => {
             let path = resolve_workspace_by_id(&workspace_id)?;
-            launch(&session, Some(&path), false, false, false, false)
+            launch(
+                &session,
+                Some(&path),
+                false,
+                false,
+                false,
+                false,
+                LaunchSupervisionOptions::default(),
+            )
         }
     }
 }
@@ -1694,6 +2743,67 @@ pub fn protocol_status() -> Result<()> {
     let s = crate::protocol::register::status()?;
     print!("{s}");
     Ok(())
+}
+
+#[cfg(test)]
+mod return_banner_tests {
+    use super::*;
+
+    #[test]
+    fn return_banner_uses_human_workspace_and_session_identity() {
+        assert_eq!(
+            return_banner("21 - Teaching", "shell"),
+            "pa ← returned from \"21 - Teaching / shell\""
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_replacement_limits_use_current_kind_policy_before_cleanup() {
+        let legacy_claude = ResourceLimits {
+            memory_high_bytes: Some(12 * ResourceLimits::GIB),
+            memory_max_bytes: Some(12 * ResourceLimits::GIB),
+            memory_swap_max_bytes: None,
+            cpu_quota_percent: None,
+            tasks_max: None,
+        };
+        assert_eq!(
+            effective_stale_replacement_limits(
+                Some(crate::domain::SessionKind::ClaudeCode),
+                true,
+                legacy_claude,
+            )
+            .unwrap(),
+            ResourceLimits::claude_defaults()
+        );
+        assert_eq!(
+            effective_stale_replacement_limits(
+                Some(crate::domain::SessionKind::Shell),
+                true,
+                ResourceLimits::claude_defaults(),
+            )
+            .unwrap(),
+            ResourceLimits::default()
+        );
+    }
+
+    #[test]
+    fn client_exit_message_preserves_code_and_signal() {
+        assert_eq!(
+            client_exit_message(ClientExit {
+                code: Some(7),
+                signal: None,
+            }),
+            "multiplexer client exited abnormally with code 7"
+        );
+        assert_eq!(
+            client_exit_message(ClientExit {
+                code: None,
+                signal: Some(15),
+            }),
+            "multiplexer client was terminated by signal 15"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use portagenty::mux::{Multiplexer, ZellijAdapter};
+use serial_test::serial;
 
 fn test_prefix() -> String {
     let nanos = SystemTime::now()
@@ -63,6 +64,7 @@ impl Drop for SessionGuard<'_> {
 }
 
 #[test]
+#[serial]
 fn list_sessions_succeeds_and_does_not_error() {
     let a = ZellijAdapter::new();
     let list = a.list_sessions().expect("list_sessions");
@@ -76,6 +78,7 @@ fn list_sessions_succeeds_and_does_not_error() {
 }
 
 #[test]
+#[serial]
 fn create_background_then_list_shows_session() {
     let a = ZellijAdapter::new();
     let mut guard = SessionGuard::new(&a);
@@ -99,6 +102,7 @@ fn create_background_then_list_shows_session() {
 }
 
 #[test]
+#[serial]
 fn has_session_returns_true_after_create_background() {
     let a = ZellijAdapter::new();
     let mut guard = SessionGuard::new(&a);
@@ -117,6 +121,7 @@ fn has_session_returns_true_after_create_background() {
 }
 
 #[test]
+#[serial]
 fn kill_removes_session() {
     let a = ZellijAdapter::new();
 
@@ -129,6 +134,7 @@ fn kill_removes_session() {
 }
 
 #[test]
+#[serial]
 fn kill_is_idempotent_on_missing_session() {
     let a = ZellijAdapter::new();
     let name = unique_name(&test_prefix(), "idem");
@@ -138,6 +144,7 @@ fn kill_is_idempotent_on_missing_session() {
 }
 
 #[test]
+#[serial]
 fn session_info_cwd_and_attached_are_none_from_list() {
     let a = ZellijAdapter::new();
     let mut guard = SessionGuard::new(&a);
@@ -168,6 +175,7 @@ fn session_info_cwd_and_attached_are_none_from_list() {
 }
 
 #[test]
+#[serial]
 fn detach_current_is_not_supported() {
     let a = ZellijAdapter::new();
     let err = a.detach_current().unwrap_err();

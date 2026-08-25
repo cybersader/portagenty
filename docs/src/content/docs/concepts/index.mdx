@@ -62,11 +62,25 @@ Shown in the TUI as colored markers next to each row:
 | Marker | State | Source | Enter does |
 |---|---|---|---|
 | ● (green) | Live | Workspace session, currently running in mpx | `attach` |
-| ○ (dim) | Idle | Workspace session, not yet started | `create_and_attach` |
+| ○ (dim) | Idle | Workspace session, not yet started | supervision-first create when UUID-backed/eligible; otherwise ordinary `create_and_attach` |
 | ? (yellow) | Untracked | Running in mpx, not in workspace TOML | `attach` |
 
 Untracked = the tmux/zellij session you started manually last week
 that `pa` can see via `list-sessions` and let you re-attach to.
+
+Idle behavior is ownership-aware. A valid workspace UUID produces a stable logical
+session ID, so Enter can create a private supervised target. For explicit
+`kind = "claude-code"`, the launch policy is `3G` MemoryHigh, `5G` MemoryMax,
+`512MiB` MemorySwapMax, `800%` CPU, and `1200` tasks; generic kinds receive no
+implied Claude defaults. Missing IDs keep ordinary Enter and can be upgraded
+explicitly with `S`; malformed IDs require manual correction. Owned v2 rows attach
+to the exact receipt target. Live v1 rows are legacy/restart-required exact-target
+attach-only. Split-containment rows may attach, but whole-workload metrics and
+control are withheld. An idle stale receipt can be exactly replaced only after
+signal-free proof that both its old invocation and target are absent; partial
+presence is ambiguous. If non-creating capability preflight fails with ownership
+already known safe, routine Enter announces an ordinary unsupervised fallback;
+later or ambiguous failures remain fail-closed.
 
 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.5rem 0;">
   <div style="border: 2px solid var(--sl-color-gray-4); border-radius: 10px; padding: 1rem; background: var(--sl-color-gray-6);">
@@ -76,7 +90,7 @@ that `pa` can see via `list-sessions` and let you re-attach to.
         <span style="opacity: 0.5; font-size: 1.1rem;">○</span>
         <span><strong>Idle</strong> — in TOML, not running</span>
       </div>
-      <div style="text-align: center; opacity: 0.5; font-size: 0.75rem;">Enter → create_and_attach</div>
+      <div style="text-align: center; opacity: 0.5; font-size: 0.75rem;">Enter → supervised create when eligible; ordinary create for legacy/invalid/unsupported</div>
       <div style="display: flex; align-items: center; gap: 0.5rem;">
         <span style="color: var(--sl-color-green); font-size: 1.1rem;">●</span>
         <span><strong>Live</strong> — running in mpx</span>
@@ -103,14 +117,16 @@ that `pa` can see via `list-sessions` and let you re-attach to.
   </div>
 </div>
 
-## Kind hint
+## Kind selector
 
 Optional `kind:` field on a session: `claude-code`, `opencode`,
 `editor`, `dev-server`, `shell`, or `other`. The TUI shows a
 one-letter colored glyph (C / O / E / D) next to the state marker.
 For `kind = "claude-code"`, `pa launch --resume` and
-`pa claim --resume` append `--continue` before launch so Claude
-picks up its prior conversation. Other kinds get a one-line hint.
+`pa claim --resume` append `--continue`, and supervised launches select the
+Claude slice/default resource policy. This explicit field is the only selector:
+a name or command containing `claude` never implies Claude policy. Other and
+absent kinds remain generic.
 
 ## Multiplexer / adapter
 
@@ -410,3 +426,14 @@ Informational only — `pa` never rebinds your mpx keys. The detach
 chord shown is the multiplexer's default; if you've customized it,
 use your own chord. (Opinionated mpx-config belongs in a dev-
 environment scaffold, not in the launcher.)
+
+When the client actually returns, Portagenty leaves a human hand-back marker:
+
+```
+  pa ← returned from "my-workspace / shell"
+```
+
+That marker also prints when the multiplexer client exits nonzero, is terminated by
+a signal, or the user is forced out; abnormal diagnostics follow it. A setup failure
+before the client starts prints no false return marker and instead reopens the same
+workspace and logical session row with a persistent error.

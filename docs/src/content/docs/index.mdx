@@ -8,6 +8,10 @@ hero:
     - text: Get started
       link: /portagenty/getting-started/installation/
       icon: right-arrow
+    - text: Explore features
+      link: /portagenty/features/
+      icon: open-book
+      variant: minimal
     - text: View on GitHub
       link: https://github.com/cybersader/portagenty
       icon: external
@@ -101,74 +105,40 @@ running; only the terminal attached to them changes.
 ## Features
 
 <CardGrid>
-  <Card title="One-command install" icon="rocket">
-    `cargo install --git https://github.com/cybersader/portagenty`.
-    No clone, no `cd`, no hand compile. Single static Rust binary
-    at `~/.cargo/bin/pa`.
+  <Card title="Organize workspaces" icon="seti:folder">
+    Layer committable workspace views over real project paths without moving
+    anything. Use recency, live-session counts, fuzzy filtering, tags, archives,
+    stable UUIDs, and move-resilient path history to keep a large registry usable.
   </Card>
-  <Card title="Cross-device takeover" icon="seti:config">
-    SSH in from your phone, run `pa claim`, and the session reshapes
-    to the new device. On tmux that's real takeover (other clients
-    get kicked); on zellij, add `--fresh` for the kill-and-recreate
-    path since zellij doesn't expose per-client disconnection.
+  <Card title="Keep sessions persistent" icon="setting">
+    Create or attach to tmux and Zellij sessions, see tracked and untracked state,
+    choose takeover or shared-client behavior, and return to the same work after
+    the terminal or SSH connection changes.
   </Card>
-  <Card title="Untracked session adoption" icon="approve-check">
-    Tmux / zellij sessions you started manually show up in the TUI
-    alongside workspace-defined ones. Attach with Enter — nothing
-    new to set up.
+  <Card title="Work across devices" icon="rocket">
+    Run the same terminal-native TUI from a laptop, remote shell, or phone over
+    Termux. Narrow layouts, Android-style back behavior, and `pa claim` make the
+    persistent host session practical from every screen size.
   </Card>
-  <Card title="Multiplexer-aware" icon="setting">
-    tmux + zellij first-class. Sessions with `cwd`, `command`, and
-    `env` work consistently across both. WezTerm explicitly skipped
-    — see the roadmap.
+  <Card title="Find, navigate, and scaffold" icon="magnifier">
+    Walk up from the current path, jump directly to a workspace, fuzzy-search
+    layered filesystem sources, pin exact paths, switch local/global scope, browse
+    a tree, and scaffold a new workspace without opening an editor.
   </Card>
-  <Card title="First-run wizard" icon="open-book">
-    Run `pa` on a new machine with no config and it walks you
-    through a 30-second setup. No TOML editing required to start.
+  <Card title="Manage, export, and integrate" icon="puzzle">
+    Add and edit sessions in the TUI or CLI, open plain shells, export tmux scripts
+    or Zellij layouts, install completions and shell snippets, launch `pa://` deep
+    links, and bridge conversation history through Portaconv.
   </Card>
-  <Card title="No-editor session management" icon="pencil">
-    `pa init` / `pa add` / `pa rm` / `pa edit` handle the whole
-    workspace-file lifecycle from the command line. Phone-keyboard
-    friendly, comment-preserving.
-  </Card>
-  <Card title="Find folder + scaffold" icon="magnifier">
-    Press `n` in the workspace picker to fuzzy-search your filesystem
-    for project folders. Tiered backends (recency, zoxide, plocate,
-    fd, stdlib walker) ranked by nucleo. Pick a folder and `pa`
-    scaffolds a workspace TOML on the spot.
-  </Card>
-  <Card title="In-TUI session editing" icon="pencil">
-    Press `e` on any session row to edit name, cwd, command, kind, or
-    env vars without leaving the TUI. CWD editing opens the same
-    find/tree browser. All changes are comment-preserving writes to
-    your TOML file.
-  </Card>
-  <Card title="Committable layouts" icon="document">
-    `pa export` renders your workspace as a tmux starter script or
-    zellij KDL layout. Commit it; teammates launch without needing
-    `pa` installed.
-  </Card>
-  <Card title="Bundled bash ergonomics" icon="puzzle">
-    `pa snippets install pa-aliases` drops curated, idempotent
-    shell snippets into your rc file. Short aliases, Termux-friendly
-    tweaks, all opt-in.
-  </Card>
-  <Card title="Tree browser" icon="seti:folder">
-    Press `Ctrl+T` inside the find overlay to switch to a filesystem tree
-    view. Expand/collapse directories, navigate with arrow keys or
-    vim bindings, select a folder with Shift+Enter.
-  </Card>
-  <Card title="Portaconv integration" icon="random">
-    Sister tool [portaconv](https://github.com/cybersader/portaconv)
-    extracts Claude Code conversation history, rewrites OS paths
-    baked into content, and exposes it over MCP. `pa convos list` /
-    `pa convos dump <id>` scope it to this workspace automatically
-    (including `previous_paths` from folder moves). `pa init
-    --with-agent-hooks` drops `.mcp.json` + `.claude/skills/` so
-    agents self-discover it. See
-    [Portaconv integration](/portagenty/concepts/portaconv-integration/).
+  <Card title="Experimental Linux resource supervision" icon="approve-check">
+    On supported systemd-user/cgroup-v2 hosts, use explicit kind-selected Claude
+    placement with soft and hard memory/swap, CPU, and task limits; prove the
+    workload root and bounded descendants; and control only complete owned v2
+    containment while legacy and split workloads remain attach-only.
   </Card>
 </CardGrid>
+
+[Explore the complete feature set, platform boundaries, and next steps →](/portagenty/features/)
 
 ## How it works
 
@@ -269,9 +239,10 @@ re-attaches and reshapes the terminal to the new screen size.
     #   ?    help
 
     # Session list
-    #   Enter  attach/create session
+    #   Enter  attach; supervision-first start eligible idle UUID rows
+    #   S      custom limits / legacy upgrade / explicit supervised restart
     #   e      edit session fields
-    #   d      delete session     x  kill live session
+    #   d      delete session     x  safe stop / stale cleanup
     #   Esc    back to picker     q  quit
     ```
   </TabItem>
@@ -415,12 +386,14 @@ Most v1.x items have shipped: zellij adapter, untracked adoption,
 `pa claim` cross-device takeover, `kind:` hints, per-session env
 vars, declarative export, first-run wizard, bundled snippets,
 full no-editor session management, workspace picker home screen,
-in-TUI find-folder + scaffold with nucleo fuzzy ranking, tree
-browser, workspace-scoped session names, in-TUI session editing,
-CWD browse via find overlay, responsive 2-line footer, arrow keys
-+ Alt+J/K navigation, help overlay, and auto-re-register on
-walk-up. Tags + custom-groups views and `pa up` eager-launch are
-still on the [roadmap](https://github.com/cybersader/portagenty/blob/main/ROADMAP.md).
+recency, tags, filtering, archives, in-TUI find-folder + scaffold
+with nucleo fuzzy ranking, tree browser, exact-path navigation,
+workspace-scoped session names, in-TUI session editing, CWD browse
+via find overlay, responsive 2-line footer, arrow keys + Alt+J/K
+navigation, help overlay, `pa://` deep links, experimental Linux
+resource supervision, and auto-re-register on walk-up. Custom
+ordered groups and `pa up` eager-launch are still on the
+[roadmap](https://github.com/cybersader/portagenty/blob/main/ROADMAP.md).
 
 WezTerm is **intentionally not supported** — its mux is built around
 the GUI emulator's window model, not the headless detach/reattach

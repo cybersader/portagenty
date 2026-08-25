@@ -14,6 +14,7 @@ directory that holds related projects. The prefix before
 
 ```toml
 name = "Example workspace"
+id = "a1b2c3d4-e5f6-4890-abcd-ef1234567890"
 multiplexer = "tmux"
 projects = ["~/code/portagenty"]
 
@@ -21,6 +22,7 @@ projects = ["~/code/portagenty"]
 name = "claude"
 cwd = "~/code/portagenty"
 command = "claude"
+kind = "claude-code"
 ```
 
 ## 2. Open the TUI
@@ -43,13 +45,25 @@ Nothing is launched yet.
 | `k` / `↑` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` | Launch the highlighted session via tmux |
+| `Enter` | Attach a live session, or supervision-first start an eligible idle row |
+| `S` | Edit supervision limits or use the advanced upgrade/restart paths |
 | `q` / `Esc` / `Ctrl-C` | Quit the TUI |
 
-When you press `Enter`, the TUI restores the terminal and hands the
-TTY to tmux via `tmux new-session` (or `tmux attach-session` if the
-session already exists). Detach with the multiplexer's normal binding
-(`Ctrl-b d` for tmux) to return to your shell.
+For the UUID-backed Claude-kind row above, `Enter` first attempts an experimental
+Linux supervised launch with `3G` MemoryHigh, `5G` MemoryMax, `512MiB`
+MemorySwapMax, `800%` CPU, and `1200` tasks beneath the pre-provisioned aggregate
+Claude slice. `kind = "claude-code"` is the only selector for that policy; naming a
+session or command `claude` without the kind remains generic. If ownership-safe,
+non-creating preflight proves that supervision is unavailable, Portagenty announces
+a loud ordinary/unsupervised fallback. Ambiguous ownership and failures after
+creation may have begun stay fail-closed. Existing live ordinary sessions attach in
+place and are never retroactively claimed; workspace files with no ID retain
+ordinary Enter.
+
+The TUI restores the terminal before handing the TTY to tmux. Detach with the
+multiplexer's normal binding (`Ctrl-b d` for tmux). After any client return—normal,
+nonzero, or by signal—Portagenty prints the human `workspace / session` identity;
+a pre-client setup failure instead reopens the same workspace and logical row.
 
 ## 4. Scriptable equivalents
 

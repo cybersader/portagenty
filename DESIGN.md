@@ -149,9 +149,12 @@ portagenty splits what it knows into two categories:
 - Last-attached timestamps
 - User's most recent TUI view preference
 
+**Machine-local ownership receipts**: Linux supervised launches use `$XDG_STATE_HOME/portagenty/supervision.toml`. This versioned, lock-protected file records the stable logical session ID, opaque transient-unit name, systemd `InvocationID`, exact `ControlGroup`, exact private multiplexer target, resolved resource limits, slice selection, and v2 workload-anchor proof. It also journals pending launches before transient-unit creation. It is not workspace configuration and must never be committed or synced as authority.
+
 **Live, rebuilt on every run**: not persisted anywhere.
 
 - Which tmux/zellij/WezTerm sessions are currently running. Obtained by polling the mpx CLI at startup and on refresh. This is how untracked sessions get surfaced (see §5).
+- Current resource snapshots and counter deltas for verified supervised workloads. These are sampled on demand or by the bounded TUI worker and are not retained as history.
 - Current focus / selection in the TUI.
 
 **Why no SQLite?** v1 doesn't need query performance. It needs inspectability, simple atomic writes, and no migration pain. A SQLite file adds a library, a schema, a migration story, and makes the state opaque. If v2+ ever needs cross-process concurrency or fast queries across thousands of tagged projects, revisit. Until then: files.
@@ -167,8 +170,8 @@ v1 shipped the tmux adapter as the reference baseline. v1.x added zellij. WezTer
 **Core interface** (conceptual, not Rust API):
 
 - `list_sessions()` — return live sessions the adapter knows about, including ones portagenty didn't launch.
-- `session_exists(name)` / `attach(name)` / `create_and_attach(name, cwd, command)` — the attach-or-create loop.
-- `kill(name)` — close a session.
+- `session_exists(name)` / `attach(name)` / `create_and_attach(name, cwd, command)` — the attach-or-create loop. Creation reports `Created` versus `Existing` so ownership is never inferred from a successful attach.
+- `kill(name)` — close an ordinary shared multiplexer session.
 - `detach_current()` — let user step back to the TUI.
 - `export(workspace) -> artifact` — optional; produces a native artifact (KDL layout for zellij, a shell script for tmux, whatever for WezTerm).
 
@@ -178,12 +181,15 @@ v1 shipped the tmux adapter as the reference baseline. v1.x added zellij. WezTer
 - Attach-or-create is a shell pipe: `tmux has-session -t NAME 2>/dev/null && tmux attach-session -t NAME || tmux new-session -s NAME -c CWD -d`.
 - Session/window naming: sanitize `[^a-zA-Z0-9_-]` → `_`, clamp at 50 chars. Match the VS Code extension's approach so existing sessions carry over.
 - Untracked session adoption: `tmux list-sessions -F '#{session_name}|#{session_path}|#{session_attached}'`.
+- Supervised creation uses a dedicated private tmux socket/server per logical session. Shared/default-server sessions remain attachable but unverified and unmanaged by cgroup controls.
 
 **zellij** — added in v1.x.
 
 - Zellij's model is different: layouts (KDL) define tabs + panes declaratively. Opening a layout spins everything up at once — fights our "lazy" default.
 - v1.x adapter runs imperative where possible (`zellij attach`, `zellij action new-tab`, `zellij action new-pane`). For workspaces where the user wants "all at once," `pa export` produces a KDL layout they can open normally.
+- On Linux, every Zellij child uses the caller's `XDG_RUNTIME_DIR` when present. If an SSH path omits it, the adapter recovers the secure systemd directory at `/run/user/<effective-uid>` (real directory, matching owner, mode `0700`) for that child only. This prevents local and Tailscale SSH launches from splitting into separate Zellij socket registries without mutating `pa`'s process environment.
 - Works better with OpenCode than tmux does, per the agentic-workflow README.
+- Supervised creation starts a fresh opaque session under an exact validated runtime namespace, using a short-lived PTY and private generated layout. Existing Zellij sessions are never retroactively claimed.
 
 **WezTerm** — **intentionally not supported** (see §1 Vocabulary
 and ROADMAP v1.x). The `Multiplexer::Wezterm` enum variant exists
@@ -202,34 +208,68 @@ clear "use tmux or zellij" message.
 
 "Entering" a workspace is cheap. It does not start any processes. It loads the session definitions, checks the multiplexer for live sessions matching those names, and draws the TUI.
 
-When the user selects a session and hits Enter:
+When the user selects a session and hits Enter, ownership and live state determine the path:
 
-1. If the mpx already has a session with that sanitized name → attach to it. (Covers both "resume something I left running" and "adopt an untracked session.")
-2. If not → create it with the session's `cwd` + `command`, then attach.
+1. An owned-and-verified v2 row attaches to the exact private target in its receipt.
+2. A live legacy-v1 row attaches to its exact private target but is restart-required and attach-only; Portagenty never upgrades, stops, or migrates it automatically.
+3. A split-containment row may attach to its exact private target, but Portagenty withholds whole-workload resource ownership and control.
+4. A live ordinary or untracked target attaches in place; Enter never kills, migrates, or retroactively claims it.
+5. An idle UUID-backed `supervisable` row uses supervision-first creation. `kind = "claude-code"` selects the Claude defaults (`3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, `1200` tasks); generic kinds remain generic and receive no implied Claude policy.
+6. An idle legacy/no-ID, malformed-ID, or genuinely unsupported row retains ordinary `create_and_attach`; malformed identity remains ineligible for supervision.
+7. An idle stale declared row can confirm exact signal-free stale-receipt removal plus a fresh supervised relaunch. A stale receipt beside a real live ordinary target follows rule 4 instead.
+8. A pending or ambiguous binding is non-attachable until exact reconciliation reaches a safe state.
 
 This is imperative, on-demand. A workspace with 20 sessions defined never costs you 20 processes worth of startup. It costs you one process when you open one session.
 
 **Eager / "jump-in" flag** — a v1.x feature: `pa launch <workspace> --eager` or a config key that tells portagenty to spawn every session in a workspace at entry time, so long-running things (agents, dev servers) are warm by the time you tab to them. Off by default.
 
+### Experimental Linux resource supervision
+
+TUI Enter is supervision-first only for idle UUID-backed rows; ordinary `pa launch` remains ordinary unless `--supervise` or a resource-limit flag is supplied. `S` is the advanced/custom path: it edits launch-local limits, can confirm-add a UUID to a writable legacy workspace, and can separately confirm termination of one exact live ordinary target before fresh supervised relaunch. Malformed IDs still fail closed for supervision. The backend is currently implemented only where a systemd user manager and unified cgroup v2 provide the required guarantees; other platforms report unsupported capability states rather than silently weakening containment.
+
+`Session.kind` is the only selector for kind-specific policy. Exactly `kind = "claude-code"` selects Claude placement and defaults; a session named `claude` or running `command = "claude"` remains generic when the kind is absent or different. Claude overrides must be equal to or stricter than every standard value and internally consistent (`MemoryHigh <= MemoryMax`). Generic supervised sessions remain in normal user-manager placement and use only explicitly requested limits.
+
+The launch lifecycle has three typed boundaries: non-creating preflight, creation that may have begun, and a multiplexer client that actually ran and returned. Routine Enter may fall back loudly to ordinary creation only when preflight has already proved the receipt store readable, no binding or pending launch requires preservation, no ordinary target exists, and supervision capability/runtime is unavailable. Receipt ambiguity, identity/target races, explicit `S`, stale replacement, CLI supervision, and every error after backend creation is invoked remain fail-closed. A pending-launch journal records the creator PID/start time and protects the gap between transient-unit creation and durable v2 receipt persistence. Pending evidence blocks attach, ordinary fallback, creation, stop, and kill. Signal-free `pa resources cleanup` removes it only when the creator is gone and the exact unit, target, and marker are all absent; partial presence stays ambiguous. A pre-client setup failure reopens the same workspace and logical row; a client that returns normally, nonzero, by signal, or after forced disconnection prints the human `workspace / session` identity before abnormal diagnostics.
+
+A supervised launch creates a transient **systemd user service**, not a scope and not a Portagenty daemon. The service uses `Type=exec`, `ExitType=cgroup`, `KillMode=control-group`, `SendSIGKILL=no`, `Restart=no`, `OOMPolicy=continue`, explicit accounting, and an exact working directory/environment/argv. A Claude-kind service also sets `Slice=claude-code.slice`, `ManagedOOMPreference=omit`, `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, CPU quota, and a finite per-service `TasksMax`. Before creation, Portagenty structurally verifies that the externally provisioned aggregate slice exists beneath `/claude.slice/claude-code.slice`, has finite positive `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, has consistent memory limits, and uses `ManagedOOMPreference=omit`; aggregate `TasksMax` is optional and may remain infinity. Portagenty observes but never creates or modifies that slice. For tmux 3.7b and later, the transient service deliberately withholds `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` from the private tmux server to prevent sibling `tmux-spawn-*.scope` creation, then restores the exact user-bus values only in the pane environment. The existing systemd user manager owns the workload lifetime after `pa` exits. Portagenty opens no listener and retains no resident process.
+
+Ownership is proof-based:
+
+1. Stable logical identity is `workspace UUID + exact declared session name`.
+2. A fresh launch gets an opaque unit, private tmux/Zellij target, one-shot owner-only launch spec, and random workload nonce.
+3. The shared hidden workload anchor used by both multiplexers atomically records its exact PID and `/proc` start time before executing the declared command. Proof also binds to the exact private tmux socket/session/pane PID or exact Zellij session/runtime identity, so an edited or replaced target cannot reconcile.
+4. The v2 machine-local receipt records unit name, `InvocationID`, `ControlGroup`, target, resolved limits, requested slice, nonce, marker path, PID, and start time atomically while holding the receipt lock. Launch specs and markers are constrained to owner-only `$XDG_RUNTIME_DIR/portagenty/workloads/<nonce>.*.toml`; marker content is reverified before unlink.
+5. Before receipt finalization, every snapshot, and every control action, Portagenty reads back service placement and limits, checks the exact root PID/start-time/nonce/cgroup, and traverses descendants only through bounded `/proc/<pid>/task/<tid>/children` edges for every thread ID. It never performs a global `/proc` scan.
+6. A root outside the service cgroup cannot reconcile as owned. Descendants outside it produce split containment; a descendant deliberately launched by `build-contained` beneath `background.slice` is reported as an external bounded scope rather than misreported as service-owned.
+7. Missing or mismatched evidence becomes stale, split, legacy/restart-required, or ambiguous and controls fail closed. Both the unit and exact target absent may stale-clean; partial presence is ambiguous. Existing shared sessions remain unverified and are never retroactively claimed.
+
+The resource model includes `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `CPUQuotaPerSecUSec`, and `TasksMax`. MemoryHigh is a reclaim threshold; MemoryMax and MemorySwapMax are hard ceilings; CPU throttles aggregate CPU time; TasksMax rejects additional tasks. `OOMPolicy=continue` allows a child OOM kill to be observed without automatically destroying the remaining session. These are launch-local controls, not persisted workspace policy.
+
+Resource snapshots read only an owned-and-verified v2 service cgroup: cumulative CPU plus sampled rate, charged memory current/peak/events, swap current/peak/events, tasks current/peak/events, aggregate I/O plus sampled rates, CPU/memory/I/O PSI, and cgroup populated/frozen state. `memory.current` is cgroup-charged memory rather than root-process RSS; `pids.current` counts tasks/threads; CPU rate may exceed 100% on multicore systems. CLI/TUI notices surface deltas such as `memory.events high/oom/oom_kill`, `pids.events max`, and CPU quota throttling. Snapshots are ephemeral—there is no history database, log monitor, or unattended telemetry collector.
+
+The control ladder stays explicit and is available only for complete owned-and-verified containment:
+
+1. Gracefully stop the exact recorded multiplexer target.
+2. Revalidate and request non-force systemd `StopUnit`.
+3. Only a separately confirmed force action may call whole-cgroup `KillUnit(..., SIGKILL)`.
+
+Picker-wide stop partitions targets by capability: verified owned workloads use steps 1–2, unmanaged shared sessions use multiplexer-native kill, and legacy, split, stale, or ambiguous receipts are shown and skipped. A pending-launch journal blocks another supervised creation for the same logical session but is not treated as an owned control target. Bulk control never force-escalates.
+
 ---
 
-## 7. Agent integration — agnostic core
+## 7. Agent integration — agnostic core, explicit policy selectors
 
-v1 does not know what Claude Code is. A session is a command; `command = "claude"` and `command = "vim"` are indistinguishable to the core.
-
-That choice is deliberate. It's what keeps portagenty durable as the agent ecosystem shifts: new CLIs (Aider, Codex, something-else-in-six-months) don't require core changes. You just write a new session.
-
-An optional `kind:` field on a session can unlock niceties later. Sketch:
+The core never guesses from command text. A session named `claude` or running `command = "claude"` remains generic unless its optional `kind` explicitly selects a documented integration. This keeps new CLIs usable without parser changes while avoiding accidental policy based on executable aliases or names.
 
 ```
 [[session]]
 name = "claude"
 cwd = "."
 command = "cc"
-kind = "claude-code"    # v1.x hook; ignored in v1
+kind = "claude-code"
 ```
 
-Planned `kind:` values: `claude-code`, `opencode`, `shell`, `editor`, `dev-server`. Effects (when implemented): agent-running indicators in the TUI, smart resume (`--continue` flags), session-coloring.
+Implemented kind values are `claude-code`, `opencode`, `shell`, `editor`, `dev-server`, and `other`. Kinds drive TUI markers; `claude-code` also drives kind-aware resume and, for supervised launches, the Claude slice/default resource policy. No other kind and no command/name inference may select that policy.
 
 A full plugin runtime — where third-party adapters register themselves via some extension mechanism — is a v2+ question. Not a v1 problem.
 
@@ -266,7 +306,7 @@ This bridges the gap between "what portagenty thinks is going on" and "what's ac
 
 ## 10. Termux and small-screen TUI constraints
 
-A primary access path for this tool is **Termux on Android → SSH → desktop → zellij → `pa`**. Portagenty never runs *on* Termux; it renders *through* it. But Termux imposes real constraints on what the TUI can assume:
+A primary access path for this tool is **Termux on Android → SSH → desktop → `pa` → zellij/tmux**. Portagenty never runs *on* Termux; it renders *through* it and attaches to the desktop's persistent multiplexer sessions. But Termux imposes real constraints on what the TUI can assume:
 
 **Keyboard reality**: Termux has no physical Ctrl/Alt/Meta. The on-screen Extra Keys row provides Ctrl/Esc/Tab/arrows as taps (each is a second tap on top of any letter). Volume-Down often maps to Ctrl, Volume-Up to Esc, but not everyone configures it. Flow control (Ctrl+S / Ctrl+Q) freezes the terminal if not disabled.
 
@@ -385,37 +425,35 @@ in the code should derive from this table, not second-guess it.
 
 ### Decision order
 
-When the user runs bare `pa` (no subcommand, no `-w`):
+When the user runs bare `pa` (no subcommand, no path):
 
-1. **Try walk-up discovery from `$PWD`.** If a `*.portagenty.toml`
-   (with non-empty prefix) exists in the current directory or any
-   ancestor, load it and open the session-list TUI for that workspace.
-   This is the fast path: in-tree invocation should feel instant and
-   local.
-2. **Walk-up fails + non-interactive shell (pipe, script, CI).** Emit
-   the discovery error and exit non-zero. Never prompt. Scripted
+1. **Try walk-up discovery from `$PWD` for registry maintenance.** If a
+   `*.portagenty.toml` exists in the current directory or an ancestor,
+   auto-register/reconcile it so moved or newly reached workspaces appear
+   in the global list. Walk-up does not bypass the home screen.
+2. **If discovery fails in a non-interactive shell (pipe, script, CI),**
+   emit the discovery error and exit non-zero. Never prompt. Scripted
    callers must get deterministic behavior.
-3. **Walk-up fails + interactive + first-time user** (no
-   `.onboarded` sentinel in `$XDG_STATE_HOME/portagenty/`). Run the
-   onboarding wizard (`src/onboarding/`). On scaffold, retry the load
-   and continue into the session-list TUI. On "skip" or "show docs",
-   exit cleanly.
-4. **Walk-up fails + interactive + returning user.** Open the
-   workspace picker TUI (`src/tui/picker.rs`). Lists every
-   `[[workspace]]` registered in `$XDG_CONFIG_HOME/portagenty/config.toml`,
-   filtering entries whose files no longer exist. Always includes a
-   trailing **"live sessions on this machine"** option for the
-   no-workspace case. On pick: load the chosen workspace inside the
-   same ratatui session (no flicker) and continue into the
-   session-list TUI.
-5. **Walk-up fails + interactive + returning user + no registered
-   workspaces.** Picker shows only the "live sessions" option, which
-   resolves to a synthetic empty workspace populated from
-   `mux.list_sessions()`.
+3. **If discovery fails for an interactive first-time user** (no
+   `.onboarded` sentinel in `$XDG_STATE_HOME/portagenty/`), run the
+   onboarding wizard (`src/onboarding/`). On scaffold, register the new
+   workspace and continue to the picker. On "skip" or "show docs", exit
+   cleanly.
+4. **Open the workspace picker TUI (`src/tui/picker.rs`).** This is the
+   home screen for every bare invocation. It lists every `[[workspace]]`
+   registered in `$XDG_CONFIG_HOME/portagenty/config.toml`, filters entries
+   whose files no longer exist, shows live-session counts, and always
+   includes a trailing **"live sessions on this machine"** option. On
+   pick, load the workspace inside the same ratatui session (no flicker)
+   and continue into the session-list TUI.
+5. **If no workspaces are registered,** the picker shows only the live-
+   sessions option, which resolves to a synthetic empty workspace populated
+   from `mux.list_sessions()`.
 
-The crucial consequence: **`pa` is callable from anywhere**. There is
-no "right" directory to be in. Walk-up is an optimization, not a
-requirement.
+`pa PATH` is the explicit fast path: it opens the workspace resolved from
+that file or directory directly. The crucial consequence is that **bare
+`pa` is callable from anywhere and always shows the same home screen**;
+location helps maintain the registry but does not silently choose the UI.
 
 ### Workspace registry — invariants
 
@@ -424,10 +462,10 @@ requirement.
   via `config::register_global_workspace`. Idempotent: re-runs and
   duplicate paths are no-ops. Preserves the rest of the config via
   `toml_edit`.
-- **Auto-re-registered on walk-up.** If walk-up finds a workspace
-  file whose path isn't already in the registry, it's silently
-  appended so the picker sees it next time. This handles folder
-  moves transparently.
+- **Auto-re-registered on walk-up.** If bare `pa` can reach a workspace
+  file whose path isn't already in the registry, it is silently appended
+  before the picker renders. This handles folder moves transparently while
+  keeping the picker as the home screen.
 - **Never edited silently outside scaffold + walk-up paths.** `pa`
   `launch` and other subcommands never mutate the registry.
 - **Stale-tolerant.** `config::list_registered_workspaces` filters
@@ -473,10 +511,9 @@ one back-stack and `Esc` means the same thing everywhere:
 
 Entry-flow-specific wrinkles:
 
-- Walk-up-entered users still see the picker once they press Esc.
-  This is a feature: the picker doubles as a "jump to another
-  registered workspace" affordance without needing to exit `pa` and
-  cd somewhere else first.
+- `pa PATH` enters that workspace directly, but Esc still returns to the
+  picker. Bare `pa` starts at the picker and therefore needs no entry-path
+  special case.
 - If the picker's own registry is empty (no workspaces registered,
   no pinned mpx with live sessions) the picker still renders with
   the "live sessions on this machine" option as the only row, so
@@ -712,4 +749,4 @@ subprocess.
 - **Agent-API wrapping**. Claude Code / OpenCode are launched as subprocesses. portagenty never speaks their APIs.
 - **GUI / web UI**. Terminal only.
 - **Syncing across machines**. Rely on git (for workspace files) and Syncthing/rsync (for anything else the user wants to sync). Not portagenty's problem.
-- **Supervisor-mode agent management**. portagenty launches agents; it does not restart them, monitor their logs, or gather telemetry.
+- **Resident supervisor-mode agent management**. Portagenty may explicitly contain and sample a workload it launches on a capable platform, but it does not restart agents, monitor their logs, retain resource history, inspect prompts/content, or run an always-on Portagenty supervisor/telemetry service.

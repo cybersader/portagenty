@@ -1,20 +1,20 @@
 //! A single executable unit in a workspace — `name + cwd + command`.
 //!
 //! See `DESIGN.md` §1 for the definition. v1's schema is deliberately
-//! minimal; env vars, pre/post commands, profile references are still
-//! v1.x extensions. `kind` arrives in v1.x as a display-only hint
-//! (ROADMAP v1.x item 9); future releases may wire smart-resume or
-//! agent-specific launch tweaks off of it, but for now it only
-//! affects how a row renders in the TUI.
+//! minimal; env vars, pre/post commands, and profile references are v1.x
+//! extensions. `kind` is an explicit policy selector: it still drives the TUI
+//! marker and resume behavior, and `claude-code` alone opts a supervised launch
+//! into the Claude containment slice and standard resource policy. Commands and
+//! session names are never inspected to infer that policy.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Optional hint about what kind of thing a session runs. Purely
-/// informational in v1.x — the TUI uses it to render a small marker
-/// so users can see at a glance which row is an agent vs a dev
-/// server vs a plain shell. Serialized as a kebab-case string.
+/// Explicit session classification. The TUI renders it as a small marker and
+/// launch code may select a documented kind-specific policy. Only
+/// `ClaudeCode` selects the Claude containment policy; absent and generic kinds
+/// remain generic regardless of command text. Serialized as kebab-case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionKind {

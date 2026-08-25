@@ -4,6 +4,10 @@
 //! `domain::Workspace`. Two-pane project/session layouts and the
 //! Tags / Custom Groups views come in v1.x per `ROADMAP.md`.
 
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -14,7 +18,33 @@ use ratatui::{
 
 use crate::domain::{Session, Workspace};
 use crate::mux::{Multiplexer, SessionInfo};
-use crate::tui::view::{build_rows, SessionRow, SessionState};
+use crate::supervision::{BindingReceipt, LogicalSessionId, ResourceLimits};
+#[cfg(target_os = "linux")]
+use crate::supervision::{MetricValue, ResourceSnapshot, SupervisionBackend};
+use crate::tui::view::{build_rows, RowOwnership, SessionRow, SessionState};
+
+/// Why the user requested a supervised launch. Only the routine Enter path is
+/// eligible for an automatic ordinary fallback when non-creating preflight
+/// proves supervision itself is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisionIntent {
+    RoutineEnter,
+    ExplicitCustom,
+    StaleReplacement,
+}
+
+/// Stable identity used to restore the highlighted row after refreshes or a
+/// failed launch reinitializes the workspace TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowSelectionIdentity {
+    Declared {
+        logical_id: Option<LogicalSessionId>,
+        session_name: String,
+    },
+    Untracked {
+        mpx_name: String,
+    },
+}
 
 /// How the user wants a selected row to be realized on the mpx side.
 /// Determined by the row's [`SessionState`].
@@ -23,8 +53,30 @@ pub enum LaunchKind {
     /// Workspace-defined, not currently live: `create_and_attach`.
     /// `mpx_name` is the workspace-scoped name the mpx should use.
     Create { session: Session, mpx_name: String },
-    /// Already live (workspace or untracked): `attach` by sanitized name.
-    Attach { mpx_name: String },
+    /// Creation under the platform supervision backend, either from routine
+    /// eligible Enter or the explicit custom-limits path.
+    CreateSupervised {
+        session: Session,
+        limits: ResourceLimits,
+        intent: SupervisionIntent,
+    },
+    /// Replace one exact stale receipt, create a fresh owned binding, and attach
+    /// in a single confirmed flow. Stale cleanup itself never sends a signal.
+    ReplaceStaleSupervised {
+        session: Session,
+        receipt: Box<BindingReceipt>,
+        limits: ResourceLimits,
+    },
+    /// Already live on the workspace's ordinary shared multiplexer target.
+    Attach {
+        mpx_name: String,
+        display_name: String,
+    },
+    /// Attach to the exact private target stored in a verified receipt.
+    AttachOwned {
+        target: crate::supervision::MuxTarget,
+        display_name: String,
+    },
 }
 
 /// The reason [`App::run`] returned. The outer entry point uses this
@@ -43,10 +95,19 @@ pub enum AppOutcome {
     OpenShellAt(std::path::PathBuf),
 }
 
+/// Final state handed back to the outer coordinator after the event loop.
+/// The workspace may differ from the input when the TUI upgrades a legacy
+/// manifest with a stable UUID before launching a supervised session.
+pub struct AppRunResult {
+    pub outcome: AppOutcome,
+    pub mux: Box<dyn Multiplexer>,
+    pub workspace: Workspace,
+}
+
 /// Internal action dispatch. Returned from [`App::handle_key`] so the
 /// event loop can translate a key press into either continued
 /// in-TUI work or a reason to exit the loop.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Action {
     None,
     Quit,
@@ -54,6 +115,12 @@ pub enum Action {
     /// (or quit if the picker wasn't in the chain).
     Back,
     LaunchSelected,
+    LaunchSupervisedSelected(ResourceLimits),
+    LaunchStaleSupervised {
+        session: Session,
+        receipt: Box<BindingReceipt>,
+        limits: ResourceLimits,
+    },
     /// `o` pressed — ask the outer driver to exit pa and spawn a
     /// plain shell at the given directory. From the session list's
     /// bare `o` this is the workspace's dir; from the file-tree
@@ -114,6 +181,20 @@ pub struct App {
     /// Default on; `z` toggles it off for max-density scanning.
     /// Session-local (not persisted) for now.
     expand_selected: bool,
+    receipts: BTreeMap<LogicalSessionId, BindingReceipt>,
+    #[cfg(target_os = "linux")]
+    pending_launches: BTreeMap<LogicalSessionId, crate::supervision::PendingLaunch>,
+    #[cfg(target_os = "linux")]
+    resource_snapshots: BTreeMap<LogicalSessionId, ResourceSnapshot>,
+    #[cfg(target_os = "linux")]
+    resource_refresh_pending: HashSet<LogicalSessionId>,
+    #[cfg(target_os = "linux")]
+    last_resource_sample: std::time::Instant,
+    #[cfg(target_os = "linux")]
+    resource_worker: Option<crate::tui::resources::ResourceWorker>,
+    supervising: Option<SuperviseState>,
+    supervision_preflight: fn() -> Result<()>,
+    supervision_evidence_available: bool,
 }
 
 /// Two-stage state for the "add new session" modal.
@@ -130,6 +211,95 @@ struct AddSessionState {
 enum AddStage {
     Name,
     Command,
+}
+
+fn supervise_limit_fields(limits: &ResourceLimits) -> (String, String, String, String, String) {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let memory_high = limits
+        .memory_high_bytes
+        .map(|bytes| {
+            if bytes % GIB == 0 {
+                format!("{}G", bytes / GIB)
+            } else {
+                bytes.to_string()
+            }
+        })
+        .unwrap_or_default();
+    let memory_max = limits
+        .memory_max_bytes
+        .map(|bytes| {
+            if bytes % GIB == 0 {
+                format!("{}G", bytes / GIB)
+            } else {
+                bytes.to_string()
+            }
+        })
+        .unwrap_or_default();
+    let memory_swap_max = limits
+        .memory_swap_max_bytes
+        .map(|bytes| {
+            const MIB: u64 = 1024 * 1024;
+            if bytes % GIB == 0 {
+                format!("{}G", bytes / GIB)
+            } else if bytes % MIB == 0 {
+                format!("{}MiB", bytes / MIB)
+            } else {
+                bytes.to_string()
+            }
+        })
+        .unwrap_or_default();
+    let cpu_quota = limits
+        .cpu_quota_percent
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let tasks_max = limits
+        .tasks_max
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    (
+        memory_high,
+        memory_max,
+        memory_swap_max,
+        cpu_quota,
+        tasks_max,
+    )
+}
+
+#[cfg(not(test))]
+fn default_supervision_preflight() -> Result<()> {
+    let report = crate::supervision::platform_backend().capabilities();
+    if report.overall != crate::supervision::CapabilityState::Supported {
+        anyhow::bail!("resource supervision is unavailable: {:?}", report.overall);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn default_supervision_preflight() -> Result<()> {
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SuperviseState {
+    stage: SuperviseStage,
+    session_name: String,
+    mpx_name: String,
+    memory_high: String,
+    memory_max: String,
+    memory_swap_max: String,
+    cpu_quota: String,
+    tasks_max: String,
+    stale_receipt: Option<Box<BindingReceipt>>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuperviseStage {
+    MemoryHigh,
+    MemoryMax,
+    MemorySwapMax,
+    CpuQuota,
+    TasksMax,
 }
 
 /// How long status messages stick around before auto-clearing.
@@ -151,6 +321,39 @@ enum PendingAction {
         /// Client count if the mpx reported it. Used to warn users
         /// about disconnecting other devices.
         attached_clients: Option<u32>,
+    },
+    /// Prepare a declared row for a fresh supervised launch. A legacy
+    /// workspace may first receive a stable UUID; a live ordinary target is
+    /// then terminated by its exact mpx name and revalidated as idle. The old
+    /// process tree is never claimed or migrated.
+    PrepareSupervised {
+        session_name: String,
+        display_name: String,
+        mpx_name: String,
+        attached_clients: Option<u32>,
+        assign_workspace_id: bool,
+        restart_live: bool,
+    },
+    #[cfg(target_os = "linux")]
+    StopOwned {
+        display_name: String,
+        receipt: Box<BindingReceipt>,
+        force: bool,
+    },
+    /// Remove one exact receipt only after the backend proves both its
+    /// systemd invocation and private multiplexer target are absent.
+    /// This action never sends a signal.
+    #[cfg(target_os = "linux")]
+    RemoveStaleReceipt {
+        display_name: String,
+        receipt: Box<BindingReceipt>,
+    },
+    /// Confirm one exact stale receipt replacement. Execution is handed to the
+    /// outer launch coordinator so cleanup, creation, and attach remain one flow.
+    ReplaceStaleBinding {
+        session: Session,
+        receipt: Box<BindingReceipt>,
+        limits: ResourceLimits,
     },
     /// Switch the workspace's pinned multiplexer between tmux and
     /// zellij. Edits the TOML in place via toml_edit (preserves
@@ -205,7 +408,277 @@ impl App {
             adding_session: None,
             untracked_scope,
             expand_selected: true,
+            receipts: BTreeMap::new(),
+            #[cfg(target_os = "linux")]
+            pending_launches: BTreeMap::new(),
+            #[cfg(target_os = "linux")]
+            resource_snapshots: BTreeMap::new(),
+            #[cfg(target_os = "linux")]
+            resource_refresh_pending: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            last_resource_sample: std::time::Instant::now(),
+            #[cfg(target_os = "linux")]
+            resource_worker: None,
+            supervising: None,
+            supervision_preflight: default_supervision_preflight,
+            supervision_evidence_available: true,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_receipts(self, receipts: Vec<BindingReceipt>) -> Self {
+        self.with_supervision_evidence(receipts, Vec::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_supervision_evidence(
+        mut self,
+        receipts: Vec<BindingReceipt>,
+        pending_launches: Vec<crate::supervision::PendingLaunch>,
+    ) -> Self {
+        self.receipts = receipts
+            .into_iter()
+            .map(|receipt| (receipt.logical_id.clone(), receipt))
+            .collect();
+        self.pending_launches = pending_launches
+            .into_iter()
+            .map(|pending| (pending.logical_id.clone(), pending))
+            .collect();
+        self.apply_receipt_annotations(&BTreeMap::new());
+        self.apply_pending_annotations();
+        if !self.receipts.is_empty() {
+            self.resource_worker = Some(crate::tui::resources::ResourceWorker::start());
+            self.request_all_resource_refreshes();
+        }
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn workspace_id(&self) -> Option<&str> {
+        self.workspace.id.as_deref()
+    }
+
+    fn has_supervision_evidence(&self, logical_id: &LogicalSessionId) -> bool {
+        if self.receipts.contains_key(logical_id) {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.pending_launches.contains_key(logical_id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_receipt_annotations(
+        &self,
+    ) -> BTreeMap<LogicalSessionId, (RowOwnership, Option<String>, Vec<String>)> {
+        self.rows
+            .iter()
+            .filter_map(|row| {
+                let logical_id = row.logical_id.as_ref()?;
+                self.receipts.contains_key(logical_id).then(|| {
+                    (
+                        logical_id.clone(),
+                        (
+                            row.ownership,
+                            row.resource_summary.clone(),
+                            row.resource_details.clone(),
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn apply_receipt_annotations(
+        &mut self,
+        annotations: &BTreeMap<LogicalSessionId, (RowOwnership, Option<String>, Vec<String>)>,
+    ) {
+        for receipt in self.receipts.values() {
+            let target_name = match &receipt.mux_target {
+                crate::supervision::MuxTarget::TmuxPrivate { session, .. }
+                | crate::supervision::MuxTarget::TmuxShared { session }
+                | crate::supervision::MuxTarget::Zellij { session, .. } => session.clone(),
+            };
+            let (ownership, resource_summary, resource_details) = annotations
+                .get(&receipt.logical_id)
+                .cloned()
+                .unwrap_or((RowOwnership::ExistingUnverified, None, Vec::new()));
+            if let Some(row) = self
+                .rows
+                .iter_mut()
+                .find(|row| row.logical_id.as_ref() == Some(&receipt.logical_id))
+            {
+                // A receipt is only authoritative after exact runtime
+                // reconciliation succeeds. Until then, and after it becomes
+                // stale, preserve the state/name derived from a fresh ordinary
+                // multiplexer listing so Enter can never chase a dead opaque
+                // target.
+                if matches!(
+                    ownership,
+                    RowOwnership::Owned
+                        | RowOwnership::LegacyRestartRequired
+                        | RowOwnership::SplitContainment
+                ) {
+                    row.state = SessionState::Live;
+                    row.mpx_name = target_name;
+                    row.mux_target = Some(receipt.mux_target.clone());
+                }
+                row.ownership = ownership;
+                row.resource_summary = resource_summary;
+                row.resource_details = resource_details;
+            } else {
+                self.rows.push(SessionRow {
+                    mpx_name: target_name,
+                    display_name: receipt.logical_id.session_name.clone(),
+                    state: SessionState::Untracked,
+                    logical_id: Some(receipt.logical_id.clone()),
+                    mux_target: Some(receipt.mux_target.clone()),
+                    ownership,
+                    resource_summary,
+                    resource_details,
+                    session: None,
+                    cwd_display: "(receipt orphan)".into(),
+                    command_display: "(receipt only)".into(),
+                    kind: None,
+                    last_attached_unix: None,
+                    attached_clients: None,
+                });
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn apply_pending_annotations(&mut self) {
+        for pending in self.pending_launches.values() {
+            let target_name = match &pending.mux_target {
+                crate::supervision::MuxTarget::TmuxPrivate { session, .. }
+                | crate::supervision::MuxTarget::TmuxShared { session }
+                | crate::supervision::MuxTarget::Zellij { session, .. } => session.clone(),
+            };
+            let mut details = vec![
+                format!("pending unit: {}", pending.unit_name),
+                format!("pending target: {:?}", pending.mux_target),
+                format!("pending marker: {}", pending.marker_path.display()),
+                format!(
+                    "creator: pid={} start-time-ticks={}",
+                    pending.creator_pid, pending.creator_start_time_ticks
+                ),
+                "attach, creation, fallback, stop, and force-kill are blocked; use `pa resources status` and signal-free `pa resources cleanup` only when proven dead".into(),
+            ];
+            if let Some(error) = &pending.last_error {
+                details.push(format!("last error: {error}"));
+            }
+            if let Some(row) = self
+                .rows
+                .iter_mut()
+                .find(|row| row.logical_id.as_ref() == Some(&pending.logical_id))
+            {
+                row.ownership = RowOwnership::Pending;
+                row.resource_summary = Some("pending launch (fail-closed)".into());
+                row.resource_details = details;
+            } else {
+                self.rows.push(SessionRow {
+                    mpx_name: target_name,
+                    display_name: pending.logical_id.session_name.clone(),
+                    state: SessionState::Untracked,
+                    logical_id: Some(pending.logical_id.clone()),
+                    mux_target: None,
+                    ownership: RowOwnership::Pending,
+                    resource_summary: Some("pending launch (fail-closed)".into()),
+                    resource_details: details,
+                    session: None,
+                    cwd_display: "(pending launch)".into(),
+                    command_display: "(pending evidence only)".into(),
+                    kind: None,
+                    last_attached_unix: None,
+                    attached_clients: None,
+                });
+            }
+        }
+    }
+
+    fn rebuild_rows(&mut self, live: &[SessionInfo]) {
+        let selection = self.selection_identity();
+        #[cfg(target_os = "linux")]
+        let annotations = self.current_receipt_annotations();
+        self.rows = build_rows(&self.workspace, live, self.untracked_scope);
+        #[cfg(target_os = "linux")]
+        {
+            self.apply_receipt_annotations(&annotations);
+            self.apply_pending_annotations();
+        }
+        if let Some(selection) = selection {
+            self.restore_selection(&selection);
+        } else if self.rows.is_empty() {
+            self.list_state.select(None);
+        } else {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    pub fn selection_identity(&self) -> Option<RowSelectionIdentity> {
+        let row = self.selected_row()?;
+        match &row.session {
+            Some(session) => Some(RowSelectionIdentity::Declared {
+                logical_id: row.logical_id.clone(),
+                session_name: session.name.clone(),
+            }),
+            None => Some(RowSelectionIdentity::Untracked {
+                mpx_name: row.mpx_name.clone(),
+            }),
+        }
+    }
+
+    pub fn restore_selection(&mut self, selection: &RowSelectionIdentity) {
+        let index = match selection {
+            RowSelectionIdentity::Declared {
+                logical_id,
+                session_name,
+            } => logical_id
+                .as_ref()
+                .and_then(|logical_id| {
+                    self.rows
+                        .iter()
+                        .position(|row| row.logical_id.as_ref() == Some(logical_id))
+                })
+                .or_else(|| {
+                    self.rows.iter().position(|row| {
+                        row.session
+                            .as_ref()
+                            .is_some_and(|session| session.name == *session_name)
+                    })
+                }),
+            RowSelectionIdentity::Untracked { mpx_name } => self
+                .rows
+                .iter()
+                .position(|row| row.session.is_none() && row.mpx_name == *mpx_name),
+        };
+        if self.rows.is_empty() {
+            self.list_state.select(None);
+        } else {
+            let fallback = self
+                .list_state
+                .selected()
+                .unwrap_or(0)
+                .min(self.rows.len() - 1);
+            self.list_state.select(Some(index.unwrap_or(fallback)));
+        }
+    }
+
+    pub fn set_persistent_status(&mut self, msg: impl Into<String>) {
+        self.status = Some(msg.into());
+        self.status_set_at = None;
+    }
+
+    pub fn fail_closed_supervision(&mut self, msg: impl Into<String>) {
+        self.supervision_evidence_available = false;
+        self.set_persistent_status(msg);
     }
 
     /// Currently-selected row index, if any.
@@ -252,19 +725,24 @@ impl App {
     }
 
     /// Consume the app: run the event loop until the user either quits
-    /// or picks a session to launch. Returns the outcome and hands
-    /// back the multiplexer so the outer entry point can call
-    /// [`Multiplexer::create_and_attach`] after restoring the terminal.
-    pub fn run(
-        mut self,
-        terminal: &mut DefaultTerminal,
-    ) -> Result<(AppOutcome, Box<dyn Multiplexer>)> {
+    /// or picks a session to launch. Returns the outcome, multiplexer, and
+    /// final workspace so the outer entry point sees in-TUI manifest upgrades
+    /// before it launches or resumes after a setup failure.
+    pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<AppRunResult> {
         loop {
             // Auto-age the status line so a "cancelled" or "deleted X"
             // message doesn't sit forever when the user walks away.
             if let Some(set_at) = self.status_set_at {
                 if set_at.elapsed() >= STATUS_TTL {
                     self.clear_status();
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.poll_resource_results();
+                if self.last_resource_sample.elapsed() >= std::time::Duration::from_secs(2) {
+                    self.request_all_resource_refreshes();
+                    self.last_resource_sample = std::time::Instant::now();
                 }
             }
             terminal.draw(|frame| self.render(frame))?;
@@ -275,9 +753,17 @@ impl App {
             // burning CPU.
             if event::poll(std::time::Duration::from_millis(250))? {
                 if let Some(outcome) = self.handle_event()? {
-                    return Ok((outcome, self.mux));
+                    return Ok(self.finish(outcome));
                 }
             }
+        }
+    }
+
+    fn finish(self, outcome: AppOutcome) -> AppRunResult {
+        AppRunResult {
+            outcome,
+            mux: self.mux,
+            workspace: self.workspace,
         }
     }
 
@@ -297,21 +783,123 @@ impl App {
             Action::None => None,
             Action::Quit => Some(AppOutcome::Quit),
             Action::Back => Some(AppOutcome::Back),
-            Action::LaunchSelected => self.selected().and_then(|i| {
+            Action::LaunchSelected => {
+                let i = self.selected()?;
                 let row = self.rows.get(i)?;
-                let kind = match row.state {
-                    SessionState::NotStarted => {
-                        row.session.as_ref().map(|s| LaunchKind::Create {
-                            session: s.clone(),
-                            mpx_name: row.mpx_name.clone(),
-                        })?
+                let receipt_backed = row
+                    .logical_id
+                    .as_ref()
+                    .is_some_and(|logical_id| self.has_supervision_evidence(logical_id));
+                let ownership = row.ownership;
+                let state = row.state;
+                let session = row.session.clone();
+                let logical_id = row.logical_id.clone();
+                let mpx_name = row.mpx_name.clone();
+                let display_name = row.display_name.clone();
+                let mux_target = row.mux_target.clone();
+
+                if ownership == RowOwnership::Pending {
+                    self.set_status(
+                        "Enter: pending supervision evidence blocks attach, fallback, and creation; inspect with `pa resources status`",
+                    );
+                    return None;
+                }
+                if receipt_backed
+                    && !matches!(
+                        ownership,
+                        RowOwnership::Owned
+                            | RowOwnership::LegacyRestartRequired
+                            | RowOwnership::SplitContainment
+                            | RowOwnership::Stale
+                    )
+                {
+                    self.set_status(
+                        "Enter: verifying the ownership receipt; wait for the row to become owned or stale",
+                    );
+                    return None;
+                }
+                if matches!(
+                    ownership,
+                    RowOwnership::Owned
+                        | RowOwnership::LegacyRestartRequired
+                        | RowOwnership::SplitContainment
+                ) {
+                    return Some(AppOutcome::Launch(LaunchKind::AttachOwned {
+                        target: mux_target?,
+                        display_name,
+                    }));
+                }
+                if matches!(state, SessionState::Live | SessionState::Untracked) {
+                    return Some(AppOutcome::Launch(LaunchKind::Attach {
+                        mpx_name,
+                        display_name,
+                    }));
+                }
+                let session = session?;
+                if ownership == RowOwnership::IdleSupported && !self.supervision_evidence_available
+                {
+                    self.set_status(
+                        "Enter: supervision evidence could not be loaded, so supervised creation and ordinary fallback are blocked",
+                    );
+                    return None;
+                }
+                if ownership == RowOwnership::Stale {
+                    let Some(logical_id) = logical_id else {
+                        self.set_status(
+                            "Enter: stale row has no declared logical identity; use x for cleanup",
+                        );
+                        return None;
+                    };
+                    let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+                        self.set_status(
+                            "Enter: stale row is missing its exact receipt; refresh and retry",
+                        );
+                        return None;
+                    };
+                    let limits = if receipt.limits.is_empty() {
+                        ResourceLimits::defaults_for_kind(session.kind)
+                    } else {
+                        receipt.limits.clone()
+                    };
+                    self.pending = Some(PendingAction::ReplaceStaleBinding {
+                        session,
+                        receipt: Box::new(receipt),
+                        limits,
+                    });
+                    return None;
+                }
+                let session_kind = session.kind;
+                let kind = if ownership == RowOwnership::IdleSupported {
+                    LaunchKind::CreateSupervised {
+                        session,
+                        limits: ResourceLimits::defaults_for_kind(session_kind),
+                        intent: SupervisionIntent::RoutineEnter,
                     }
-                    SessionState::Live | SessionState::Untracked => LaunchKind::Attach {
-                        mpx_name: row.mpx_name.clone(),
-                    },
+                } else {
+                    LaunchKind::Create { session, mpx_name }
                 };
                 Some(AppOutcome::Launch(kind))
+            }
+            Action::LaunchSupervisedSelected(limits) => self.selected().and_then(|i| {
+                let row = self.rows.get(i)?;
+                row.session
+                    .as_ref()
+                    .map(|session| LaunchKind::CreateSupervised {
+                        session: session.clone(),
+                        limits,
+                        intent: SupervisionIntent::ExplicitCustom,
+                    })
+                    .map(AppOutcome::Launch)
             }),
+            Action::LaunchStaleSupervised {
+                session,
+                receipt,
+                limits,
+            } => Some(AppOutcome::Launch(LaunchKind::ReplaceStaleSupervised {
+                session,
+                receipt,
+                limits,
+            })),
             Action::OpenShellAt(dir) => Some(AppOutcome::OpenShellAt(dir)),
         }
     }
@@ -358,6 +946,141 @@ impl App {
         self.status_set_at = None;
     }
 
+    #[cfg(target_os = "linux")]
+    fn request_resource_refresh(&mut self, logical_id: &LogicalSessionId) -> bool {
+        if self.pending_launches.contains_key(logical_id)
+            || self.resource_refresh_pending.contains(logical_id)
+        {
+            return false;
+        }
+        let Some(receipt) = self.receipts.get(logical_id).cloned() else {
+            return false;
+        };
+        let previous = self.resource_snapshots.get(logical_id).cloned();
+        let queued = self
+            .resource_worker
+            .as_ref()
+            .is_some_and(|worker| worker.request(receipt, previous));
+        if queued {
+            self.resource_refresh_pending.insert(logical_id.clone());
+        }
+        queued
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request_all_resource_refreshes(&mut self) {
+        let ids: Vec<LogicalSessionId> = self.receipts.keys().cloned().collect();
+        for logical_id in ids {
+            let _ = self.request_resource_refresh(&logical_id);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request_selected_resource_refresh(&mut self) {
+        let logical_id = self.selected_row().and_then(|row| row.logical_id.clone());
+        if let Some(logical_id) = logical_id {
+            if self.request_resource_refresh(&logical_id) {
+                self.set_status("resource refresh queued");
+            } else {
+                self.set_status("r: refresh not queued (missing, busy, or already pending)");
+            }
+        } else {
+            self.set_status("r: selected row has no owned resource binding");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_resource_results(&mut self) {
+        let results: Vec<_> = self
+            .resource_worker
+            .as_ref()
+            .map(|worker| worker.drain().collect())
+            .unwrap_or_default();
+        let mut rebuild_from_mux = false;
+        for result in results {
+            self.resource_refresh_pending.remove(&result.logical_id);
+            if self.pending_launches.contains_key(&result.logical_id) {
+                continue;
+            }
+            let ownership = match &result.ownership {
+                crate::supervision::OwnershipState::OwnedVerified(_) => RowOwnership::Owned,
+                crate::supervision::OwnershipState::LegacyRestartRequired(_) => {
+                    RowOwnership::LegacyRestartRequired
+                }
+                crate::supervision::OwnershipState::SplitContainment(_) => {
+                    RowOwnership::SplitContainment
+                }
+                crate::supervision::OwnershipState::AmbiguousBinding(_) => {
+                    rebuild_from_mux = true;
+                    RowOwnership::Ambiguous
+                }
+                crate::supervision::OwnershipState::StaleBinding(_) => {
+                    rebuild_from_mux = true;
+                    RowOwnership::Stale
+                }
+                crate::supervision::OwnershipState::ExistingUnverified => {
+                    RowOwnership::ExistingUnverified
+                }
+                crate::supervision::OwnershipState::Unmanaged => RowOwnership::Unmanaged,
+                crate::supervision::OwnershipState::Unsupported(_) => RowOwnership::Unsupported,
+                crate::supervision::OwnershipState::IdleSupported => RowOwnership::IdleSupported,
+            };
+            let previous = self.resource_snapshots.get(&result.logical_id);
+            let event_notice = result
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| resource_event_notice(previous, snapshot));
+            if let Some(snapshot) = result.snapshot {
+                self.resource_snapshots
+                    .insert(result.logical_id.clone(), snapshot.clone());
+                if let Some(row) = self
+                    .rows
+                    .iter_mut()
+                    .find(|row| row.logical_id.as_ref() == Some(&result.logical_id))
+                {
+                    row.resource_summary = Some(resource_summary(&snapshot));
+                    row.resource_details = resource_details(&snapshot);
+                }
+            }
+            if let Some(row) = self
+                .rows
+                .iter_mut()
+                .find(|row| row.logical_id.as_ref() == Some(&result.logical_id))
+            {
+                row.ownership = ownership;
+                if matches!(
+                    ownership,
+                    RowOwnership::Owned
+                        | RowOwnership::LegacyRestartRequired
+                        | RowOwnership::SplitContainment
+                ) {
+                    if let Some(receipt) = self.receipts.get(&result.logical_id) {
+                        row.state = SessionState::Live;
+                        row.mpx_name = match &receipt.mux_target {
+                            crate::supervision::MuxTarget::TmuxPrivate { session, .. }
+                            | crate::supervision::MuxTarget::TmuxShared { session }
+                            | crate::supervision::MuxTarget::Zellij { session, .. } => {
+                                session.clone()
+                            }
+                        };
+                        row.mux_target = Some(receipt.mux_target.clone());
+                    }
+                }
+                if let Some(error) = result.error {
+                    row.resource_summary = Some(format!("resource error: {error}"));
+                }
+            }
+            if let Some(notice) = event_notice {
+                self.set_status(format!("resource event: {notice}"));
+            }
+        }
+        if rebuild_from_mux {
+            if let Ok(live) = self.mux.list_sessions() {
+                self.rebuild_rows(&live);
+            }
+        }
+    }
+
     /// Queue a delete-session confirm modal for the currently-selected
     /// row. Only valid on tracked rows (ones with a workspace
     /// session). Untracked rows (live mpx sessions outside the
@@ -371,15 +1094,594 @@ impl App {
         let Some(row) = self.selected_row() else {
             return;
         };
-        if row.state == SessionState::NotStarted {
-            self.set_status("x: no live session to kill on this row (it's idle)");
+        let receipt_backed = row
+            .logical_id
+            .as_ref()
+            .is_some_and(|logical_id| self.has_supervision_evidence(logical_id));
+        if receipt_backed
+            && !matches!(
+                row.ownership,
+                RowOwnership::Owned
+                    | RowOwnership::LegacyRestartRequired
+                    | RowOwnership::SplitContainment
+                    | RowOwnership::Pending
+                    | RowOwnership::Ambiguous
+                    | RowOwnership::Stale
+            )
+        {
+            self.set_status("x: verifying the ownership receipt; wait for a final state");
             return;
         }
-        self.pending = Some(PendingAction::KillSession {
+        match row.ownership {
+            #[cfg(target_os = "linux")]
+            RowOwnership::Owned => {
+                let Some(logical_id) = row.logical_id.clone() else {
+                    self.set_status("x: owned row is missing its logical identity");
+                    return;
+                };
+                let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+                    self.set_status("x: owned row is missing its binding receipt");
+                    return;
+                };
+                self.pending = Some(PendingAction::StopOwned {
+                    display_name: row.display_name.clone(),
+                    receipt: Box::new(receipt),
+                    force: false,
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
+            RowOwnership::Owned => {
+                self.set_status(
+                    "x: receipt-backed resource control is unsupported on this platform",
+                );
+            }
+            RowOwnership::LegacyRestartRequired => {
+                self.set_status(
+                    "x: legacy v1 service is attach-only; exit it normally to transition",
+                );
+            }
+            RowOwnership::SplitContainment => {
+                self.set_status(
+                    "x: split containment disables whole-workload stop; external descendants remain separately bounded",
+                );
+            }
+            RowOwnership::Pending => {
+                self.set_status(
+                    "x: pending launch evidence is not an owned control target; use `pa resources status` and signal-free cleanup only when proven dead",
+                );
+            }
+            RowOwnership::Ambiguous => {
+                self.set_status("x: ownership is ambiguous; no control action is allowed");
+            }
+            #[cfg(target_os = "linux")]
+            RowOwnership::Stale => {
+                let Some(logical_id) = row.logical_id.clone() else {
+                    self.set_status("x: stale row is missing its logical identity");
+                    return;
+                };
+                let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+                    self.set_status("x: stale row is missing its binding receipt");
+                    return;
+                };
+                self.pending = Some(PendingAction::RemoveStaleReceipt {
+                    display_name: row.display_name.clone(),
+                    receipt: Box::new(receipt),
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
+            RowOwnership::Stale => {
+                self.set_status("x: stale receipt cleanup is unsupported on this platform");
+            }
+            _ if row.state == SessionState::NotStarted => {
+                self.set_status("x: no live session to stop on this row (it's idle)");
+            }
+            _ => {
+                self.pending = Some(PendingAction::KillSession {
+                    display_name: row.display_name.clone(),
+                    mpx_name: row.mpx_name.clone(),
+                    attached_clients: row.attached_clients,
+                });
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_force_kill_prompt(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.ownership != RowOwnership::Owned {
+            self.set_status("X: force-kill is available only for owned-and-verified rows");
+            return;
+        }
+        let Some(logical_id) = row.logical_id.clone() else {
+            self.set_status("X: owned row is missing its logical identity");
+            return;
+        };
+        let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+            self.set_status("X: owned row is missing its binding receipt");
+            return;
+        };
+        self.pending = Some(PendingAction::StopOwned {
             display_name: row.display_name.clone(),
-            mpx_name: row.mpx_name.clone(),
-            attached_clients: row.attached_clients,
+            receipt: Box::new(receipt),
+            force: true,
         });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open_force_kill_prompt(&mut self) {
+        self.set_status("X: receipt-backed force-kill is unsupported on this platform");
+    }
+
+    fn open_supervise_modal(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        let Some(session) = row.session.as_ref() else {
+            self.set_status("S: untracked rows cannot be launched under workspace supervision");
+            return;
+        };
+        let session_name = session.name.clone();
+        let display_name = row.display_name.clone();
+        let mpx_name = row.mpx_name.clone();
+        let attached_clients = row.attached_clients;
+        let state = row.state;
+        let ownership = row.ownership;
+        let logical_id = row.logical_id.clone();
+        let receipt_backed = row
+            .logical_id
+            .as_ref()
+            .is_some_and(|logical_id| self.has_supervision_evidence(logical_id));
+
+        if receipt_backed
+            && !matches!(
+                ownership,
+                RowOwnership::Owned
+                    | RowOwnership::LegacyRestartRequired
+                    | RowOwnership::SplitContainment
+                    | RowOwnership::Pending
+                    | RowOwnership::Ambiguous
+                    | RowOwnership::Stale
+            )
+        {
+            self.set_status("S: verifying the ownership receipt; wait for a final state");
+            return;
+        }
+
+        match ownership {
+            RowOwnership::Owned => {
+                self.set_status(
+                    "S: this row is already supervised; Enter attaches and r refreshes resources",
+                );
+                return;
+            }
+            RowOwnership::LegacyRestartRequired => {
+                self.set_status(
+                    "S: legacy v1 service is attach-only; exit it normally, then relaunch for v2 ownership",
+                );
+                return;
+            }
+            RowOwnership::SplitContainment => {
+                self.set_status(
+                    "S: containment is split by external descendants; whole-workload ownership is disabled",
+                );
+                return;
+            }
+            RowOwnership::Pending => {
+                self.set_status(
+                    "S: pending launch evidence blocks new supervision; inspect with `pa resources status`",
+                );
+                return;
+            }
+            RowOwnership::Ambiguous => {
+                self.set_status(
+                    "S: ownership evidence is ambiguous; no restart or resource action is allowed",
+                );
+                return;
+            }
+            RowOwnership::Stale => {
+                if state != SessionState::NotStarted {
+                    self.set_status(
+                        "S: a stale receipt and a live ordinary target need separate cleanup/restart decisions",
+                    );
+                    return;
+                }
+                let Some(logical_id) = logical_id else {
+                    self.set_status("S: stale row is missing its logical identity");
+                    return;
+                };
+                let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+                    self.set_status("S: stale row is missing its binding receipt");
+                    return;
+                };
+                if let Err(error) = (self.supervision_preflight)() {
+                    self.set_status(format!("S: {error:#}"));
+                    return;
+                }
+                let limits = if receipt.limits.is_empty() {
+                    ResourceLimits::defaults_for_kind(session.kind)
+                } else {
+                    receipt.limits.clone()
+                };
+                if let Err(error) =
+                    self.open_supervise_limits_with(&session_name, limits, Some(receipt))
+                {
+                    self.set_status(format!("S: {error:#}"));
+                }
+                return;
+            }
+            RowOwnership::InvalidWorkspaceId => {
+                self.set_status(
+                    "S: workspace has an invalid ID; fix it explicitly before supervision",
+                );
+                return;
+            }
+            RowOwnership::Unsupported => {
+                self.set_status("S: supervision is genuinely unsupported for this row");
+                return;
+            }
+            RowOwnership::Unmanaged if state != SessionState::Live => {
+                self.set_status("S: unmanaged row is not a live declared session");
+                return;
+            }
+            RowOwnership::ExistingUnverified if state != SessionState::Live => {
+                self.set_status("S: unverified row is not currently live");
+                return;
+            }
+            RowOwnership::IdleSupported if state != SessionState::NotStarted => {
+                self.set_status("S: supervisable row changed state; refresh and retry");
+                return;
+            }
+            RowOwnership::NeedsWorkspaceId
+            | RowOwnership::IdleSupported
+            | RowOwnership::ExistingUnverified
+            | RowOwnership::Unmanaged => {}
+        }
+
+        if !self.supervision_evidence_available {
+            self.set_status("S: supervision evidence could not be loaded; creation is fail-closed");
+            return;
+        }
+        if let Err(error) = (self.supervision_preflight)() {
+            self.set_status(format!("S: {error:#}"));
+            return;
+        }
+
+        if ownership == RowOwnership::IdleSupported {
+            if let Err(error) = self.open_supervise_limits(&session_name) {
+                self.set_status(format!("S: {error:#}"));
+            }
+            return;
+        }
+
+        self.pending = Some(PendingAction::PrepareSupervised {
+            session_name,
+            display_name,
+            mpx_name,
+            attached_clients,
+            assign_workspace_id: ownership == RowOwnership::NeedsWorkspaceId,
+            restart_live: state == SessionState::Live,
+        });
+    }
+
+    fn open_supervise_limits(&mut self, session_name: &str) -> Result<()> {
+        let kind = self
+            .rows
+            .iter()
+            .find_map(|row| {
+                row.session
+                    .as_ref()
+                    .filter(|session| session.name == session_name)
+                    .map(|session| session.kind)
+            })
+            .flatten();
+        self.open_supervise_limits_with(session_name, ResourceLimits::defaults_for_kind(kind), None)
+    }
+
+    fn open_supervise_limits_with(
+        &mut self,
+        session_name: &str,
+        limits: ResourceLimits,
+        stale_receipt: Option<BindingReceipt>,
+    ) -> Result<()> {
+        let index = self
+            .rows
+            .iter()
+            .position(|row| {
+                row.session
+                    .as_ref()
+                    .is_some_and(|session| session.name == session_name)
+            })
+            .ok_or_else(|| anyhow::anyhow!("declared session {session_name:?} disappeared"))?;
+        let row = &self.rows[index];
+        let expected_ownership = if stale_receipt.is_some() {
+            RowOwnership::Stale
+        } else {
+            RowOwnership::IdleSupported
+        };
+        if row.state != SessionState::NotStarted || row.ownership != expected_ownership {
+            anyhow::bail!(
+                "session {session_name:?} is {}, not idle and supervisable",
+                row.ownership.label()
+            );
+        }
+        let mpx_name = row.mpx_name.clone();
+        let (memory_high, memory_max, memory_swap_max, cpu_quota, tasks_max) =
+            supervise_limit_fields(&limits);
+        self.list_state.select(Some(index));
+        self.supervising = Some(SuperviseState {
+            stage: SuperviseStage::MemoryHigh,
+            session_name: session_name.to_string(),
+            mpx_name,
+            memory_high,
+            memory_max,
+            memory_swap_max,
+            cpu_quota,
+            tasks_max,
+            stale_receipt: stale_receipt.map(Box::new),
+            error: None,
+        });
+        Ok(())
+    }
+
+    fn reload_workspace_checked(&mut self) -> Result<()> {
+        let path = self
+            .workspace
+            .file_path
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("workspace has no file on disk"))?;
+        self.workspace = crate::config::load(&crate::config::LoadOptions {
+            workspace_path: Some(path),
+            ..Default::default()
+        })?;
+        let live = self.mux.list_sessions()?;
+        self.rebuild_rows(&live);
+        Ok(())
+    }
+
+    fn prepare_supervised_launch(
+        &mut self,
+        session_name: &str,
+        expected_mpx_name: &str,
+        assign_workspace_id: bool,
+        restart_live: bool,
+    ) -> Result<()> {
+        (self.supervision_preflight)()?;
+
+        if assign_workspace_id {
+            let path = self
+                .workspace
+                .file_path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("legacy workspace has no file to upgrade"))?;
+            crate::config::ensure_workspace_id(&path)?;
+        }
+        self.reload_workspace_checked()?;
+
+        let index = self
+            .rows
+            .iter()
+            .position(|row| {
+                row.session
+                    .as_ref()
+                    .is_some_and(|session| session.name == session_name)
+            })
+            .ok_or_else(|| anyhow::anyhow!("declared session {session_name:?} disappeared"))?;
+        let row = &self.rows[index];
+        if row.mpx_name != expected_mpx_name {
+            anyhow::bail!(
+                "session target changed from {expected_mpx_name:?} to {:?}; refusing to control it",
+                row.mpx_name
+            );
+        }
+
+        if row.state == SessionState::Live {
+            if !restart_live {
+                anyhow::bail!(
+                    "session became live while preparing supervision; no process was stopped"
+                );
+            }
+            if !matches!(
+                row.ownership,
+                RowOwnership::ExistingUnverified | RowOwnership::Unmanaged
+            ) {
+                anyhow::bail!(
+                    "ownership changed to {}; refusing to stop the live target",
+                    row.ownership.label()
+                );
+            }
+            self.mux.kill(expected_mpx_name)?;
+            let live = self.mux.list_sessions()?;
+            self.rebuild_rows(&live);
+        }
+
+        if self.mux.has_session(expected_mpx_name)? {
+            anyhow::bail!(
+                "multiplexer target {expected_mpx_name:?} is still live; supervised launch was not opened"
+            );
+        }
+        self.open_supervise_limits(session_name)?;
+        Ok(())
+    }
+
+    fn validate_supervised_submission(&self, state: &SuperviseState) -> Result<()> {
+        (self.supervision_preflight)()?;
+        let row = self
+            .rows
+            .iter()
+            .find(|row| {
+                row.session
+                    .as_ref()
+                    .is_some_and(|session| session.name == state.session_name)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("declared session {:?} disappeared", state.session_name)
+            })?;
+        let ownership_matches = match state.stale_receipt.as_deref() {
+            Some(expected) => {
+                row.ownership == RowOwnership::Stale
+                    && row.logical_id.as_ref() == Some(&expected.logical_id)
+                    && self.receipts.get(&expected.logical_id) == Some(expected)
+            }
+            None => row.ownership == RowOwnership::IdleSupported,
+        };
+        if row.mpx_name != state.mpx_name
+            || row.state != SessionState::NotStarted
+            || !ownership_matches
+        {
+            anyhow::bail!("session state changed before supervised launch; close and retry");
+        }
+        if self.mux.has_session(&state.mpx_name)? {
+            anyhow::bail!(
+                "multiplexer target {:?} became live before launch; Portagenty will not claim it",
+                state.mpx_name
+            );
+        }
+        Ok(())
+    }
+
+    fn handle_supervise_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Option<Action> {
+        let mut state = self.supervising.take()?;
+        match code {
+            KeyCode::Esc => {
+                self.set_status("supervised launch cancelled");
+            }
+            KeyCode::Enter | KeyCode::Tab => match state.stage {
+                SuperviseStage::MemoryHigh => {
+                    state.stage = SuperviseStage::MemoryMax;
+                    state.error = None;
+                    self.supervising = Some(state);
+                }
+                SuperviseStage::MemoryMax => {
+                    state.stage = SuperviseStage::MemorySwapMax;
+                    state.error = None;
+                    self.supervising = Some(state);
+                }
+                SuperviseStage::MemorySwapMax => {
+                    state.stage = SuperviseStage::CpuQuota;
+                    state.error = None;
+                    self.supervising = Some(state);
+                }
+                SuperviseStage::CpuQuota => {
+                    state.stage = SuperviseStage::TasksMax;
+                    state.error = None;
+                    self.supervising = Some(state);
+                }
+                SuperviseStage::TasksMax => {
+                    let parsed = (|| -> Result<ResourceLimits> {
+                        ResourceLimits {
+                            memory_high_bytes: if state.memory_high.trim().is_empty() {
+                                None
+                            } else {
+                                Some(crate::supervision::model::parse_memory_size(
+                                    state.memory_high.trim(),
+                                )?)
+                            },
+                            memory_max_bytes: if state.memory_max.trim().is_empty() {
+                                None
+                            } else {
+                                Some(crate::supervision::model::parse_memory_size(
+                                    state.memory_max.trim(),
+                                )?)
+                            },
+                            memory_swap_max_bytes: if state.memory_swap_max.trim().is_empty() {
+                                None
+                            } else {
+                                Some(crate::supervision::model::parse_memory_size(
+                                    state.memory_swap_max.trim(),
+                                )?)
+                            },
+                            cpu_quota_percent: if state.cpu_quota.trim().is_empty() {
+                                None
+                            } else {
+                                Some(crate::supervision::model::parse_cpu_quota(
+                                    state.cpu_quota.trim(),
+                                )?)
+                            },
+                            tasks_max: if state.tasks_max.trim().is_empty() {
+                                None
+                            } else {
+                                Some(crate::supervision::model::parse_tasks_max(
+                                    state.tasks_max.trim(),
+                                )?)
+                            },
+                        }
+                        .resolve_for_kind(
+                            self.rows
+                                .iter()
+                                .find_map(|row| {
+                                    row.session
+                                        .as_ref()
+                                        .filter(|session| session.name == state.session_name)
+                                })
+                                .and_then(|session| session.kind),
+                        )
+                    })();
+                    match parsed {
+                        Ok(limits) => match self.validate_supervised_submission(&state) {
+                            Ok(()) => {
+                                if let Some(receipt) = state.stale_receipt.take() {
+                                    let session = self
+                                        .rows
+                                        .iter()
+                                        .find_map(|row| {
+                                            row.session.as_ref().filter(|session| {
+                                                session.name == state.session_name
+                                            })
+                                        })
+                                        .cloned()?;
+                                    return Some(Action::LaunchStaleSupervised {
+                                        session,
+                                        receipt,
+                                        limits,
+                                    });
+                                }
+                                return Some(Action::LaunchSupervisedSelected(limits));
+                            }
+                            Err(error) => {
+                                state.error = Some(format!("{error:#}"));
+                                self.supervising = Some(state);
+                            }
+                        },
+                        Err(error) => {
+                            state.error = Some(format!("{error:#}"));
+                            self.supervising = Some(state);
+                        }
+                    }
+                }
+            },
+            KeyCode::BackTab => {
+                state.stage = match state.stage {
+                    SuperviseStage::MemoryHigh => SuperviseStage::MemoryHigh,
+                    SuperviseStage::MemoryMax => SuperviseStage::MemoryHigh,
+                    SuperviseStage::MemorySwapMax => SuperviseStage::MemoryMax,
+                    SuperviseStage::CpuQuota => SuperviseStage::MemorySwapMax,
+                    SuperviseStage::TasksMax => SuperviseStage::CpuQuota,
+                };
+                state.error = None;
+                self.supervising = Some(state);
+            }
+            KeyCode::Backspace => {
+                supervise_buffer(&mut state).pop();
+                self.supervising = Some(state);
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                supervise_buffer(&mut state).clear();
+                self.supervising = Some(state);
+            }
+            KeyCode::Char(_) if mods.contains(KeyModifiers::CONTROL) => {
+                self.supervising = Some(state);
+            }
+            KeyCode::Char(character) => {
+                supervise_buffer(&mut state).push(character);
+                self.supervising = Some(state);
+            }
+            _ => {
+                self.supervising = Some(state);
+            }
+        }
+        None
     }
 
     /// Open the in-TUI edit overlay for the highlighted session.
@@ -534,8 +1836,7 @@ impl App {
             if let Ok(ws) = crate::config::load(&opts) {
                 self.workspace = ws;
                 let live = self.mux.list_sessions().unwrap_or_default();
-                self.rows =
-                    crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
+                self.rebuild_rows(&live);
             }
         }
     }
@@ -617,20 +1918,116 @@ impl App {
                     // tracked row (if any) falls back to NotStarted;
                     // untracked rows vanish entirely.
                     let live = self.mux.list_sessions().unwrap_or_default();
-                    self.rows =
-                        crate::tui::view::build_rows(&self.workspace, &live, self.untracked_scope);
-                    if self.rows.is_empty() {
-                        self.list_state.select(None);
-                    } else {
-                        let sel = self.list_state.selected().unwrap_or(0);
-                        self.list_state.select(Some(sel.min(self.rows.len() - 1)));
-                    }
+                    self.rebuild_rows(&live);
                     self.set_status(format!("killed session {display_name:?}"));
                 }
                 Err(e) => {
                     self.set_status(format!("kill failed: {e:#}"));
                 }
             },
+            PendingAction::PrepareSupervised {
+                session_name,
+                display_name,
+                mpx_name,
+                assign_workspace_id,
+                restart_live,
+                ..
+            } => match self.prepare_supervised_launch(
+                &session_name,
+                &mpx_name,
+                assign_workspace_id,
+                restart_live,
+            ) {
+                Ok(()) => {
+                    if assign_workspace_id && restart_live {
+                        self.set_status(format!(
+                            "added a workspace ID and stopped {display_name:?}; choose supervised limits"
+                        ));
+                    } else if assign_workspace_id {
+                        self.set_status("added a stable workspace ID; choose supervised limits");
+                    } else {
+                        self.set_status(format!(
+                            "stopped {display_name:?}; choose supervised limits"
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.set_status(format!("supervised restart preparation failed: {error:#}"));
+                }
+            },
+            #[cfg(target_os = "linux")]
+            PendingAction::StopOwned {
+                display_name,
+                receipt,
+                force,
+            } => {
+                let outcome = (|| -> Result<crate::supervision::ActionResult> {
+                    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+                    match backend.reconcile(&receipt)? {
+                        crate::supervision::OwnershipState::OwnedVerified(_) => {}
+                        state => {
+                            anyhow::bail!("ownership changed before control action: {state:?}")
+                        }
+                    }
+                    if force {
+                        backend.force_kill(&receipt)
+                    } else {
+                        if let Err(error) = crate::cli::graceful_stop_target(&receipt.mux_target) {
+                            tracing::warn!(
+                                target = "portagenty::tui",
+                                error = %format!("{error:#}"),
+                                "graceful multiplexer stop failed before systemd stop"
+                            );
+                        }
+                        backend.stop_unit(&receipt)
+                    }
+                })();
+                match outcome {
+                    Ok(result) => {
+                        if result.completed {
+                            if let Ok(store) = crate::supervision::ReceiptStore::standard() {
+                                let _ = store.remove(&receipt.logical_id);
+                            }
+                            self.receipts.remove(&receipt.logical_id);
+                            self.resource_snapshots.remove(&receipt.logical_id);
+                            self.reload_workspace();
+                        }
+                        self.set_status(format!("{display_name:?}: {}", result.final_state));
+                    }
+                    Err(error) => {
+                        self.set_status(format!("resource control failed: {error:#}"));
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            PendingAction::RemoveStaleReceipt {
+                display_name,
+                receipt,
+            } => {
+                let outcome = (|| -> Result<()> {
+                    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+                    let store = crate::supervision::ReceiptStore::standard()?;
+                    backend.remove_stale_binding(&store, &receipt)
+                })();
+                match outcome {
+                    Ok(()) => {
+                        self.receipts.remove(&receipt.logical_id);
+                        self.resource_snapshots.remove(&receipt.logical_id);
+                        self.resource_refresh_pending.remove(&receipt.logical_id);
+                        let live = self.mux.list_sessions().unwrap_or_default();
+                        self.rebuild_rows(&live);
+                        self.set_status(format!(
+                            "cleared dead receipt for {display_name:?}; no process was signalled"
+                        ));
+                    }
+                    Err(error) => {
+                        self.set_status(format!("stale receipt cleanup refused: {error:#}"));
+                    }
+                }
+            }
+            PendingAction::ReplaceStaleBinding { .. } => {
+                self.set_status("stale replacement must be handed to the launch coordinator");
+            }
             PendingAction::DeleteSession { name } => {
                 let Some(path) = self.workspace.file_path.clone() else {
                     self.set_status("delete failed: no workspace file on disk");
@@ -644,11 +2041,7 @@ impl App {
                         // reappears as an Untracked row after rebuild.
                         self.workspace.sessions.retain(|s| s.name != name);
                         let live = self.mux.list_sessions().unwrap_or_default();
-                        self.rows = crate::tui::view::build_rows(
-                            &self.workspace,
-                            &live,
-                            self.untracked_scope,
-                        );
+                        self.rebuild_rows(&live);
                         // Keep selection in-bounds.
                         if self.rows.is_empty() {
                             self.list_state.select(None);
@@ -717,11 +2110,7 @@ impl App {
                     Ok(reloaded) => {
                         self.workspace = reloaded;
                         let live = self.mux.list_sessions().unwrap_or_default();
-                        self.rows = crate::tui::view::build_rows(
-                            &self.workspace,
-                            &live,
-                            self.untracked_scope,
-                        );
+                        self.rebuild_rows(&live);
                         if !self.rows.is_empty() {
                             let sel = self.list_state.selected().unwrap_or(0);
                             self.list_state.select(Some(sel.min(self.rows.len() - 1)));
@@ -759,6 +2148,11 @@ impl App {
         if self.help_open {
             self.help_open = false;
             return Action::None;
+        }
+        if self.supervising.is_some() {
+            return self
+                .handle_supervise_key(code, mods)
+                .unwrap_or(Action::None);
         }
         // Add-session modal: two-stage input (name → command). Enter
         // advances / commits, Esc cancels, Backspace & Ctrl+H delete,
@@ -879,11 +2273,7 @@ impl App {
                                     {
                                         self.workspace = reloaded;
                                         let live = self.mux.list_sessions().unwrap_or_default();
-                                        self.rows = crate::tui::view::build_rows(
-                                            &self.workspace,
-                                            &live,
-                                            self.untracked_scope,
-                                        );
+                                        self.rebuild_rows(&live);
                                     }
                                     self.set_status(format!("cwd updated for {sn:?}"));
                                 }
@@ -931,9 +2321,20 @@ impl App {
         // performs the pending action, anything else cancels.
         if let Some(action) = self.pending.take() {
             match crate::tui::confirm::classify(code) {
-                crate::tui::confirm::ConfirmKey::Confirm => {
-                    self.perform_pending(action);
-                }
+                crate::tui::confirm::ConfirmKey::Confirm => match action {
+                    PendingAction::ReplaceStaleBinding {
+                        session,
+                        receipt,
+                        limits,
+                    } => {
+                        return Action::LaunchStaleSupervised {
+                            session,
+                            receipt,
+                            limits,
+                        };
+                    }
+                    action => self.perform_pending(action),
+                },
                 crate::tui::confirm::ConfirmKey::Cancel => {
                     self.set_status("cancelled");
                 }
@@ -961,6 +2362,21 @@ impl App {
             }
             (KeyCode::Char('x'), _) => {
                 self.open_kill_prompt();
+                Action::None
+            }
+            (KeyCode::Char('X'), _) => {
+                self.open_force_kill_prompt();
+                Action::None
+            }
+            (KeyCode::Char('S'), _) => {
+                self.open_supervise_modal();
+                Action::None
+            }
+            (KeyCode::Char('r'), _) => {
+                #[cfg(target_os = "linux")]
+                self.request_selected_resource_refresh();
+                #[cfg(not(target_os = "linux"))]
+                self.set_status("resource refresh is unsupported on this platform");
                 Action::None
             }
             (KeyCode::Char('m'), _) => {
@@ -1181,7 +2597,7 @@ impl App {
                 &[
                     Entry::new("Esc/q", "back"),
                     Entry::new("?", "help"),
-                    Entry::new("Enter/l", "launch"),
+                    Entry::new("Enter/l", "attach/start"),
                     Entry::new("j/k", "nav"),
                     Entry::new("g/G", "top/btm"),
                 ],
@@ -1231,7 +2647,21 @@ impl App {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("kill  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled("stop  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "S ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("supervise  ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled(
+                        "r ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("resources  ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled(
                         "z ",
                         Style::default()
@@ -1280,6 +2710,9 @@ impl App {
         // Add-session modal: above content, under help.
         if let Some(st) = &self.adding_session {
             render_add_session_modal(frame, area, st);
+        }
+        if let Some(state) = &self.supervising {
+            render_supervise_modal(frame, area, state);
         }
 
         // Help overlay renders last so it sits on top of everything.
@@ -1399,22 +2832,23 @@ fn row_list_item(
 
     // Status tag: includes attached-client count when the mpx reports
     // it (tmux does; zellij doesn't expose per-session, so no count).
-    let status_label = match row.state {
+    let state_status = match row.state {
         SessionState::Live => {
             if let Some(n) = row.attached_clients {
                 if n > 1 {
-                    format!("[live · {n} clients]")
+                    format!("live · {n} clients")
                 } else if n == 1 {
-                    "[live · 1 client]".to_string()
+                    "live · 1 client".to_string()
                 } else {
-                    "[live · detached]".to_string()
+                    "live · detached".to_string()
                 }
             } else {
-                format!("[{}]", row.state.label())
+                row.state.label().to_string()
             }
         }
-        _ => format!("[{}]", row.state.label()),
+        _ => row.state.label().to_string(),
     };
+    let status_label = format!("[{state_status} · {}]", row.ownership.label());
 
     // Human description note, when the session declared one. Only
     // tracked rows carry a `session`; untracked rows never have one.
@@ -1596,6 +3030,16 @@ fn expansion_lines(row: &SessionRow, description: Option<&str>, width: u16) -> V
         clip_end(&compact_path(&row.cwd_display), value_w),
         dim,
     ));
+    if let Some(summary) = &row.resource_summary {
+        lines.push(labeled_detail_line(
+            "res",
+            clip_end(summary, value_w),
+            plain,
+        ));
+    }
+    for detail in row.resource_details.iter().take(3) {
+        lines.push(detail_continuation_line(clip_end(detail, value_w), dim));
+    }
     lines
 }
 
@@ -1631,6 +3075,195 @@ fn clip_end(s: &str, width: usize) -> String {
     let mut out: String = s.chars().take(width - 1).collect();
     out.push('…');
     out
+}
+
+#[cfg(target_os = "linux")]
+fn resource_summary(snapshot: &ResourceSnapshot) -> String {
+    let cpu = match &snapshot.cpu_percent {
+        MetricValue::Value(value) => format!("CPU {value:.0}%"),
+        _ => "CPU --".into(),
+    };
+    let memory = match &snapshot.memory_current_bytes {
+        MetricValue::Value(value) => format!("mem {}", compact_bytes(*value)),
+        _ => "mem --".into(),
+    };
+    let swap = match &snapshot.swap_current_bytes {
+        MetricValue::Value(value) => format!("swap {}", compact_bytes(*value)),
+        _ => "swap --".into(),
+    };
+    let tasks = match &snapshot.tasks_current {
+        MetricValue::Value(value) => format!("tasks {value}"),
+        _ => "tasks --".into(),
+    };
+    format!("{cpu} · {memory} · {swap} · {tasks}")
+}
+
+#[cfg(target_os = "linux")]
+fn resource_details(snapshot: &ResourceSnapshot) -> Vec<String> {
+    let mut details = Vec::new();
+    if let MetricValue::Value(events) = &snapshot.memory_events {
+        details.push(format!(
+            "memory events: high={} oom={} oom_kill={}",
+            events.get("high").copied().unwrap_or(0),
+            events.get("oom").copied().unwrap_or(0),
+            events.get("oom_kill").copied().unwrap_or(0)
+        ));
+    }
+    if let MetricValue::Value(pressure) = &snapshot.memory_pressure {
+        if let Some(some) = &pressure.some {
+            details.push(format!(
+                "memory PSI some: avg10={:.2} avg60={:.2}",
+                some.avg10, some.avg60
+            ));
+        }
+    }
+    if let (MetricValue::Value(read), MetricValue::Value(write)) = (
+        &snapshot.io_read_bytes_per_sec,
+        &snapshot.io_write_bytes_per_sec,
+    ) {
+        details.push(format!(
+            "I/O: {}/s read · {}/s write",
+            compact_bytes(*read as u64),
+            compact_bytes(*write as u64)
+        ));
+    }
+    details
+}
+
+#[cfg(target_os = "linux")]
+fn resource_event_notice(
+    previous: Option<&ResourceSnapshot>,
+    current: &ResourceSnapshot,
+) -> Option<String> {
+    let previous = previous?;
+    let mut events = Vec::new();
+    if let (MetricValue::Value(old), MetricValue::Value(new)) =
+        (&previous.memory_events, &current.memory_events)
+    {
+        for (key, label) in [
+            ("high", "MemoryHigh"),
+            ("oom", "OOM"),
+            ("oom_kill", "OOM kill"),
+        ] {
+            let old = old.get(key).copied().unwrap_or(0);
+            let new = new.get(key).copied().unwrap_or(0);
+            if new > old {
+                events.push(format!("{label} +{}", new - old));
+            }
+        }
+    }
+    if let (MetricValue::Value(old), MetricValue::Value(new)) =
+        (&previous.tasks_events, &current.tasks_events)
+    {
+        let old = old.get("max").copied().unwrap_or(0);
+        let new = new.get("max").copied().unwrap_or(0);
+        if new > old {
+            events.push(format!("TasksMax +{}", new - old));
+        }
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events.join(", "))
+    }
+}
+
+fn compact_bytes(value: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let value = value as f64;
+    if value >= GIB {
+        format!("{:.1}G", value / GIB)
+    } else if value >= MIB {
+        format!("{:.0}M", value / MIB)
+    } else if value >= KIB {
+        format!("{:.0}K", value / KIB)
+    } else {
+        format!("{value:.0}B")
+    }
+}
+
+fn supervise_buffer(state: &mut SuperviseState) -> &mut String {
+    match state.stage {
+        SuperviseStage::MemoryHigh => &mut state.memory_high,
+        SuperviseStage::MemoryMax => &mut state.memory_max,
+        SuperviseStage::MemorySwapMax => &mut state.memory_swap_max,
+        SuperviseStage::CpuQuota => &mut state.cpu_quota,
+        SuperviseStage::TasksMax => &mut state.tasks_max,
+    }
+}
+
+fn render_supervise_modal(frame: &mut Frame<'_>, area: Rect, state: &SuperviseState) {
+    use ratatui::widgets::{Block, Borders, Clear};
+    let overlay_w = area.width.saturating_sub(4).clamp(42, 74);
+    let overlay_h = if state.error.is_some() { 12 } else { 11 }.min(area.height.saturating_sub(2));
+    let region = Rect {
+        x: area.x + (area.width.saturating_sub(overlay_w)) / 2,
+        y: area.y + (area.height.saturating_sub(overlay_h)) / 2,
+        width: overlay_w,
+        height: overlay_h,
+    };
+    frame.render_widget(Clear, region);
+    let active = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let style = |stage| if state.stage == stage { active } else { dim };
+    let caret = Span::styled(
+        "_",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::SLOW_BLINK),
+    );
+    let field = |label: &'static str, value: &str, stage| {
+        let mut spans = vec![
+            Span::styled(format!("  {label:<13}"), style(stage)),
+            Span::styled(value.to_string(), style(stage)),
+        ];
+        if state.stage == stage {
+            spans.push(caret.clone());
+        }
+        Line::from(spans)
+    };
+    let mut lines = vec![
+        Line::raw(""),
+        field(
+            "Memory High",
+            &state.memory_high,
+            SuperviseStage::MemoryHigh,
+        ),
+        Line::styled(
+            "    MemoryHigh is a reclaim threshold, not a hard ceiling",
+            dim,
+        ),
+        field("Memory max", &state.memory_max, SuperviseStage::MemoryMax),
+        field(
+            "Swap max",
+            &state.memory_swap_max,
+            SuperviseStage::MemorySwapMax,
+        ),
+        field("CPU quota", &state.cpu_quota, SuperviseStage::CpuQuota),
+        Line::styled("    800% permits up to eight CPU cores", dim),
+        field("Tasks max", &state.tasks_max, SuperviseStage::TasksMax),
+        Line::styled("    maximum tasks/threads", dim),
+    ];
+    if let Some(error) = &state.error {
+        lines.push(Line::styled(
+            format!("  {error}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::styled(
+        "  Enter/Tab next · Ctrl+U clears/unsets field · Enter on Tasks Max launches · Esc cancel",
+        dim,
+    ));
+    let block = Block::default()
+        .title(" Supervised launch ")
+        .title_style(active)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(Paragraph::new(lines).block(block), region);
 }
 
 /// Centered two-field input modal for adding a new session. Stage
@@ -1773,6 +3406,106 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
                 ),
             )
         }
+        PendingAction::PrepareSupervised {
+            display_name,
+            attached_clients,
+            assign_workspace_id,
+            restart_live,
+            ..
+        } => {
+            let clients = match attached_clients {
+                Some(n) if *n >= 2 => {
+                    format!(" {n} clients are attached and will all be disconnected.")
+                }
+                Some(1) => " 1 client is attached and will be disconnected.".into(),
+                _ => String::new(),
+            };
+            let identity = if *assign_workspace_id {
+                " Portagenty will first add a stable UUID to the workspace file."
+            } else {
+                ""
+            };
+            if *restart_live {
+                (
+                    "Restart under supervision".into(),
+                    format!(
+                        "Restart {display_name:?} under supervision?{identity}{clients} The exact existing multiplexer session will be terminated, then a fresh private target will be launched after you choose limits. The running process tree is not migrated or claimed."
+                    ),
+                )
+            } else {
+                (
+                    "Enable workspace supervision".into(),
+                    format!(
+                        "Add a stable UUID to workspace {workspace_name:?}, then choose supervised limits for {display_name:?}? Existing workspace comments and sessions stay intact."
+                    ),
+                )
+            }
+        }
+        #[cfg(target_os = "linux")]
+        PendingAction::StopOwned {
+            display_name,
+            force,
+            ..
+        } => {
+            if *force {
+                (
+                    "Force-kill owned workload".into(),
+                    format!(
+                        "Send SIGKILL to every process in the verified control group for {display_name:?}? \
+                         This is a separate irreversible escalation and can lose unsaved work."
+                    ),
+                )
+            } else {
+                (
+                    "Stop owned workload".into(),
+                    format!(
+                        "Gracefully close the exact multiplexer target for {display_name:?}, then request \
+                         a non-force systemd stop if descendants remain? SendSIGKILL=no; this action will \
+                         not silently escalate."
+                    ),
+                )
+            }
+        }
+        #[cfg(target_os = "linux")]
+        PendingAction::RemoveStaleReceipt { display_name, .. } => (
+            "Clear dead ownership receipt".into(),
+            format!(
+                "Remove only the stale machine-local ownership receipt for {display_name:?}? \
+                 Portagenty will first prove the exact systemd invocation and exact private \
+                 multiplexer target are both absent. This sends no signal and stops no process."
+            ),
+        ),
+        PendingAction::ReplaceStaleBinding {
+            session, limits, ..
+        } => {
+            let memory = limits
+                .memory_high_bytes
+                .map(compact_bytes)
+                .unwrap_or_else(|| "unset".into());
+            let memory_max = limits
+                .memory_max_bytes
+                .map(compact_bytes)
+                .unwrap_or_else(|| "unset".into());
+            let swap_max = limits
+                .memory_swap_max_bytes
+                .map(compact_bytes)
+                .unwrap_or_else(|| "unset".into());
+            let cpu = limits
+                .cpu_quota_percent
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| "unset".into());
+            let tasks = limits
+                .tasks_max
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unset".into());
+            (
+                "Replace stale supervised binding".into(),
+                format!(
+                    "Prove the exact dead receipt for {:?} has no systemd invocation or private multiplexer target, remove only that receipt without sending a signal, then relaunch it supervised with MemoryHigh {memory}, MemoryMax {memory_max}, SwapMax {swap_max}, CPU {cpu}, and TasksMax {tasks}?",
+                    session.name
+                ),
+            )
+        }
         PendingAction::SwitchMpx {
             from,
             to,
@@ -1911,6 +3644,7 @@ mod tests {
     use crate::mux::MockMultiplexer;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use serial_test::serial;
     use std::path::PathBuf;
 
     fn sample_workspace(name: &str, sessions: usize) -> Workspace {
@@ -2491,6 +4225,33 @@ mod tests {
     }
 
     #[test]
+    fn row_rebuild_preserves_declared_selection_by_name_after_reorder() {
+        let ws = sample_workspace("x", 3);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.list_state.select(Some(1));
+        assert_eq!(app.selected_row().unwrap().display_name, "s1");
+
+        app.workspace.sessions.swap(0, 1);
+        app.rebuild_rows(&[]);
+
+        assert_eq!(app.selected_row().unwrap().display_name, "s1");
+    }
+
+    #[test]
+    fn row_rebuild_preserves_selection_when_legacy_workspace_gains_uuid() {
+        let ws = sample_workspace("x", 2);
+        let mut app = App::new(ws, Box::new(MockMultiplexer::new()), vec![]);
+        app.list_state.select(Some(1));
+        assert_eq!(app.selected_row().unwrap().display_name, "s1");
+
+        app.workspace.id = Some("550e8400-e29b-41d4-a716-446655440000".into());
+        app.rebuild_rows(&[]);
+
+        assert_eq!(app.selected_row().unwrap().display_name, "s1");
+        assert!(app.selected_row().unwrap().logical_id.is_some());
+    }
+
+    #[test]
     fn enter_on_live_attaches_by_mpx_name() {
         let ws = sample_workspace("x", 1);
         let mut app = App::new(
@@ -2501,7 +4262,7 @@ mod tests {
         // Row 0 is now Live.
         let outcome = drive_enter(&mut app).expect("enter should produce outcome");
         match outcome {
-            AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
+            AppOutcome::Launch(LaunchKind::Attach { mpx_name, .. }) => {
                 assert_eq!(mpx_name, "x-s0");
             }
             other => panic!("expected Attach, got {other:?}"),
@@ -2519,7 +4280,7 @@ mod tests {
         );
         let outcome = drive_enter(&mut app).expect("enter should produce outcome");
         match outcome {
-            AppOutcome::Launch(LaunchKind::Attach { mpx_name }) => {
+            AppOutcome::Launch(LaunchKind::Attach { mpx_name, .. }) => {
                 assert_eq!(mpx_name, "orphan-session");
             }
             other => panic!("expected Attach, got {other:?}"),
@@ -2566,11 +4327,11 @@ mod tests {
             row3.contains("?"),
             "row3 should have untracked marker: {row3:?}"
         );
-        // Labels also appear.
+        // State and ownership labels also appear.
         let body = format!("{row1}\n{row2}\n{row3}");
-        assert!(body.contains("[live]"));
-        assert!(body.contains("[idle]"));
-        assert!(body.contains("[untracked]"));
+        assert!(body.contains("live"));
+        assert!(body.contains("idle"));
+        assert!(body.contains("untracked"));
     }
 
     #[test]
@@ -2961,5 +4722,646 @@ mod tests {
         // Modal should still be open (commit failed), error present.
         let st = app.adding_session.as_ref().expect("modal should stay open");
         assert!(st.error.is_some(), "expected error on duplicate");
+    }
+
+    fn supervised_workspace() -> Workspace {
+        let mut workspace = sample_workspace("x", 1);
+        workspace.id = Some("550e8400-e29b-41d4-a716-446655440000".into());
+        workspace.sessions[0].kind = Some(crate::domain::SessionKind::ClaudeCode);
+        workspace
+    }
+
+    fn supervised_app() -> App {
+        let mut mock = MockMultiplexer::new();
+        mock.expect_has_session().returning(|_| Ok(false));
+        App::new(supervised_workspace(), Box::new(mock), vec![])
+    }
+
+    fn write_supervision_workspace(path: &std::path::Path, id: Option<&str>) {
+        let id_line = id.map(|id| format!("id = \"{id}\"\n")).unwrap_or_default();
+        std::fs::write(
+            path,
+            format!(
+                "# preserved workspace comment\nname = \"legacy\"\n{id_line}multiplexer = \"tmux\"\n\n[[session]]\nname = \"shell\"\ncwd = \".\"\ncommand = \"bash\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn idle_legacy_workspace_can_confirm_add_id_and_open_limits() {
+        let xdg = assert_fs::TempDir::new().unwrap();
+        let home = assert_fs::TempDir::new().unwrap();
+        let _env = crate::test_env::EnvSandbox::new()
+            .set("XDG_CONFIG_HOME", xdg.path())
+            .set("HOME", home.path());
+        let temp = assert_fs::TempDir::new().unwrap();
+        let path = temp.path().join("legacy.portagenty.toml");
+        write_supervision_workspace(&path, None);
+        let workspace = crate::config::load(&crate::config::LoadOptions {
+            workspace_path: Some(path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut mock = MockMultiplexer::new();
+        mock.expect_list_sessions()
+            .times(1)
+            .returning(|| Ok(vec![]));
+        mock.expect_has_session()
+            .withf(|name| name == "legacy-shell")
+            .times(1)
+            .returning(|_| Ok(false));
+        let mut app = App::new(workspace, Box::new(mock), vec![]);
+        assert_eq!(app.rows[0].ownership, RowOwnership::NeedsWorkspaceId);
+
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::PrepareSupervised {
+                assign_workspace_id: true,
+                restart_live: false,
+                ..
+            })
+        ));
+        let (_, copy) = confirm_copy(app.pending.as_ref().unwrap(), "legacy");
+        assert!(copy.contains("Add a stable UUID"), "copy: {copy}");
+
+        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.supervising.is_some());
+        assert_eq!(app.rows[0].ownership, RowOwnership::IdleSupported);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# preserved workspace comment"));
+        let parsed: crate::config::WorkspaceFile = crate::config::load_toml(&path).unwrap();
+        let assigned_id = parsed.id.unwrap();
+        uuid::Uuid::parse_str(&assigned_id).unwrap();
+
+        let run_result = app.finish(AppOutcome::Back);
+        assert_eq!(
+            run_result.workspace.id.as_deref(),
+            Some(assigned_id.as_str()),
+            "the outer coordinator must receive the workspace reloaded after UUID assignment"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cancelling_legacy_supervision_does_not_write_or_stop() {
+        let xdg = assert_fs::TempDir::new().unwrap();
+        let home = assert_fs::TempDir::new().unwrap();
+        let _env = crate::test_env::EnvSandbox::new()
+            .set("XDG_CONFIG_HOME", xdg.path())
+            .set("HOME", home.path());
+        let temp = assert_fs::TempDir::new().unwrap();
+        let path = temp.path().join("legacy.portagenty.toml");
+        write_supervision_workspace(&path, None);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let workspace = crate::config::load(&crate::config::LoadOptions {
+            workspace_path: Some(path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut app = App::new(workspace, Box::new(MockMultiplexer::new()), vec![]);
+
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+
+        assert!(app.pending.is_none());
+        assert!(app.supervising.is_none());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn live_legacy_workspace_persists_id_before_exact_target_restart() {
+        let xdg = assert_fs::TempDir::new().unwrap();
+        let home = assert_fs::TempDir::new().unwrap();
+        let _env = crate::test_env::EnvSandbox::new()
+            .set("XDG_CONFIG_HOME", xdg.path())
+            .set("HOME", home.path());
+        let temp = assert_fs::TempDir::new().unwrap();
+        let path = temp.path().join("legacy.portagenty.toml");
+        write_supervision_workspace(&path, None);
+        let workspace = crate::config::load(&crate::config::LoadOptions {
+            workspace_path: Some(path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let live = vec![SessionInfo {
+            name: "legacy-shell".into(),
+            cwd: None,
+            attached: Some(2),
+        }];
+        let mut sequence = mockall::Sequence::new();
+        let mut mock = MockMultiplexer::new();
+        let refreshed_live = live.clone();
+        mock.expect_list_sessions()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(move || Ok(refreshed_live));
+        let path_at_kill = path.clone();
+        mock.expect_kill()
+            .withf(|name| name == "legacy-shell")
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(move |_| {
+                let raw = std::fs::read_to_string(&path_at_kill).unwrap();
+                assert!(raw.contains("id = "), "ID must exist before kill: {raw}");
+                Ok(())
+            });
+        mock.expect_list_sessions()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(|| Ok(vec![]));
+        mock.expect_has_session()
+            .withf(|name| name == "legacy-shell")
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(false));
+        let mut app = App::new(workspace, Box::new(mock), live);
+
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        let (_, copy) = confirm_copy(app.pending.as_ref().unwrap(), "legacy");
+        assert!(copy.contains("2 clients"), "copy: {copy}");
+        assert!(copy.contains("not migrated or claimed"), "copy: {copy}");
+        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+
+        assert!(app.supervising.is_some());
+        assert_eq!(app.rows[0].state, SessionState::NotStarted);
+        assert_eq!(app.rows[0].ownership, RowOwnership::IdleSupported);
+    }
+
+    #[test]
+    fn live_uuid_row_offers_restart_but_owned_and_invalid_rows_refuse() {
+        let live = vec![SessionInfo {
+            name: "x-s0".into(),
+            cwd: None,
+            attached: Some(1),
+        }];
+        let mut app = App::new(
+            supervised_workspace(),
+            Box::new(MockMultiplexer::new()),
+            live,
+        );
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::PrepareSupervised {
+                assign_workspace_id: false,
+                restart_live: true,
+                ..
+            })
+        ));
+
+        app.pending = None;
+        app.rows[0].ownership = RowOwnership::Owned;
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        assert!(app.pending.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("already supervised")));
+
+        app.rows[0].ownership = RowOwnership::InvalidWorkspaceId;
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        assert!(app.pending.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("invalid ID")));
+    }
+
+    #[test]
+    fn target_reappearance_keeps_limits_modal_open_and_refuses_launch() {
+        let mut mock = MockMultiplexer::new();
+        mock.expect_has_session()
+            .withf(|name| name == "x-s0")
+            .times(1)
+            .returning(|_| Ok(true));
+        let mut app = App::new(supervised_workspace(), Box::new(mock), vec![]);
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        for _ in 0..4 {
+            app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        }
+        let action = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(action, Action::None);
+        let state = app.supervising.as_ref().expect("modal should remain open");
+        assert!(state
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("became live")));
+    }
+
+    #[test]
+    fn capability_failure_prevents_confirmation_or_limits_modal() {
+        fn unavailable() -> Result<()> {
+            anyhow::bail!("test backend unavailable")
+        }
+
+        let mut app = App::new(
+            supervised_workspace(),
+            Box::new(MockMultiplexer::new()),
+            vec![],
+        );
+        app.supervision_preflight = unavailable;
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        assert!(app.pending.is_none());
+        assert!(app.supervising.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("backend unavailable")));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_receipt() -> BindingReceipt {
+        BindingReceipt {
+            schema_version: crate::supervision::model::LEGACY_RECEIPT_SCHEMA_VERSION,
+            logical_id: LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "s0")
+                .unwrap(),
+            backend: crate::supervision::BackendKind::SystemdUserService,
+            unit_name: "portagenty-wtest.service".into(),
+            invocation_id: "00112233445566778899aabbccddeeff".into(),
+            control_group: "/user.slice/user-1000.slice/user@1000.service/app.slice/test.scope"
+                .into(),
+            mux_target: crate::supervision::MuxTarget::TmuxPrivate {
+                socket: PathBuf::from("/run/user/1000/portagenty/test/tmux.sock"),
+                session: "opaque-owned-session".into(),
+            },
+            observed_at_unix_ms: 1,
+            limits: ResourceLimits::default(),
+            session_kind: None,
+            requested_slice: None,
+            workload_anchor: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn app_with_test_receipt() -> App {
+        let mut app = supervised_app();
+        let receipt = test_receipt();
+        app.receipts
+            .insert(receipt.logical_id.clone(), receipt.clone());
+        app.apply_receipt_annotations(&BTreeMap::from([(
+            receipt.logical_id,
+            (RowOwnership::Owned, None, Vec::new()),
+        )]));
+        app
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_supervision_evidence_blocks_idle_enter() {
+        let mut app = supervised_app();
+        app.fail_closed_supervision("evidence unavailable");
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("evidence could not be loaded")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_launch_row_blocks_enter_supervise_stop_and_force_kill() {
+        let logical_id =
+            LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "s0").unwrap();
+        let pending = crate::supervision::PendingLaunch {
+            logical_id,
+            unit_name: "portagenty-wpending.service".into(),
+            mux_target: crate::supervision::MuxTarget::TmuxPrivate {
+                socket: PathBuf::from("/run/user/1000/portagenty/tmux/pending.sock"),
+                session: "main".into(),
+            },
+            marker_path: PathBuf::from(
+                "/run/user/1000/portagenty/workloads/0123456789abcdef0123456789abcdef.marker.toml",
+            ),
+            created_at_unix_ms: 1,
+            creator_pid: 123,
+            creator_start_time_ticks: 456,
+            last_error: Some("interrupted".into()),
+        };
+        let mut app = supervised_app().with_supervision_evidence(Vec::new(), vec![pending]);
+        assert_eq!(app.rows[0].ownership, RowOwnership::Pending);
+
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("pending supervision evidence")));
+        for key in ['S', 'x', 'X'] {
+            app.pending = None;
+            app.handle_key(KeyCode::Char(key), KeyModifiers::NONE);
+            assert!(app.pending.is_none());
+            assert!(app.supervising.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_row_attaches_to_exact_receipted_target() {
+        let mut app = app_with_test_receipt();
+        let expected = test_receipt().mux_target;
+        assert_eq!(app.rows[0].ownership, RowOwnership::Owned);
+        assert_eq!(app.rows[0].mpx_name, "opaque-owned-session");
+
+        let outcome = app.reduce_action(Action::LaunchSelected);
+        match outcome {
+            Some(AppOutcome::Launch(LaunchKind::AttachOwned { target, .. })) => {
+                assert_eq!(target, expected);
+            }
+            other => panic!("expected exact owned attach, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_receipt_is_exact_target_attach_only() {
+        let mut app = supervised_app();
+        let receipt = test_receipt();
+        app.receipts
+            .insert(receipt.logical_id.clone(), receipt.clone());
+        app.apply_receipt_annotations(&BTreeMap::from([(
+            receipt.logical_id.clone(),
+            (RowOwnership::LegacyRestartRequired, None, Vec::new()),
+        )]));
+
+        assert!(matches!(
+            app.reduce_action(Action::LaunchSelected),
+            Some(AppOutcome::Launch(LaunchKind::AttachOwned { target, .. }))
+                if target == receipt.mux_target
+        ));
+        app.open_kill_prompt();
+        assert!(app.pending.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("attach-only")));
+    }
+
+    #[test]
+    fn idle_uuid_row_enter_uses_recommended_supervision_without_modal() {
+        let mut app = supervised_app();
+        match app.reduce_action(Action::LaunchSelected) {
+            Some(AppOutcome::Launch(LaunchKind::CreateSupervised {
+                session,
+                limits,
+                intent,
+            })) => {
+                assert_eq!(session.name, "s0");
+                assert_eq!(limits, ResourceLimits::claude_defaults());
+                assert_eq!(intent, SupervisionIntent::RoutineEnter);
+                assert!(app.supervising.is_none());
+            }
+            other => panic!("expected routine supervised launch, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_stale_enter_confirms_exact_replacement_with_recommended_limits() {
+        let mut app = app_with_test_receipt();
+        app.rows[0].ownership = RowOwnership::Stale;
+        app.rebuild_rows(&[]);
+
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::ReplaceStaleBinding { .. })
+        ));
+        let (_, copy) = confirm_copy(app.pending.as_ref().unwrap(), "x");
+        assert!(copy.contains("without sending a signal"), "copy: {copy}");
+        assert!(copy.contains("MemoryHigh 3.0G"), "copy: {copy}");
+        assert!(copy.contains("MemoryMax 5.0G"), "copy: {copy}");
+        assert!(copy.contains("SwapMax 512M"), "copy: {copy}");
+
+        let action = app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        match action {
+            Action::LaunchStaleSupervised {
+                session,
+                receipt,
+                limits,
+            } => {
+                assert_eq!(session.name, "s0");
+                assert_eq!(*receipt, test_receipt());
+                assert_eq!(limits, ResourceLimits::claude_defaults());
+            }
+            other => panic!("expected stale supervised action, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn row_rebuild_preserves_receipt_ownership_and_resource_text() {
+        let mut app = app_with_test_receipt();
+        app.rows[0].ownership = RowOwnership::Stale;
+        app.rows[0].resource_summary = Some("CPU 80% · memory 2.0 GiB".into());
+        app.rows[0].resource_details = vec!["memory high=3".into()];
+
+        app.rebuild_rows(&[]);
+
+        assert_eq!(app.rows[0].ownership, RowOwnership::Stale);
+        assert_eq!(app.rows[0].state, SessionState::NotStarted);
+        assert_eq!(app.rows[0].mpx_name, "x-s0");
+        assert_eq!(
+            app.rows[0].resource_summary.as_deref(),
+            Some("CPU 80% · memory 2.0 GiB")
+        );
+        assert_eq!(app.rows[0].resource_details, vec!["memory high=3"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreconciled_receipt_does_not_impersonate_a_live_target() {
+        let mut app = supervised_app();
+        let receipt = test_receipt();
+        app.receipts
+            .insert(receipt.logical_id.clone(), receipt.clone());
+        app.apply_receipt_annotations(&BTreeMap::new());
+
+        assert_eq!(app.rows[0].ownership, RowOwnership::ExistingUnverified);
+        assert_eq!(app.rows[0].state, SessionState::NotStarted);
+        assert_eq!(app.rows[0].mpx_name, "x-s0");
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("verifying")));
+
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.pending.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("verifying")));
+
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        assert!(app.pending.is_none());
+        assert!(app.supervising.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("verifying")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_receipt_attaches_the_real_ordinary_live_target() {
+        let mut app = App::new(
+            supervised_workspace(),
+            Box::new(MockMultiplexer::new()),
+            vec![live_session("s0")],
+        );
+        let receipt = test_receipt();
+        app.receipts
+            .insert(receipt.logical_id.clone(), receipt.clone());
+        app.apply_receipt_annotations(&BTreeMap::from([(
+            receipt.logical_id,
+            (RowOwnership::Stale, None, Vec::new()),
+        )]));
+
+        assert_eq!(app.rows[0].ownership, RowOwnership::Stale);
+        assert_eq!(app.rows[0].state, SessionState::Live);
+        assert_eq!(app.rows[0].mpx_name, "x-s0");
+        match app.reduce_action(Action::LaunchSelected) {
+            Some(AppOutcome::Launch(LaunchKind::Attach {
+                mpx_name,
+                display_name,
+            })) => {
+                assert_eq!(mpx_name, "x-s0");
+                assert_eq!(display_name, "s0");
+            }
+            other => panic!("expected ordinary attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supervised_launch_modal_prefills_claude_policy() {
+        let mut app = supervised_app();
+        assert_eq!(
+            app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE),
+            Action::None
+        );
+        let state = app.supervising.as_ref().unwrap();
+        assert_eq!(state.memory_high, "3G");
+        assert_eq!(state.memory_max, "5G");
+        assert_eq!(state.memory_swap_max, "512MiB");
+        assert_eq!(state.cpu_quota, "800");
+        assert_eq!(state.tasks_max, "1200");
+        let terminal = render_to_backend(&mut app, 90, 30);
+        let screen = full_screen(&terminal, 30);
+        for expected in ["3G", "5G", "512MiB", "800", "1200"] {
+            assert!(screen.contains(expected), "missing {expected}:\n{screen}");
+        }
+
+        for _ in 0..4 {
+            app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        }
+        let action = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            action,
+            Action::LaunchSupervisedSelected(ResourceLimits::claude_defaults())
+        );
+    }
+
+    #[test]
+    fn cleared_claude_fields_resolve_back_to_standard_defaults() {
+        let mut app = supervised_app();
+        app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
+        for index in 0..5 {
+            app.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+            if index < 4 {
+                app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+            }
+        }
+        let action = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            action,
+            Action::LaunchSupervisedSelected(ResourceLimits::claude_defaults())
+        );
+    }
+
+    #[test]
+    fn supervised_launch_modal_parses_all_hard_and_soft_limits() {
+        let mut app = supervised_app();
+        assert_eq!(
+            app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE),
+            Action::None
+        );
+        for value in ["1G", "4G", "256MiB", "250", "42"] {
+            app.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+            for ch in value.chars() {
+                app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE);
+            }
+            if value != "42" {
+                app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+            }
+        }
+        let action = app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            action,
+            Action::LaunchSupervisedSelected(ResourceLimits {
+                memory_high_bytes: Some(1_073_741_824),
+                memory_max_bytes: Some(4_294_967_296),
+                memory_swap_max_bytes: Some(268_435_456),
+                cpu_quota_percent: Some(250.0),
+                tasks_max: Some(42),
+            })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_owned_row_offers_receipt_cleanup_but_refuses_force_kill() {
+        let mut app = app_with_test_receipt();
+        app.rows[0].ownership = RowOwnership::Stale;
+
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::RemoveStaleReceipt { .. })
+        ));
+        let (_, copy) = confirm_copy(app.pending.as_ref().unwrap(), "x");
+        assert!(copy.contains("sends no signal"), "copy: {copy}");
+        assert!(copy.contains("stops no process"), "copy: {copy}");
+
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert!(app.pending.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("owned-and-verified")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn force_kill_requires_a_separate_owned_confirmation() {
+        let mut app = app_with_test_receipt();
+        app.handle_key(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::StopOwned { force: true, .. })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expanded_owned_row_renders_resource_summary_and_details() {
+        let mut app = app_with_test_receipt();
+        app.rows[0].resource_summary = Some("CPU 80% · memory 2.0 GiB".into());
+        app.rows[0].resource_details = vec!["memory events high=3 oom=0".into()];
+
+        let terminal = render_to_backend(&mut app, 100, 14);
+        let screen = full_screen(&terminal, 14);
+        assert!(
+            screen.contains("CPU 80%"),
+            "resource summary missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("memory events high=3"),
+            "details missing:\n{screen}"
+        );
     }
 }

@@ -38,6 +38,61 @@ pub enum AttachMode {
     Shared,
 }
 
+/// Whether a create-and-attach call created a new multiplexer target or
+/// attached to one that already existed. Ownership-aware launchers must not
+/// infer this distinction from a successful return value alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationDisposition {
+    Created,
+    Existing,
+}
+
+/// A multiplexer client process that ran and returned unsuccessfully.
+///
+/// This is deliberately distinct from an outer [`anyhow::Error`]: an error
+/// means validation, preparation, or process spawning failed before a client
+/// return could be observed. A `ClientExit` means the client did run, so callers
+/// can still print the human workspace/session identity before reporting the
+/// abnormal completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+/// Completion of a blocking multiplexer client command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientCompletion<T> {
+    Returned(T),
+    Abnormal(ClientExit),
+}
+
+impl<T> ClientCompletion<T> {
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> ClientCompletion<U> {
+        match self {
+            Self::Returned(value) => ClientCompletion::Returned(f(value)),
+            Self::Abnormal(exit) => ClientCompletion::Abnormal(exit),
+        }
+    }
+
+    pub(crate) fn from_status(status: std::process::ExitStatus, value: T) -> Self {
+        if status.success() {
+            return Self::Returned(value);
+        }
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        Self::Abnormal(ClientExit {
+            code: status.code(),
+            signal,
+        })
+    }
+}
+
 use anyhow::Result;
 
 use crate::domain::Session;
@@ -61,12 +116,18 @@ pub trait Multiplexer {
     /// blocks until the user detaches from the mpx. `mode` controls
     /// whether other clients currently attached to the same session
     /// get bumped or left in place; see [`AttachMode`].
-    fn attach(&self, name: &str, mode: AttachMode) -> Result<()>;
+    fn attach(&self, name: &str, mode: AttachMode) -> Result<ClientCompletion<()>>;
 
     /// Create a session from `session` and attach. `mpx_name` is the
     /// workspace-scoped name the mpx should use (e.g. "myproject-shell").
-    /// `mode` applies to the attach step.
-    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()>;
+    /// `mode` applies to the attach step. An abnormal client return does not
+    /// claim whether creation completed successfully.
+    fn create_and_attach(
+        &self,
+        session: &Session,
+        mpx_name: &str,
+        mode: AttachMode,
+    ) -> Result<ClientCompletion<CreationDisposition>>;
 
     /// Kill a session by sanitized name. No-op when the session does
     /// not exist.
@@ -121,5 +182,30 @@ mod tests {
         let got = mock.list_sessions().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "one");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_completion_distinguishes_success_code_and_signal() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(
+            ClientCompletion::from_status(std::process::ExitStatus::from_raw(0), "ok"),
+            ClientCompletion::Returned("ok")
+        );
+        assert_eq!(
+            ClientCompletion::from_status(std::process::ExitStatus::from_raw(7 << 8), "unused"),
+            ClientCompletion::Abnormal(ClientExit {
+                code: Some(7),
+                signal: None,
+            })
+        );
+        assert_eq!(
+            ClientCompletion::from_status(std::process::ExitStatus::from_raw(15), "unused"),
+            ClientCompletion::Abnormal(ClientExit {
+                code: None,
+                signal: Some(15),
+            })
+        );
     }
 }

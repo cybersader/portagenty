@@ -41,12 +41,16 @@ Explicitly **not** in v1:
 1. **zellij adapter.** List/has/kill via imperative CLI; create +
    attach via generated KDL layout files. Inside-zellij detection
    returns a clear "detach first" error instead of the opaque
-   nesting failure. 7 e2e tests against real zellij on Linux CI.
+   nesting failure. On Linux, child-only recovery of a missing
+   `XDG_RUNTIME_DIR` keeps local and Tailscale SSH clients on the
+   same secure `/run/user/<uid>` session registry. 7 e2e tests against
+   real zellij on Linux CI, including a run with the variable unset.
 3. **Untracked session adoption.** The TUI merges `mux.list_sessions`
    with workspace definitions and surfaces three row states — Live,
    NotStarted, Untracked — each with a distinct color marker.
-   Enter routes to `attach` for Live/Untracked and `create_and_attach`
-   for NotStarted.
+   Enter routes to exact owned attach for verified receipts, ordinary `attach`
+   for Live/Untracked, supervision-first creation for eligible idle UUID-backed
+   rows, and ordinary `create_and_attach` for legacy/invalid/unsupported idle rows.
 6. **State/activity decorations.** Delivered alongside untracked
    adoption: ● (green) live, ○ (dim) idle, ? (yellow) untracked,
    plus a `[label]` tag on each row.
@@ -105,11 +109,12 @@ real projects:
   run flow: pick workspace name, multiplexer (with install-detection
   badges), Claude-Code starter session. Auto-registers the new
   workspace in the global index.
-- **Workspace picker "home screen"** in the TUI. When `pa` runs
-  outside any walk-up tree, a ratatui picker lists registered
-  workspaces + a "live sessions on this machine" sentinel. Android-
-  back navigation: Esc from session TUI always returns to the
-  picker; q / Ctrl+C exits.
+- **Workspace picker "home screen"** in the TUI. Bare `pa` always opens
+  a ratatui picker listing registered workspaces, their live-session
+  counts, and a "live sessions on this machine" sentinel. `pa <path>`
+  remains the explicit direct-workspace fast path. Android-back
+  navigation: Esc from session TUI always returns to the picker; q /
+  Ctrl+C exits.
 - **Workspace recency** across the picker (sort + "X ago" column)
   and session list (LAST column on Live rows at ≥80 cols). Reads
   from the state store written since v1.
@@ -210,10 +215,10 @@ real projects:
   drops least-important entries first at narrow widths, then drops
   labels for keys-only mode. Mobile (<30 col) always sees `?` and
   `q` plus their labels.
-- **Auto-re-register on walk-up.** When walk-up finds a workspace
-  file that isn't in the global registry (e.g. the user moved the
-  folder), it's silently re-registered so the picker sees it next
-  time. Makes folder moves transparent without manual config fixes.
+- **Auto-re-register on walk-up.** Before bare `pa` renders the picker,
+  a reachable workspace missing from the global registry (for example,
+  after a folder move) is silently re-registered. The picker reflects
+  the corrected path immediately without changing the home-screen flow.
 - **Stable workspace `id` field.** Every new workspace TOML gets an
   auto-generated UUIDv4 `id` field. Optional — old files without
   one keep working. The ID is committed, survives git clone and
@@ -423,70 +428,85 @@ real projects:
 
 ---
 
+## Experimental Linux resource supervision — Claude containment integration implemented
+
+The capability-aware supervision milestone now has an explicit kind-selected
+Claude policy. Eligible idle UUID-backed TUI rows use supervision-first Enter,
+while CLI supervision remains explicit. On supported Linux hosts, Portagenty
+creates fresh tmux or Zellij workloads as transient systemd **user services**
+backed by cgroup v2. Stable logical identity (`workspace UUID + declared session
+name`), opaque private targets, a pending-launch journal, versioned machine-local
+receipts, and workload-anchor proof gate observation and control.
+
+The implementation includes:
+
+- `pa launch <session> --supervise`, plus typed `--memory-high`,
+  `--memory-max`, `--memory-swap-max`, `--cpu-quota`, and `--tasks-max` limits;
+- explicit `kind = "claude-code"` selection of `3G` MemoryHigh, `5G` MemoryMax,
+  `512MiB` MemorySwapMax, `800%` CPU, and `1200` tasks; names and command strings
+  never select Claude policy, and overrides may only be equal or stricter;
+- Claude service placement beneath externally provisioned `claude-code.slice`,
+  aggregate-slice structural preflight, `ManagedOOMPreference=omit`, and service
+  placement/limit read-back before v2 ownership persistence;
+- one shared tmux/Zellij workload-anchor protocol with exact nonce, PID,
+  `/proc` start time, and cgroup evidence, plus bounded descendant traversal via
+  `/proc/<pid>/task/<pid>/children` without a global process scan;
+- split-containment reporting when the root or descendants escape, including an
+  explicit external-bounded-scope explanation for `build-contained` descendants
+  beneath `background.slice`; split rows may attach but receive no whole-workload
+  metrics, stop, or force-kill authority;
+- mixed receipt transition semantics: new launches write v2 evidence, live v1
+  services are legacy/restart-required exact-target attach-only, both unit and
+  target absent may stale-clean, and partial presence remains ambiguous;
+- `pa resources capabilities|status|stop|kill --force` and TUI ownership labels,
+  editable five-field limits, bounded sampling, event warnings, and separately
+  confirmed force-kill only for complete owned-and-verified v2 containment;
+- loud ordinary fallback only from proven-safe non-creating capability preflight,
+  with every ownership ambiguity and post-creation failure remaining fail-closed;
+- graceful target shutdown followed by non-force systemd stop, preserving
+  `OOMPolicy=continue`, `ExitType=cgroup`, `KillMode=control-group`, and
+  `SendSIGKILL=no`; picker-wide stop skips legacy, split, stale, and ambiguous
+  receipts and never bulk-force-kills, while a pending journal blocks duplicate
+  supervised creation without granting control.
+
+This does **not** add a Portagenty daemon, listener, GUI, history database, log
+monitor, restart manager, or unattended telemetry service. Portagenty observes but
+does not create or modify the aggregate Claude slice. Existing services and live
+ordinary multiplexer sessions are not stopped, migrated, upgraded, or retroactively
+claimed. `MemoryHigh` remains a reclaim threshold; `MemoryMax` and
+`MemorySwapMax` are hard ceilings.
+
+The backend, store, parser, CLI, TUI, picker, and multiplexer seams have bounded
+fake/unit coverage. Ignored Linux integration fixtures remain explicit, short-lived,
+and non-pressure; pressure, OOM, swap-fill, CPU saturation, force-kill,
+logout/reboot, and real-agent workload tests remain outside routine verification.
+
+### Future platform and supervision work
+
+- **Non-systemd Linux:** honest unsupported state today; consider direct cgroup
+  v2, process-group, or observation-only adapters only if they can preserve the
+  same ownership contract.
+- **Windows:** Job Object assignment during process creation, retained handles,
+  and Job accounting/member sampling. Do not label host pressure as workload PSI.
+- **macOS:** anchored process-group/direct-child observation with explicit limits;
+  it is not equivalent to cgroup descendant containment.
+- **WSL dual plane:** Linux cgroups cannot contain native Windows descendants
+  launched through interop. Strong support would require a separately approved
+  Windows Job Object companion; otherwise report the escape honestly.
+- Nested sub-workloads, GPU attribution, history, alerts, and arbitrary
+  child-process actions remain deferred.
+- A Plasma or other graphical resource dashboard remains an external consumer,
+  not part of the terminal-native core.
+
+The single-static-binary, terminal-only, no-Portagenty-daemon constraints remain
+in force. Any platform that genuinely requires a resident same-user companion is
+a new owner decision, not an implied extension of this MVP.
+
+---
+
 ## v2+ — Parked
 
 These are plausibly valuable, but we're committing to not thinking about them until v1.x is settled.
-
-### Capability-aware session resource supervision — research, not built
-
-A recurring workstation failure mode is progressive slowdown rather than a clean
-crash: one logical session may own a growing process tree, consume memory and
-swap, saturate CPU, or create I/O pressure while the root agent process still
-looks harmless. Portagenty's stable workspace ID plus declared session name is
-a useful logical address for that workload, but Portagenty currently does **not**
-attribute descendant processes, aggregate resources, report pressure, or safely
-terminate anything narrower than its existing multiplexer lifecycle permits.
-
-The portable direction is a capability-aware supervision contract, not a
-Fedora-only implementation disguised as a universal feature. The contract would
-cover stable logical identity, launch-time workload binding, normalized resource
-snapshots, supported actions, and receipts. Platform adapters would advertise
-only what the host can actually guarantee:
-
-- **Linux:** prefer a systemd user scope backed by cgroup v2, with pidfds for
-  reuse-safe process actions and cgroup CPU, memory, swap, I/O, task, event, and
-  pressure-stall information where available. Fedora is the first reference
-  profile, not the definition of the architecture. Non-systemd Linux must
-  degrade explicitly to direct cgroup v2, process-group, or observation-only
-  operation.
-- **Windows:** use a Job Object assigned during process creation, retained
-  process/job handles for identity, and Job accounting plus member sampling.
-  Windows has no workload-local PSI equivalent, so host memory notifications
-  and Job thresholds must not be presented as the same metric.
-- **macOS:** use an anchored process group and direct-child observation. This is
-  cooperative grouping, not cgroup-style containment: descendants can leave the
-  group, aggregate swap and workload pressure are not generally available, and
-  the UI must say so.
-- **WSL:** model Linux and native Windows execution as separate planes. A Linux
-  cgroup cannot authoritatively contain a Windows executable launched through
-  ordinary WSL interop; strong dual-plane supervision would require an optional
-  Windows Job Object broker. Otherwise the capability report must say that a
-  Windows escape is possible.
-
-The cross-platform baseline should remain deliberately small: identify the root
-process Portagenty launched, sample meaningful CPU and memory values, request a
-graceful stop, force-stop the root when necessary, and report exactly what was
-attempted. Strong descendant containment, aggregate swap/I/O, per-workload
-pressure, nested sub-workloads, and GPU attribution are optional capabilities,
-never assumed portable features.
-
-**Ownership boundary remains an explicit design gate.** Portagenty may own the
-session address, capability vocabulary, TUI presentation, and request/receipt
-protocol without embedding every kernel-facing mechanism. Platform code should
-be isolated behind adapters and may ultimately live in separate Rust crates or
-an optional companion project. The current single-static-binary, terminal-only,
-no-always-running-daemon constraints remain in force until deliberately reopened
-in `DESIGN.md`; this roadmap item does not silently authorize a resident service,
-GUI, listener, or new network surface. If reliable Windows handles or macOS
-anchor lifetime prove to require a resident same-user supervisor, that is a
-separate owner decision. Any graphical resource dashboard would likewise remain
-an external consumer rather than part of Portagenty's terminal-native core.
-
-Before implementation, require evidence for launch-time binding, PID reuse,
-fork/exec/reparenting behavior, graceful-to-forceful termination, capability
-truthfulness on every claimed platform, privacy-safe labels and metrics, and
-synthetic workload tests. Until those gates pass, Portagenty remains a session
-registry and multiplexer lifecycle controller—not a resource supervisor.
 
 - **Agent adapter plugin runtime.** A formal extension mechanism so third parties can add `kind:` handlers without patching the core.
 - **Remote-machine awareness.** portagenty as a multi-host tool. Currently: SSH in and run `pa` there.

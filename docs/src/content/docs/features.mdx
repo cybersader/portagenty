@@ -1,0 +1,251 @@
+---
+title: Features
+description: Explore Portagenty's workspace organization, persistent sessions, cross-device workflows, terminal navigation, integrations, and experimental Linux resource supervision.
+---
+
+import { Aside, Card, CardGrid } from "@astrojs/starlight/components";
+
+Portagenty is a portable, terminal-native workspace and session launcher. It adds
+committable organization, navigation, and lifecycle controls on top of real
+filesystem paths and persistent tmux or Zellij sessions—without replacing either.
+
+<CardGrid>
+  <Card title="One binary, two interfaces" icon="rocket">
+    Use the interactive TUI for daily navigation or the same `pa` binary as a
+    scriptable one-shot CLI. There is no Portagenty daemon or GUI to keep running.
+  </Card>
+  <Card title="Portable by design" icon="seti:config">
+    Workspace definitions are TOML files. Machine-local recency, registration,
+    and ownership state stay outside the files you commit.
+  </Card>
+</CardGrid>
+
+## Workspaces and organization
+
+<CardGrid>
+  <Card title="Alternative hierarchies" icon="seti:folder">
+    Build named workspace views across projects that live under different parent
+    directories. A project can appear in multiple workspaces without anything
+    moving on disk.
+  </Card>
+  <Card title="Workspace picker" icon="magnifier">
+    Browse registered workspaces from a home screen with recency ordering,
+    live-session counts, fuzzy filtering, tag chips and tag views, plus reversible
+    archive/unarchive controls.
+  </Card>
+  <Card title="Stable workspace identity" icon="approve-check">
+    New workspaces receive a UUID. Auto-registration and `previous_paths` preserve
+    a stable anchor when folders move or the same workspace is used from another
+    environment.
+  </Card>
+  <Card title="Three-tier configuration" icon="setting">
+    Merge global defaults, a committable `*.portagenty.toml` workspace, and
+    per-project `portagenty.toml` session declarations with deterministic
+    precedence.
+  </Card>
+</CardGrid>
+
+From the picker you can also rename a workspace, edit its tags, reveal or open its
+path, unregister it without deleting the file, or explicitly delete it with
+confirmation. See the [workspace-picker command reference](/portagenty/reference/commands/#workspace-picker-home-screen)
+and [TOML schema](/portagenty/reference/schema/).
+
+## Persistent sessions
+
+<CardGrid>
+  <Card title="tmux and Zellij" icon="setting">
+    Both multiplexers are first-class adapters. Portagenty creates, lists,
+    attaches to, and exports sessions while the multiplexer remains responsible
+    for terminal persistence.
+  </Card>
+  <Card title="Tracked and untracked sessions" icon="approve-check">
+    Workspace-declared sessions show as live or idle. Sessions started manually
+    outside Portagenty appear as untracked rows and remain attachable without
+    adoption or configuration changes.
+  </Card>
+  <Card title="Human lifecycle feedback" icon="open-book">
+    Rows show state, kind, command or description, path, recency, and available
+    client counts. After a client returns, Portagenty prints the human
+    `workspace / session` identity before any abnormal-exit diagnostic.
+  </Card>
+  <Card title="Takeover or shared attach" icon="random">
+    `pa claim` makes the current device the primary tmux client. `--shared`
+    preserves other clients, while Zellij's separately explicit `--fresh` path
+    handles the multiplexer’s lack of per-client takeover.
+  </Card>
+</CardGrid>
+
+Sessions live in tmux or Zellij, not in a Portagenty background process. Closing
+an SSH connection or leaving the TUI does not stop the session. Learn the exact
+state and attach semantics in [Concepts](/portagenty/concepts/).
+
+## Cross-device workflows
+
+<CardGrid>
+  <Card title="Phone, laptop, or remote shell" icon="rocket">
+    SSH into the host from any terminal, run `pa`, and attach to the same session.
+    The workflow is terminal-native and does not depend on a browser or desktop
+    application.
+  </Card>
+  <Card title="Termux-friendly UI" icon="seti:config">
+    Narrow terminals receive two-line rows, shortened footer hints, arrow-key
+    navigation, Android-style back behavior, and no-editor setup and management
+    flows.
+  </Card>
+  <Card title="Resume-aware agent sessions" icon="approve-check">
+    For sessions marked `kind = "claude-code"`, `pa launch --resume` and
+    `pa claim --resume` append `--continue` at launch time without mutating the
+    committed workspace command.
+  </Card>
+</CardGrid>
+
+The [Termux guide](/portagenty/getting-started/termux/) covers the complete
+phone-over-SSH setup.
+
+## Find, navigate, and scaffold
+
+<CardGrid>
+  <Card title="Open from anywhere" icon="magnifier">
+    Bare `pa` walks upward for a workspace or opens the global picker. Pass a
+    directory or TOML path to jump directly to a specific workspace.
+  </Card>
+  <Card title="Layered folder search" icon="seti:folder">
+    The picker combines recency, zoxide, indexed search, `fd`, and a bounded
+    filesystem walker, then fuzzy-ranks the results. Existing absolute and `~/`
+    paths pin an exact result.
+  </Card>
+  <Card title="Scoped and global navigation" icon="random">
+    Drill into or widen the current search scope, toggle local/global search
+    without losing the query, use `Ctrl+G` for an exact absolute-path jump, or
+    switch to the filesystem tree browser.
+  </Card>
+  <Card title="Scaffold in place" icon="pencil">
+    Confirm a folder with no workspace and Portagenty can create and register one
+    immediately. `pa init`, the first-run wizard, and in-TUI add/edit flows avoid
+    hand-authoring TOML when you do not want to.
+  </Card>
+</CardGrid>
+
+Start with the [Quickstart](/portagenty/getting-started/quickstart/) or use the
+[full command reference](/portagenty/reference/commands/) for every key and flag.
+
+## Manage, export, and integrate
+
+<CardGrid>
+  <Card title="No-editor session management" icon="pencil">
+    Add, rename, edit, and remove sessions from either the TUI or CLI. Manage
+    commands, working directories, kind hints, descriptions, and per-session
+    environment variables with comment-preserving TOML updates.
+  </Card>
+  <Card title="Open a plain shell" icon="seti:folder">
+    Drop out of Portagenty into a normal shell at a workspace or highlighted tree
+    path—no multiplexer and no session state—when direct terminal work is the
+    simpler choice.
+  </Card>
+  <Card title="Committable exports" icon="document">
+    `pa export` renders a tmux starter script or Zellij KDL layout that teammates
+    can launch without installing Portagenty.
+  </Card>
+  <Card title="Shell ergonomics" icon="puzzle">
+    Generate completions and install opt-in, idempotent bash snippets for shorter
+    commands and Termux-friendly behavior.
+  </Card>
+  <Card title="pa:// deep links" icon="random">
+    Register `pa://` with the operating system, then open a path, workspace UUID,
+    named session, or plain shell from a browser, note, chat, or other link-aware
+    application.
+  </Card>
+  <Card title="Portaconv companion" icon="approve-check">
+    `pa convos` scopes conversation discovery and export to the current workspace.
+    Stable IDs and previous paths let the companion bridge histories across folder
+    moves and WSL/Windows path changes.
+  </Card>
+</CardGrid>
+
+See [Portaconv integration](/portagenty/concepts/portaconv-integration/),
+[snippets](/portagenty/reference/snippets/), and
+[completion setup](/portagenty/getting-started/completions/) for the optional
+integration workflows.
+
+## Experimental Linux resource supervision
+
+On supported Linux hosts, Portagenty includes a first-party, capability-aware
+supervision backend. It launches an eligible session as a transient systemd user
+service and records a machine-local receipt for its private tmux or Zellij target.
+Whole-workload ownership is claimed only when v2 evidence proves the exact workload
+root and every bounded descendant remains in the service cgroup.
+
+<CardGrid>
+  <Card title="Explicit Claude policy" icon="rocket">
+    Only `kind = "claude-code"` selects Claude placement and defaults: `3G`
+    MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, and `1200`
+    tasks. Names and command strings never imply Claude policy; custom Claude
+    values may only be equal or stricter.
+  </Card>
+  <Card title="Explicit scriptable controls" icon="seti:config">
+    CLI launches remain ordinary unless `--supervise` or a resource-limit flag is
+    supplied. Generic sessions receive no Claude defaults and stay in normal
+    user-manager placement.
+  </Card>
+  <Card title="Soft and hard limits" icon="setting">
+    `MemoryHigh` asks the kernel to reclaim memory. `MemoryMax` and
+    `MemorySwapMax` are hard ceilings. CPU quota limits aggregate CPU time, and
+    `TasksMax` bounds processes and threads.
+  </Card>
+  <Card title="Structural Claude placement" icon="magnifier">
+    Claude services request `claude-code.slice`, `ManagedOOMPreference=omit`, and
+    finite per-service `TasksMax`. Portagenty requires finite aggregate memory and
+    CPU controls, while aggregate `TasksMax` is optional and may be infinity. It
+    reads back service placement and limits but never creates or modifies the slice.
+  </Card>
+  <Card title="Workload-anchor proof" icon="approve-check">
+    The shared tmux/Zellij anchor records a nonce, exact PID, and process start
+    time, then binds proof to the exact tmux pane or Zellij session/runtime target.
+    Portagenty checks the exact cgroup and walks every thread's bounded `/proc`
+    children edges before metrics or control are allowed.
+  </Card>
+  <Card title="Safe transitions and escapes" icon="random">
+    Live v1 services are legacy/restart-required exact-target attach-only. Escaped
+    descendants produce split containment; external `build-contained` children in
+    `background.slice` stay externally bounded and prevent whole-workload control.
+    Partial unit/target presence remains ambiguous and fail-closed.
+  </Card>
+</CardGrid>
+
+<Aside type="caution" title="Linux-specific backend, portable core">
+Resource supervision currently requires Linux with a working systemd user manager
+and unified cgroup v2. On unsupported hosts, Portagenty's workspace, TUI, CLI,
+search, export, deep-link, tmux, and Zellij features remain available; only the
+supervision capability reports unsupported. Portagenty installs no supervision
+daemon or listener and records no resource history, terminal content, or
+unattended telemetry.
+</Aside>
+
+If routine TUI Enter reaches an ownership-safe, non-creating preflight failure, it
+announces the reason and may fall back to an ordinary unsupervised launch. Explicit
+`S`, stale replacement, CLI supervision, receipt ambiguity, and failures after
+backend creation may have begun do not silently fall back. A pending-launch journal
+protects the creation-to-receipt gap. Stale cleanup removes only an exactly
+confirmed dead receipt and marker and sends no signal; partial presence never
+stale-cleans.
+
+Use [`pa resources`](/portagenty/reference/commands/#pa-resources) for capability,
+status, graceful-stop, and force-kill details. The [schema reference](/portagenty/reference/schema/#id)
+explains why stable workspace identity is required.
+
+## Where to go next
+
+<CardGrid>
+  <Card title="Install Portagenty" icon="rocket">
+    Follow the [installation guide](/portagenty/getting-started/installation/) and
+    verify `pa --version`.
+  </Card>
+  <Card title="Launch a first session" icon="open-book">
+    The [Quickstart](/portagenty/getting-started/quickstart/) walks through a
+    workspace file, the TUI, and cross-device attach behavior.
+  </Card>
+  <Card title="Look up a command" icon="document">
+    The [command reference](/portagenty/reference/commands/) documents every
+    subcommand, flag, picker key, and session-list action.
+  </Card>
+</CardGrid>

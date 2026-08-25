@@ -8,10 +8,14 @@ sidebar:
 portagenty never runs *on* Termux. The typical mobile path is:
 
 ```
-Termux on Android ──SSH──▶ your desktop ──▶ zellij / tmux ──▶ pa
+Termux on Android ──SSH──▶ your desktop ──▶ pa ──▶ zellij / tmux
 ```
 
-Your sessions persist on the desktop; Termux is just the transport.
+Your sessions persist on the desktop; Termux is just the transport. Run
+bare `pa` from the SSH shell, choose a workspace with a live badge, and
+PortAgenty attaches to the existing multiplexer session. On Linux it also
+recovers the secure systemd runtime directory for Zellij when the SSH login
+omits `XDG_RUNTIME_DIR`, so no export, alias, or wrapper is required.
 
 ## Supported interactions
 
@@ -44,13 +48,17 @@ visible:
 
 ## Recommended setup
 
-1. On desktop: install `pa`, install `tmux`, run SSH server.
+1. On desktop: install `pa`, install `tmux` or Zellij, and run an SSH server.
 2. On phone: install Termux + Termux:Widget; set up SSH keys.
-3. Persist sessions across disconnects: run `pa` inside a zellij or
-   tmux session on the desktop so you can re-attach after a flaky
-   mobile connection. For zellij, see the broader pattern in
-   [`cybersader/agentic-workflow-and-tech-stack`'s terminal-setup
-   docs](https://github.com/cybersader/agentic-workflow-and-tech-stack/blob/main/docs/terminal-setup.md).
+3. SSH to the desktop and run bare `pa`. The global picker shows registered
+   workspaces and their live-session counts; select one to attach or create it.
+4. Detach from the multiplexer when leaving. On the next desktop or mobile
+   connection, run `pa` again and select the same live workspace session.
+
+Do not run `pa` from inside an existing Zellij client: Zellij refuses nested
+attachments. Detach to the SSH shell first, then use `pa` as the launcher.
+For the broader terminal setup, see
+[`cybersader/agentic-workflow-and-tech-stack`'s terminal-setup docs](https://github.com/cybersader/agentic-workflow-and-tech-stack/blob/main/docs/terminal-setup.md).
 
 ## Bootstrapping a new project from the phone
 

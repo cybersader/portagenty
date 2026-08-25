@@ -37,6 +37,10 @@ const CHECKS = [
   { path: `${PREFIX}/getting-started/dev/`, mustContain: "Tailscale" },
   { path: `${PREFIX}/getting-started/termux/`, mustContain: "Termux" },
   { path: `${PREFIX}/getting-started/completions/`, mustContain: "completions" },
+  {
+    path: `${PREFIX}/features/`,
+    mustContain: "Experimental Linux resource supervision",
+  },
   { path: `${PREFIX}/concepts/`, mustContain: "Workspace" },
   { path: `${PREFIX}/reference/commands/`, mustContain: "pa launch" },
   { path: `${PREFIX}/reference/schema/`, mustContain: "session" },

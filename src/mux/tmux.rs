@@ -1,17 +1,23 @@
 //! tmux adapter. Shells out to the `tmux` CLI via `std::process::Command`.
 //!
 //! An optional `socket` path isolates the adapter to a private tmux
-//! server (tmux `-S <path>`). Production use leaves this `None` to
-//! share the user's default server; tests pass a per-test socket so
-//! concurrent nextest runs don't collide.
+//! server (tmux `-S <path>`). Normal launches leave this `None` to share
+//! the user's default server; supervised launches and tests use a private
+//! socket for exact ownership and isolation.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::domain::Session;
-use crate::mux::{sanitize_session_name, AttachMode, Multiplexer, SessionInfo};
+use crate::mux::{
+    sanitize_session_name, AttachMode, ClientCompletion, CreationDisposition, Multiplexer,
+    SessionInfo,
+};
 
 /// Wrap a std::io::Error that fired during a tmux invocation. We
 /// lift `NotFound` into a clear "tmux isn't installed or isn't in
@@ -41,8 +47,8 @@ impl TmuxAdapter {
         Self::default()
     }
 
-    /// Private tmux server at the given socket path. Used in tests
-    /// for isolation; not typically what end users want.
+    /// Private tmux server at the given socket path. Used for supervised
+    /// per-session ownership and for isolated tests.
     pub fn with_socket(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: Some(socket.into()),
@@ -62,30 +68,101 @@ impl TmuxAdapter {
     /// create path without taking over the controlling TTY.
     pub fn create_detached(&self, session: &Session) -> Result<()> {
         let name = sanitize_session_name(&session.name);
-        self.create_detached_with_name(session, &name)
+        self.create_detached_with_name(session, &name).map(|_| ())
     }
 
-    fn create_detached_with_name(&self, session: &Session, name: &str) -> Result<()> {
-        if self.has_session(name)? {
-            return Ok(());
-        }
+    pub(crate) fn create_detached_args(
+        &self,
+        session: &Session,
+        name: &str,
+    ) -> Result<Vec<OsString>> {
+        self.create_detached_args_with_command(session, name, &session.command)
+    }
+
+    pub(crate) fn create_detached_args_with_command(
+        &self,
+        session: &Session,
+        name: &str,
+        command: &str,
+    ) -> Result<Vec<OsString>> {
+        self.create_detached_args_with_command_and_environment(session, name, command, &session.env)
+    }
+
+    pub(crate) fn create_detached_args_with_command_and_environment(
+        &self,
+        session: &Session,
+        name: &str,
+        command: &str,
+        pane_environment: &BTreeMap<String, String>,
+    ) -> Result<Vec<OsString>> {
         ensure_cwd_exists(&session.cwd)?;
-        let mut cmd = self.cmd();
-        cmd.arg("new-session").arg("-d").arg("-s").arg(name);
+        let mut args = Vec::new();
+        if let Some(socket) = &self.socket {
+            args.push(OsString::from("-S"));
+            args.push(socket.as_os_str().to_owned());
+        }
+        args.extend([
+            OsString::from("new-session"),
+            OsString::from("-d"),
+            OsString::from("-s"),
+            OsString::from(name),
+        ]);
         // -e KEY=VAL flags: tmux applies these to the session's
         // environment, so the spawned shell + child processes see
         // them. Order is deterministic because session.env is BTreeMap.
-        for (k, v) in &session.env {
-            cmd.arg("-e").arg(format!("{k}={v}"));
+        for (key, value) in pane_environment {
+            args.push(OsString::from("-e"));
+            args.push(OsString::from(format!("{key}={value}")));
         }
-        cmd.arg("-c").arg(&session.cwd).arg(&session.command);
-        let status = cmd
+        args.push(OsString::from("-c"));
+        args.push(session.cwd.as_os_str().to_owned());
+        args.push(OsString::from(command));
+        Ok(args)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pane_pid(&self, session: &str) -> Result<u32> {
+        let output = self
+            .cmd()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{session}:0.0"),
+                "#{pane_pid}",
+            ])
+            .output()
+            .map_err(|error| friendly_io_err("querying tmux pane PID", error))?;
+        if !output.status.success() {
+            bail!(
+                "tmux pane PID query failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        String::from_utf8(output.stdout)
+            .context("tmux pane PID output was not UTF-8")?
+            .trim()
+            .parse::<u32>()
+            .context("parsing tmux pane PID")
+    }
+
+    fn create_detached_with_name(
+        &self,
+        session: &Session,
+        name: &str,
+    ) -> Result<CreationDisposition> {
+        if self.has_session(name)? {
+            return Ok(CreationDisposition::Existing);
+        }
+        let args = self.create_detached_args(session, name)?;
+        let status = Command::new("tmux")
+            .args(args)
             .status()
             .map_err(|e| friendly_io_err("spawning tmux new-session", e))?;
         if !status.success() {
             bail!("tmux new-session failed for session {name:?}");
         }
-        Ok(())
+        Ok(CreationDisposition::Created)
     }
 
     /// Stop the tmux server this adapter is pointed at. Used in
@@ -110,7 +187,10 @@ fn ensure_cwd_exists(cwd: &Path) -> Result<()> {
 
 fn is_no_server_error(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
-    s.contains("no server running") || s.contains("no sessions") || s.contains("error connecting")
+    s.contains("no server running")
+        || s.contains("no sessions")
+        || s.contains("error connecting")
+        || s.contains("server exited unexpectedly")
 }
 
 impl Multiplexer for TmuxAdapter {
@@ -171,7 +251,7 @@ impl Multiplexer for TmuxAdapter {
         Ok(status.success())
     }
 
-    fn attach(&self, name: &str, mode: AttachMode) -> Result<()> {
+    fn attach(&self, name: &str, mode: AttachMode) -> Result<ClientCompletion<()>> {
         let mut cmd = self.cmd();
         cmd.arg("attach-session").arg("-t").arg(name);
         if mode == AttachMode::Takeover {
@@ -182,17 +262,19 @@ impl Multiplexer for TmuxAdapter {
         let status = cmd
             .status()
             .map_err(|e| friendly_io_err("spawning tmux attach-session", e))?;
-        if !status.success() {
-            bail!("tmux attach-session failed for {name:?}");
-        }
-        Ok(())
+        Ok(ClientCompletion::from_status(status, ()))
     }
 
-    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()> {
+    fn create_and_attach(
+        &self,
+        session: &Session,
+        mpx_name: &str,
+        mode: AttachMode,
+    ) -> Result<ClientCompletion<CreationDisposition>> {
         // Use the caller-provided mpx_name (workspace-scoped) instead
         // of computing from session.name (which would miss the prefix).
-        self.create_detached_with_name(session, mpx_name)?;
-        self.attach(mpx_name, mode)
+        let disposition = self.create_detached_with_name(session, mpx_name)?;
+        Ok(self.attach(mpx_name, mode)?.map(|()| disposition))
     }
 
     fn kill(&self, name: &str) -> Result<()> {
@@ -210,6 +292,19 @@ impl Multiplexer for TmuxAdapter {
             .map_err(|e| friendly_io_err("spawning tmux kill-session", e))?;
         if !status.success() {
             bail!("tmux kill-session failed for {name:?}");
+        }
+        if let Some(socket) = &self.socket {
+            if self.list_sessions()?.is_empty() {
+                match fs::remove_file(socket) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("removing private tmux socket {}", socket.display())
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -257,6 +352,7 @@ mod tests {
         assert!(is_no_server_error("no server running on /tmp/sock"));
         assert!(is_no_server_error("error connecting to /tmp/sock"));
         assert!(is_no_server_error("no sessions"));
+        assert!(is_no_server_error("server exited unexpectedly"));
         assert!(!is_no_server_error("some unrelated tmux error"));
     }
 
@@ -339,6 +435,51 @@ mod tests {
         assert_eq!(
             args,
             vec!["new-session", "-d", "-s", "s", "-c", "/tmp", "echo hi"]
+        );
+    }
+
+    #[test]
+    fn supervised_args_use_the_explicit_pane_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = Session {
+            name: "agent".into(),
+            cwd: temp.path().to_path_buf(),
+            command: "ignored".into(),
+            kind: None,
+            env: BTreeMap::from([("ORIGINAL".into(), "not-forwarded".into())]),
+            description: None,
+        };
+        let pane_environment = BTreeMap::from([
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            ),
+            ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+        ]);
+        let args = TmuxAdapter::with_socket("/tmp/private.sock")
+            .create_detached_args_with_command_and_environment(
+                &session,
+                "exact",
+                "exec workload-anchor",
+                &pane_environment,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "-e",
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+            ]
+        }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-e", "XDG_RUNTIME_DIR=/run/user/1000"]));
+        assert!(!args.iter().any(|arg| arg.starts_with("ORIGINAL=")));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("exec workload-anchor")
         );
     }
 }

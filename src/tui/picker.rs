@@ -86,21 +86,29 @@ impl StatusLine {
     }
 }
 
-/// One target of a mass-kill operation: the mpx session name to
-/// kill, plus whether it was declared in the workspace TOML
-/// (`tracked`) or only discovered live in the multiplexer
-/// (`untracked` — leaked from outside `pa` but still under the
-/// workspace's prefix). Surfaced in the confirm prompt so the user
-/// sees exactly what dies.
+/// One target of a workspace-wide stop operation. Every row carries the exact
+/// control path that confirmation will authorize: receipt-owned workloads use
+/// graceful + non-force systemd stop, unmanaged shared targets use the native
+/// multiplexer kill, and stale or ambiguous receipts are shown but skipped.
 #[derive(Debug, Clone)]
 struct KillTarget {
-    /// Multiplexer session name (post-`workspace_session_name`).
-    mpx_name: String,
-    /// Display label — the declared TOML session name for tracked
-    /// entries, or the bare mpx name (minus workspace prefix when
-    /// known) for untracked. Used only in the confirm prompt.
+    /// Display label — the declared TOML session name for tracked entries, or
+    /// the bare mpx name (minus workspace prefix) for untracked entries.
     display: String,
-    tracked: bool,
+    control: KillControl,
+}
+
+#[derive(Debug, Clone)]
+enum KillControl {
+    #[cfg(target_os = "linux")]
+    Owned(Box<crate::supervision::BindingReceipt>),
+    MuxNative {
+        mpx_name: String,
+        tracked: bool,
+    },
+    Skipped {
+        reason: String,
+    },
 }
 
 /// Destructive action awaiting user confirmation in the picker.
@@ -124,12 +132,10 @@ enum PickerPending {
     /// path + in-progress input, seeded with the current tags. Enter
     /// writes the TOML `tags` array; Esc cancels.
     EditTags { path: PathBuf, input: String },
-    /// Kill every live mpx session belonging to this workspace.
-    /// Triggered by `X` in the picker. Holds the workspace's display
-    /// name (for the prompt title), the resolved multiplexer (to
-    /// dispatch kill calls), and the list of targets — pre-computed
-    /// at key-press time so the confirm prompt names exactly what's
-    /// about to die.
+    /// Stop every controllable live session belonging to this workspace.
+    /// Triggered by `X` in the picker. Owned workloads use graceful +
+    /// non-force systemd stop, unmanaged targets use multiplexer-native kill,
+    /// and stale or ambiguous receipts are previewed but skipped.
     KillAllSessions {
         ws_display_name: String,
         mpx: crate::domain::Multiplexer,
@@ -768,12 +774,10 @@ pub fn run(
                     status.set("D: nothing to delete — live-sessions row isn't a workspace".into());
                 }
             }
-            // X: kill every live mpx session under the highlighted
-            // workspace. Capital — mirrors `D` for delete-file: both
-            // destructive sweeps, both gated by an explicit y/N
-            // confirm that names exactly what's about to die. Zero
-            // live sessions short-circuits to a status message, no
-            // confirm needed (nothing to confirm).
+            // X: stop every controllable live session under the highlighted
+            // workspace. The confirmation previews owned non-force stops,
+            // unmanaged multiplexer kills, and stale bindings that will be
+            // skipped. Zero targets short-circuits without a modal.
             (KeyCode::Char('X'), _) => {
                 let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
                 else {
@@ -788,7 +792,7 @@ pub fn run(
                     Ok((ws_display_name, mpx, targets)) => {
                         if targets.is_empty() {
                             status.set(format!(
-                                "X: no live sessions under {ws_display_name:?} to kill"
+                                "X: no live sessions under {ws_display_name:?} to stop"
                             ));
                         } else {
                             let _ = path; // path was only used to load the workspace above
@@ -1077,57 +1081,152 @@ fn enumerate_kill_targets(
     let ws_name = ws.name.clone();
     let mpx = ws.multiplexer;
     let declared_names: Vec<String> = ws.sessions.iter().map(|s| s.name.clone()).collect();
+    let receipts = workspace_receipts(&ws)?;
 
     let mux: Option<Box<dyn crate::mux::Multiplexer>> = match mpx {
         crate::domain::Multiplexer::Tmux => Some(Box::new(crate::mux::TmuxAdapter::new())),
         crate::domain::Multiplexer::Zellij => Some(Box::new(crate::mux::ZellijAdapter::new())),
         crate::domain::Multiplexer::Wezterm => None,
     };
-    let Some(mux) = mux else {
-        return Ok((ws_name, mpx, vec![]));
-    };
-    let live: std::collections::HashSet<String> = match mux.list_sessions() {
-        Ok(rows) => rows.into_iter().map(|s| s.name).collect(),
-        Err(_) => return Ok((ws_name, mpx, vec![])),
+    let live: std::collections::HashSet<String> = match mux {
+        Some(mux) => mux
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|session| session.name)
+            .collect(),
+        None => std::collections::HashSet::new(),
     };
 
+    #[cfg(target_os = "linux")]
+    let supervision_backend = crate::supervision::LinuxSystemdBackend::connect();
+
     let mut targets: Vec<KillTarget> = Vec::new();
+    let mut handled_receipts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut tracked_mpx: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for sn in &declared_names {
-        let mpx_name = crate::mux::workspace_session_name(&ws_name, sn);
+    for session_name in &declared_names {
+        let mpx_name = crate::mux::workspace_session_name(&ws_name, session_name);
+        tracked_mpx.insert(mpx_name.clone());
+        if let Some(receipt) = receipts.get(session_name) {
+            handled_receipts.insert(session_name.clone());
+            targets.push(KillTarget {
+                display: session_name.clone(),
+                control: classify_receipted_bulk_target(
+                    receipt,
+                    #[cfg(target_os = "linux")]
+                    &supervision_backend,
+                ),
+            });
+            continue;
+        }
+
         if live.contains(&mpx_name) {
             targets.push(KillTarget {
-                mpx_name: mpx_name.clone(),
-                display: sn.clone(),
-                tracked: true,
+                display: session_name.clone(),
+                control: KillControl::MuxNative {
+                    mpx_name,
+                    tracked: true,
+                },
             });
-            tracked_mpx.insert(mpx_name);
         }
     }
+
+    for (session_name, receipt) in &receipts {
+        if handled_receipts.contains(session_name) {
+            continue;
+        }
+        targets.push(KillTarget {
+            display: session_name.clone(),
+            control: classify_receipted_bulk_target(
+                receipt,
+                #[cfg(target_os = "linux")]
+                &supervision_backend,
+            ),
+        });
+    }
+
     let prefix = format!(
         "{}-",
         crate::mux::workspace_session_name(&ws_name, "").trim_end_matches('-')
     );
     for live_name in &live {
-        if tracked_mpx.contains(live_name) {
+        if tracked_mpx.contains(live_name) || !live_name.starts_with(&prefix) {
             continue;
         }
-        if live_name.starts_with(&prefix) {
-            let display = live_name
-                .strip_prefix(&prefix)
-                .unwrap_or(live_name)
-                .to_string();
-            targets.push(KillTarget {
+        let display = live_name
+            .strip_prefix(&prefix)
+            .unwrap_or(live_name)
+            .to_string();
+        targets.push(KillTarget {
+            display,
+            control: KillControl::MuxNative {
                 mpx_name: live_name.clone(),
-                display,
                 tracked: false,
-            });
-        }
+            },
+        });
     }
     Ok((ws_name, mpx, targets))
 }
 
-/// Iterate the kill list, invoking the right mpx adapter for each.
+fn workspace_receipts(
+    workspace: &crate::domain::Workspace,
+) -> anyhow::Result<std::collections::BTreeMap<String, crate::supervision::BindingReceipt>> {
+    let Some(workspace_id) = workspace.id.as_deref() else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let receipts = crate::supervision::ReceiptStore::standard()?
+            .list()?
+            .into_iter()
+            .filter(|receipt| receipt.logical_id.workspace_id == workspace_id)
+            .map(|receipt| (receipt.logical_id.session_name.clone(), receipt))
+            .collect();
+        Ok(receipts)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = workspace_id;
+        Ok(std::collections::BTreeMap::new())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_receipted_bulk_target(
+    receipt: &crate::supervision::BindingReceipt,
+    backend: &anyhow::Result<crate::supervision::LinuxSystemdBackend>,
+) -> KillControl {
+    use crate::supervision::SupervisionBackend as _;
+
+    match backend {
+        Ok(backend) => match backend.reconcile(receipt) {
+            Ok(crate::supervision::OwnershipState::OwnedVerified(_)) => {
+                KillControl::Owned(Box::new(receipt.clone()))
+            }
+            Ok(crate::supervision::OwnershipState::StaleBinding(reason)) => {
+                KillControl::Skipped { reason }
+            }
+            Ok(state) => KillControl::Skipped {
+                reason: format!("ownership is {state:?}"),
+            },
+            Err(error) => KillControl::Skipped {
+                reason: format!("ownership revalidation failed: {error:#}"),
+            },
+        },
+        Err(error) => KillControl::Skipped {
+            reason: format!("supervision backend unavailable: {error:#}"),
+        },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn classify_receipted_bulk_target(_receipt: &crate::supervision::BindingReceipt) -> KillControl {
+    KillControl::Skipped {
+        reason: "resource supervision is unsupported on this platform".into(),
+    }
+}
+
+/// Iterate the stop list using each target's previewed control path.
 /// Best-effort: per-target failures append to an error tally but
 /// don't abort the sweep. Returns the human-readable status line.
 fn perform_kill_all_sessions(
@@ -1140,29 +1239,73 @@ fn perform_kill_all_sessions(
         crate::domain::Multiplexer::Zellij => Some(Box::new(crate::mux::ZellijAdapter::new())),
         crate::domain::Multiplexer::Wezterm => None,
     };
-    let Some(mux) = mux else {
-        return format!("X: workspace {ws_display_name:?} mpx isn't supported — nothing killed");
-    };
-    let mut killed = 0usize;
+    #[cfg(target_os = "linux")]
+    let supervision_backend = crate::supervision::LinuxSystemdBackend::connect();
+
+    let mut stopped = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
-    for t in targets {
-        match mux.kill(&t.mpx_name) {
-            Ok(()) => killed += 1,
-            Err(e) => failed.push(format!("{}: {e}", t.display)),
+    for target in targets {
+        match &target.control {
+            KillControl::MuxNative { mpx_name, .. } => match &mux {
+                Some(mux) => match mux.kill(mpx_name) {
+                    Ok(()) => stopped += 1,
+                    Err(error) => failed.push(format!("{}: {error}", target.display)),
+                },
+                None => failed.push(format!(
+                    "{}: workspace multiplexer is unsupported",
+                    target.display
+                )),
+            },
+            #[cfg(target_os = "linux")]
+            KillControl::Owned(receipt) => {
+                use crate::supervision::SupervisionBackend as _;
+                let result = (|| -> anyhow::Result<()> {
+                    let backend = supervision_backend.as_ref().map_err(|error| {
+                        anyhow::anyhow!("supervision backend unavailable: {error:#}")
+                    })?;
+                    match backend.reconcile(receipt)? {
+                        crate::supervision::OwnershipState::OwnedVerified(_) => {}
+                        state => {
+                            anyhow::bail!("ownership changed before non-force stop: {state:?}")
+                        }
+                    }
+                    if let Err(error) = crate::cli::graceful_stop_target(&receipt.mux_target) {
+                        tracing::warn!(
+                            target = "portagenty::tui",
+                            error = %format!("{error:#}"),
+                            "bulk graceful multiplexer stop failed before systemd stop"
+                        );
+                    }
+                    let result = backend.stop_unit(receipt)?;
+                    if !result.completed {
+                        anyhow::bail!("{}", result.final_state);
+                    }
+                    crate::supervision::ReceiptStore::standard()?.remove(&receipt.logical_id)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => stopped += 1,
+                    Err(error) => failed.push(format!("{}: {error:#}", target.display)),
+                }
+            }
+            KillControl::Skipped { reason } => {
+                skipped.push(format!("{}: {reason}", target.display));
+            }
         }
     }
-    if failed.is_empty() {
-        format!(
-            "killed {killed} live session{} under {ws_display_name:?}",
-            if killed == 1 { "" } else { "s" }
-        )
-    } else {
-        format!(
-            "killed {killed} of {} under {ws_display_name:?}; failed: {}",
-            targets.len(),
-            failed.join(", ")
-        )
+
+    let mut status = format!(
+        "stopped {stopped} of {} under {ws_display_name:?}",
+        targets.len()
+    );
+    if !skipped.is_empty() {
+        status.push_str(&format!("; skipped: {}", skipped.join(", ")));
     }
+    if !failed.is_empty() {
+        status.push_str(&format!("; failed: {}", failed.join(", ")));
+    }
+    status
 }
 
 /// Read the `name = "..."` field from a workspace TOML. Returns
@@ -1348,21 +1491,29 @@ fn perform_scaffold_at(dir: &std::path::Path) -> anyhow::Result<PathBuf> {
     Ok(outcome.path().to_path_buf())
 }
 
-/// Probe the multiplexers once and return a map of workspace path
-/// → number of live sessions that correspond to its declared
-/// sessions. "Live" means an mpx session exists under the
-/// workspace-scoped name (matches what the session-list TUI shows
-/// with the green ● marker, minus Idle and Untracked).
+/// Probe the multiplexers and supervision receipts once, then return a map of
+/// workspace path → number of declared sessions that are actually live.
+/// Ordinary sessions count when the workspace-scoped mpx target exists;
+/// supervised sessions count only after exact receipt reconciliation proves the
+/// private target and systemd invocation are still owned.
 ///
-/// Errors are swallowed as 0 — a workspace whose TOML is broken or
-/// whose mpx is unreachable just gets a live count of 0.
+/// Errors are swallowed as 0 for the affected source — a broken workspace,
+/// unreachable mpx, unreadable receipt store, or unavailable supervision backend
+/// must not make an idle/stale session look live.
 fn compute_live_counts(workspaces: &[PathBuf]) -> std::collections::HashMap<PathBuf, usize> {
     use std::collections::{HashMap, HashSet};
     let mut counts: HashMap<PathBuf, usize> = HashMap::new();
 
-    // Resolve each workspace (name, mpx, session names).
-    let mut resolved: Vec<(PathBuf, String, crate::domain::Multiplexer, Vec<String>)> =
-        Vec::with_capacity(workspaces.len());
+    struct ResolvedWorkspace {
+        path: PathBuf,
+        id: Option<String>,
+        name: String,
+        mpx: crate::domain::Multiplexer,
+        session_names: Vec<String>,
+    }
+
+    // Resolve each workspace (stable ID, name, mpx, session names).
+    let mut resolved: Vec<ResolvedWorkspace> = Vec::with_capacity(workspaces.len());
     for p in workspaces {
         let Ok(ws) = crate::config::load(&crate::config::LoadOptions {
             workspace_path: Some(p.clone()),
@@ -1371,15 +1522,21 @@ fn compute_live_counts(workspaces: &[PathBuf]) -> std::collections::HashMap<Path
             counts.insert(p.clone(), 0);
             continue;
         };
-        let names: Vec<String> = ws.sessions.iter().map(|s| s.name.clone()).collect();
-        resolved.push((p.clone(), ws.name, ws.multiplexer, names));
+        let session_names = ws.sessions.iter().map(|s| s.name.clone()).collect();
+        resolved.push(ResolvedWorkspace {
+            path: p.clone(),
+            id: ws.id,
+            name: ws.name,
+            mpx: ws.multiplexer,
+            session_names,
+        });
     }
 
     // Probe each distinct mpx at most once — spawning tmux / zellij
     // is ~100ms, so collapsing across workspaces is worth it.
     let mut live_by_mpx: HashMap<crate::domain::Multiplexer, HashSet<String>> = HashMap::new();
     let unique_mpxs: HashSet<crate::domain::Multiplexer> =
-        resolved.iter().map(|(_, _, m, _)| *m).collect();
+        resolved.iter().map(|workspace| workspace.mpx).collect();
     for mpx in unique_mpxs {
         let mux: Option<Box<dyn crate::mux::Multiplexer>> = match mpx {
             crate::domain::Multiplexer::Tmux => Some(Box::new(crate::mux::TmuxAdapter::new())),
@@ -1393,19 +1550,87 @@ fn compute_live_counts(workspaces: &[PathBuf]) -> std::collections::HashMap<Path
         }
     }
 
-    // Count per workspace.
-    for (path, ws_name, mpx, session_names) in &resolved {
-        let Some(live) = live_by_mpx.get(mpx) else {
-            counts.insert(path.clone(), 0);
-            continue;
-        };
-        let n = session_names
-            .iter()
-            .filter(|sn| live.contains(&crate::mux::workspace_session_name(ws_name, sn)))
-            .count();
-        counts.insert(path.clone(), n);
+    let workspace_ids: HashSet<String> = resolved
+        .iter()
+        .filter_map(|workspace| workspace.id.clone())
+        .collect();
+    let owned_supervised = owned_supervised_sessions(&workspace_ids);
+    let empty_live = HashSet::new();
+
+    // Count the union of ordinary live targets and exactly owned private targets.
+    for workspace in &resolved {
+        let live = live_by_mpx.get(&workspace.mpx).unwrap_or(&empty_live);
+        let n = declared_live_count(
+            workspace.id.as_deref(),
+            &workspace.name,
+            &workspace.session_names,
+            live,
+            &owned_supervised,
+        );
+        counts.insert(workspace.path.clone(), n);
     }
     counts
+}
+
+fn declared_live_count(
+    workspace_id: Option<&str>,
+    workspace_name: &str,
+    session_names: &[String],
+    ordinary_live: &std::collections::HashSet<String>,
+    owned_supervised: &std::collections::HashSet<crate::supervision::LogicalSessionId>,
+) -> usize {
+    session_names
+        .iter()
+        .filter(|session_name| {
+            let ordinary = ordinary_live.contains(&crate::mux::workspace_session_name(
+                workspace_name,
+                session_name,
+            ));
+            let supervised = workspace_id.is_some_and(|workspace_id| {
+                owned_supervised.contains(&crate::supervision::LogicalSessionId {
+                    workspace_id: workspace_id.to_string(),
+                    session_name: (*session_name).clone(),
+                })
+            });
+            ordinary || supervised
+        })
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+fn owned_supervised_sessions(
+    workspace_ids: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<crate::supervision::LogicalSessionId> {
+    use crate::supervision::SupervisionBackend as _;
+
+    let Ok(receipts) = crate::supervision::ReceiptStore::standard().and_then(|store| store.list())
+    else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(backend) = crate::supervision::LinuxSystemdBackend::connect() else {
+        return std::collections::HashSet::new();
+    };
+
+    receipts
+        .into_iter()
+        .filter(|receipt| workspace_ids.contains(&receipt.logical_id.workspace_id))
+        .filter_map(|receipt| match backend.reconcile(&receipt) {
+            Ok(
+                crate::supervision::OwnershipState::OwnedVerified(_)
+                | crate::supervision::OwnershipState::LegacyRestartRequired(_)
+                | crate::supervision::OwnershipState::SplitContainment(_),
+            ) => Some(receipt.logical_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn owned_supervised_sessions(
+    workspace_ids: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<crate::supervision::LogicalSessionId> {
+    let _ = workspace_ids;
+    std::collections::HashSet::new()
 }
 
 fn clamp_selection(workspaces: &[PathBuf], state: &mut ListState) {
@@ -1752,28 +1977,42 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
             targets,
         } => {
             let n = targets.len();
-            let tracked = targets.iter().filter(|t| t.tracked).count();
-            let untracked = n - tracked;
-            let mix = match (tracked, untracked) {
-                (_, 0) => format!(" ({tracked} tracked)"),
-                (0, _) => format!(" ({untracked} untracked)"),
-                _ => format!(" ({tracked} tracked + {untracked} untracked)"),
-            };
+            #[cfg(target_os = "linux")]
+            let owned = targets
+                .iter()
+                .filter(|target| matches!(&target.control, KillControl::Owned(_)))
+                .count();
+            #[cfg(not(target_os = "linux"))]
+            let owned = 0usize;
+            let mux_native = targets
+                .iter()
+                .filter(|target| matches!(&target.control, KillControl::MuxNative { .. }))
+                .count();
+            let skipped = n - owned - mux_native;
             let list = targets
                 .iter()
-                .map(|t| {
-                    let tag = if t.tracked { "tracked" } else { "untracked" };
-                    format!("  · {} ({tag})", t.display)
+                .map(|target| {
+                    let tag = match &target.control {
+                        #[cfg(target_os = "linux")]
+                        KillControl::Owned(_) => "owned: graceful + non-force systemd stop".into(),
+                        KillControl::MuxNative { tracked, .. } => format!(
+                            "{}: multiplexer-native kill",
+                            if *tracked { "tracked" } else { "unmanaged" }
+                        ),
+                        KillControl::Skipped { reason } => format!("SKIP: {reason}"),
+                    };
+                    format!("  · {} ({tag})", target.display)
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
             (
-                "Kill all live sessions".into(),
+                "Stop all live sessions".into(),
                 format!(
-                    "Kill {n} live session{plural} under {ws_display_name:?}?{mix}\n\
+                    "Stop {n} session target{plural} under {ws_display_name:?}? \
+                     ({owned} owned, {mux_native} mux-native, {skipped} skipped)\n\
                      \n{list}\n\
                      \n\
-                     Sessions die immediately — running state is lost.",
+                     No force escalation occurs. Running state may be lost.",
                     plural = if n == 1 { "" } else { "s" },
                 ),
             )
@@ -2012,5 +2251,123 @@ mod tests {
         // Other Ctrl combos are ignored (don't insert a literal char).
         edit_text_input(&mut s, KeyCode::Char('a'), KeyModifiers::CONTROL);
         assert_eq!(s, "x");
+    }
+
+    #[test]
+    fn declared_live_count_unions_ordinary_and_owned_supervised_sessions() {
+        let workspace_id = "550e8400-e29b-41d4-a716-446655440000";
+        let session_names = vec![
+            "ordinary".to_string(),
+            "supervised".to_string(),
+            "both".to_string(),
+            "idle".to_string(),
+        ];
+        let ordinary_live = std::collections::HashSet::from([
+            crate::mux::workspace_session_name("Example", "ordinary"),
+            crate::mux::workspace_session_name("Example", "both"),
+        ]);
+        let owned_supervised = std::collections::HashSet::from([
+            crate::supervision::LogicalSessionId {
+                workspace_id: workspace_id.into(),
+                session_name: "supervised".into(),
+            },
+            crate::supervision::LogicalSessionId {
+                workspace_id: workspace_id.into(),
+                session_name: "both".into(),
+            },
+            crate::supervision::LogicalSessionId {
+                workspace_id: "550e8400-e29b-41d4-a716-446655440001".into(),
+                session_name: "idle".into(),
+            },
+        ]);
+
+        assert_eq!(
+            declared_live_count(
+                Some(workspace_id),
+                "Example",
+                &session_names,
+                &ordinary_live,
+                &owned_supervised,
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_does_not_claim_owned_receipts_by_session_name() {
+        let session_names = vec!["supervised".to_string()];
+        let owned_supervised =
+            std::collections::HashSet::from([crate::supervision::LogicalSessionId {
+                workspace_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                session_name: "supervised".into(),
+            }]);
+
+        assert_eq!(
+            declared_live_count(
+                None,
+                "Example",
+                &session_names,
+                &std::collections::HashSet::new(),
+                &owned_supervised,
+            ),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bulk_stop_confirmation_names_each_control_path_and_skips_ambiguity() {
+        let receipt = crate::supervision::BindingReceipt {
+            schema_version: crate::supervision::model::LEGACY_RECEIPT_SCHEMA_VERSION,
+            logical_id: crate::supervision::LogicalSessionId::new(
+                "550e8400-e29b-41d4-a716-446655440000",
+                "owned",
+            )
+            .unwrap(),
+            backend: crate::supervision::BackendKind::SystemdUserService,
+            unit_name: "portagenty-wtest.service".into(),
+            invocation_id: "00112233445566778899aabbccddeeff".into(),
+            control_group: "/user.slice/user-1000.slice/user@1000.service/app.slice/test.service"
+                .into(),
+            mux_target: crate::supervision::MuxTarget::TmuxPrivate {
+                socket: PathBuf::from("/run/user/1000/portagenty/test/tmux.sock"),
+                session: "opaque".into(),
+            },
+            observed_at_unix_ms: 1,
+            limits: crate::supervision::ResourceLimits::default(),
+            session_kind: None,
+            requested_slice: None,
+            workload_anchor: None,
+        };
+        let pending = PickerPending::KillAllSessions {
+            ws_display_name: "example".into(),
+            mpx: crate::domain::Multiplexer::Tmux,
+            targets: vec![
+                KillTarget {
+                    display: "owned".into(),
+                    control: KillControl::Owned(Box::new(receipt)),
+                },
+                KillTarget {
+                    display: "shared".into(),
+                    control: KillControl::MuxNative {
+                        mpx_name: "example-shared".into(),
+                        tracked: true,
+                    },
+                },
+                KillTarget {
+                    display: "stale".into(),
+                    control: KillControl::Skipped {
+                        reason: "receipt mismatch".into(),
+                    },
+                },
+            ],
+        };
+
+        let (title, body) = picker_confirm_copy(&pending);
+        assert_eq!(title, "Stop all live sessions");
+        assert!(body.contains("owned: graceful + non-force systemd stop"));
+        assert!(body.contains("tracked: multiplexer-native kill"));
+        assert!(body.contains("SKIP: receipt mismatch"));
+        assert!(body.contains("No force escalation occurs"));
     }
 }

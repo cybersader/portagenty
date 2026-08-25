@@ -10,8 +10,8 @@
 //! - **No per-session cwd exposed.** `list_sessions` returns names
 //!   only; `SessionInfo::cwd` is always `None` for zellij.
 //! - **No CLI detach action.** `detach_current` returns an error
-//!   directing the user to the multiplexer's keybind (Ctrl+Q by
-//!   default). Parity with tmux's `detach-client` is fundamentally
+//!   directing the user to the multiplexer's detach keybind (Ctrl+O then d
+//!   by default). Parity with tmux's `detach-client` is fundamentally
 //!   not available here.
 //! - **Sessions with a command** are spawned via a generated KDL
 //!   layout file (see `write_layout_file`); zellij's `attach
@@ -20,13 +20,15 @@
 
 use std::fs;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Result};
 
 use crate::domain::Session;
-use crate::mux::{AttachMode, Multiplexer, SessionInfo};
+use crate::mux::{AttachMode, ClientCompletion, CreationDisposition, Multiplexer, SessionInfo};
 
 /// zellij-backed [`Multiplexer`].
 #[derive(Debug, Clone, Default)]
@@ -36,6 +38,10 @@ pub struct ZellijAdapter {
     /// `$XDG_RUNTIME_DIR`) but keeps config-driven behavior
     /// reproducible.
     config_dir: Option<PathBuf>,
+    /// Exact runtime directory for a receipted supervised target. Normal
+    /// launches leave this unset and use the caller's environment or the
+    /// existing secure Linux fallback.
+    runtime_dir: Option<PathBuf>,
 }
 
 impl ZellijAdapter {
@@ -46,11 +52,23 @@ impl ZellijAdapter {
     pub fn with_config_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
             config_dir: Some(dir.into()),
+            runtime_dir: None,
+        }
+    }
+
+    pub fn with_runtime_dir(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            config_dir: None,
+            runtime_dir: Some(dir.into()),
         }
     }
 
     fn cmd(&self) -> Command {
         let mut c = Command::new("zellij");
+        configure_runtime_environment(&mut c);
+        if let Some(runtime_dir) = &self.runtime_dir {
+            c.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
         if let Some(d) = &self.config_dir {
             c.arg("--config-dir").arg(d);
         }
@@ -71,9 +89,9 @@ impl ZellijAdapter {
     /// zellij's session registration is briefly async after the CLI
     /// returns — the child process can exit successfully before
     /// `list-sessions` reports the new name. This method polls
-    /// `has_session` up to one second so the return is
+    /// `has_session` for up to five seconds so the return is
     /// synchronous-to-visibility, which keeps tests deterministic on
-    /// slow CI runners without every test having to retry.
+    /// slow or concurrently exercised CI runners without every test having to retry.
     pub fn create_background(&self, name: &str) -> Result<()> {
         let status = self
             .cmd()
@@ -88,16 +106,16 @@ impl ZellijAdapter {
             bail!("zellij attach --create-background failed for session {name:?}");
         }
 
-        // Wait for the session to appear in list-sessions. 40 × 50ms
-        // = 2s max; most runs return on the first check. CI runners
-        // occasionally need more than 1s.
-        for _ in 0..40 {
+        // Wait for the session to appear in list-sessions. 100 × 50ms
+        // = 5s max; most runs return on the first check. Concurrent
+        // Zellij e2e tests can make shared registry propagation slower.
+        for _ in 0..100 {
             if self.has_session(name)? {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        bail!("zellij session {name:?} was created but did not appear in list within 2s")
+        bail!("zellij session {name:?} was created but did not appear in list within 5s")
     }
 
     /// Best-effort "are other clients attached to this session?"
@@ -160,6 +178,49 @@ impl ZellijAdapter {
     }
 }
 
+/// Point Zellij at the standard systemd user runtime directory when a login
+/// path (notably Tailscale SSH) omitted `XDG_RUNTIME_DIR`. The override is
+/// child-only: PortAgenty's own environment and unrelated session commands are
+/// left untouched.
+#[cfg(target_os = "linux")]
+fn configure_runtime_environment(command: &mut Command) {
+    configure_runtime_environment_from(
+        command,
+        Path::new("/run/user"),
+        rustix::process::geteuid().as_raw(),
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_runtime_environment(_command: &mut Command) {}
+
+#[cfg(target_os = "linux")]
+fn configure_runtime_environment_from(command: &mut Command, root: &Path, uid: u32) {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        if let Some(runtime_dir) = secure_systemd_runtime_dir(root, uid) {
+            command.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
+    }
+}
+
+/// Return `<root>/<uid>` only when it is the secure runtime directory systemd
+/// normally creates for that user. Refusing symlinks, foreign ownership, and
+/// permissive modes avoids redirecting Zellij's control socket to an untrusted
+/// location.
+#[cfg(target_os = "linux")]
+fn secure_systemd_runtime_dir(root: &Path, uid: u32) -> Option<PathBuf> {
+    let candidate = root.join(uid.to_string());
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
 fn friendly_io_err(context: &str, err: io::Error) -> anyhow::Error {
     if err.kind() == io::ErrorKind::NotFound {
         anyhow!(
@@ -213,7 +274,19 @@ fn escape_kdl(s: &str) -> String {
 /// When the session has env vars set, we route through `env(1)` —
 /// each `KEY=VAL` is a separate KDL string arg, which avoids shell-
 /// escape gymnastics inside the bash -c payload.
-fn render_layout(session: &Session) -> String {
+pub(crate) fn render_layout(session: &Session) -> String {
+    render_layout_with_tab_name(session, &session.name)
+}
+
+pub(crate) fn render_layout_with_tab_name(session: &Session, tab_name: &str) -> String {
+    render_layout_with_tab_name_and_command(session, tab_name, &session.command)
+}
+
+pub(crate) fn render_layout_with_tab_name_and_command(
+    session: &Session,
+    tab_name: &str,
+    command: &str,
+) -> String {
     // Normalize cwd: strip trailing `.` component the walk-up loader
     // leaves behind for `cwd = "."` in TOML. Zellij accepts it but it
     // looks ugly in the status bar and is harmless to trim.
@@ -228,7 +301,8 @@ fn render_layout(session: &Session) -> String {
         }
     };
     let cwd = escape_kdl(&cwd_path);
-    let cmd = escape_kdl(&session.command);
+    let cmd = escape_kdl(command);
+    let tab_name = escape_kdl(tab_name);
 
     // Stock zellij default — needed so status-bar + tab-bar plugins
     // render. Values match the out-of-the-box tab template.
@@ -239,13 +313,13 @@ fn render_layout(session: &Session) -> String {
     // ENTER to close" which confuses users who expect their shell
     // exit to close the session.
     let pane = if session.env.is_empty() {
-        if is_shell_command(&session.command) {
+        if is_shell_command(command) {
             // Run the shell binary directly; no `-c` wrapper.
             format!(
-                "    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"{cmd}\"\n    }}\n"
+                "        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"{cmd}\"\n        }}\n"
             )
         } else {
-            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"bash\"\n        args \"-c\" \"{cmd}\"\n    }}\n")
+            format!("        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"bash\"\n            args \"-c\" \"{cmd}\"\n        }}\n")
         }
     } else {
         let mut env_args = String::new();
@@ -253,14 +327,14 @@ fn render_layout(session: &Session) -> String {
             let pair = format!("{k}={v}");
             env_args.push_str(&format!(" \"{}\"", escape_kdl(&pair)));
         }
-        if is_shell_command(&session.command) {
-            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"env\"\n        args{env_args} \"{cmd}\"\n    }}\n")
+        if is_shell_command(command) {
+            format!("        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"env\"\n            args{env_args} \"{cmd}\"\n        }}\n")
         } else {
-            format!("    pane cwd=\"{cwd}\" close_on_exit=true {{\n        command \"env\"\n        args{env_args} \"bash\" \"-c\" \"{cmd}\"\n    }}\n")
+            format!("        pane cwd=\"{cwd}\" close_on_exit=true {{\n            command \"env\"\n            args{env_args} \"bash\" \"-c\" \"{cmd}\"\n        }}\n")
         }
     };
 
-    format!("layout {{\n{tab_template}{pane}}}\n")
+    format!("layout {{\n{tab_template}    tab name=\"{tab_name}\" {{\n{pane}    }}\n}}\n")
 }
 
 /// Is this command "just run a login shell"? Matches the bare shell
@@ -315,10 +389,10 @@ impl Multiplexer for ZellijAdapter {
         Ok(sessions.iter().any(|s| s.name == name))
     }
 
-    fn attach(&self, name: &str, mode: AttachMode) -> Result<()> {
+    fn attach(&self, name: &str, mode: AttachMode) -> Result<ClientCompletion<()>> {
         if Self::is_inside_zellij() {
             bail!(
-                "already inside a zellij session; detach first (Ctrl+Q by default) before attaching to {name:?}"
+                "already inside a zellij session; detach first (Ctrl+O then d by default) before attaching to {name:?}"
             );
         }
         // zellij has no CLI-level "detach other clients" flag. On
@@ -335,20 +409,24 @@ impl Multiplexer for ZellijAdapter {
             .arg(name)
             .status()
             .map_err(|e| friendly_io_err("spawning zellij attach", e))?;
-        if !status.success() {
-            bail!("zellij attach failed for session {name:?}");
-        }
-        Ok(())
+        Ok(ClientCompletion::from_status(status, ()))
     }
 
-    fn create_and_attach(&self, session: &Session, mpx_name: &str, mode: AttachMode) -> Result<()> {
+    fn create_and_attach(
+        &self,
+        session: &Session,
+        mpx_name: &str,
+        mode: AttachMode,
+    ) -> Result<ClientCompletion<CreationDisposition>> {
         let name = mpx_name;
         if self.has_session(name)? {
-            return self.attach(name, mode);
+            return Ok(self
+                .attach(name, mode)?
+                .map(|()| CreationDisposition::Existing));
         }
         if Self::is_inside_zellij() {
             bail!(
-                "already inside a zellij session; detach first (Ctrl+Q by default) before launching session {name:?}"
+                "already inside a zellij session; detach first (Ctrl+O then d by default) before launching session {name:?}"
             );
         }
         ensure_cwd_exists(&session.cwd)?;
@@ -368,10 +446,10 @@ impl Multiplexer for ZellijAdapter {
                 .arg("--create")
                 .status()
                 .map_err(|e| friendly_io_err("spawning zellij attach --create", e))?;
-            if !status.success() {
-                bail!("zellij failed to start session {name:?}");
-            }
-            return Ok(());
+            return Ok(ClientCompletion::from_status(
+                status,
+                CreationDisposition::Created,
+            ));
         }
 
         // Non-shell command (or env overrides): we need a layout to
@@ -394,10 +472,10 @@ impl Multiplexer for ZellijAdapter {
             .arg(&layout)
             .status()
             .map_err(|e| friendly_io_err("spawning zellij with layout", e))?;
-        if !status.success() {
-            bail!("zellij failed to start session {name:?}");
-        }
-        Ok(())
+        Ok(ClientCompletion::from_status(
+            status,
+            CreationDisposition::Created,
+        ))
     }
 
     fn kill(&self, name: &str) -> Result<()> {
@@ -408,7 +486,7 @@ impl Multiplexer for ZellijAdapter {
     }
 
     fn detach_current(&self) -> Result<()> {
-        bail!("zellij has no CLI detach action; use the multiplexer's keybind (Ctrl+Q by default)");
+        bail!("zellij has no CLI detach action; use the multiplexer's detach keybind (Ctrl+O then d by default)");
     }
 }
 
@@ -416,6 +494,11 @@ impl Multiplexer for ZellijAdapter {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[cfg(target_os = "linux")]
+    use crate::test_env::EnvSandbox;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
     fn cmd_without_config_dir_has_no_flag() {
@@ -437,6 +520,120 @@ mod tests {
             args,
             vec!["--config-dir".to_string(), "/tmp/pa-zj-cfg".to_string()]
         );
+    }
+
+    #[test]
+    fn cmd_with_runtime_dir_targets_exact_session_namespace() {
+        let command = ZellijAdapter::with_runtime_dir("/tmp/pa-zellij-runtime").cmd();
+        let runtime = command
+            .get_envs()
+            .find(|(key, _)| *key == "XDG_RUNTIME_DIR")
+            .and_then(|(_, value)| value.map(PathBuf::from));
+        assert_eq!(runtime, Some(PathBuf::from("/tmp/pa-zellij-runtime")));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_override(command: &Command) -> Option<PathBuf> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "XDG_RUNTIME_DIR")
+            .and_then(|(_, value)| value.map(PathBuf::from))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn secure_runtime_fixture(mode: u32) -> (tempfile::TempDir, u32, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let candidate = root.path().join(uid.to_string());
+        fs::create_dir(&candidate).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(mode)).unwrap();
+        (root, uid, candidate)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_runtime_env_injects_secure_systemd_directory_child_only() {
+        let _env = EnvSandbox::new().unset("XDG_RUNTIME_DIR");
+        let (root, uid, candidate) = secure_runtime_fixture(0o700);
+        let mut command = Command::new("zellij");
+
+        configure_runtime_environment_from(&mut command, root.path(), uid);
+
+        assert_eq!(runtime_override(&command), Some(candidate));
+        assert!(
+            std::env::var_os("XDG_RUNTIME_DIR").is_none(),
+            "command construction must not mutate PortAgenty's environment"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_runtime_env_is_preserved_without_child_override() {
+        let _env = EnvSandbox::new().set("XDG_RUNTIME_DIR", "/caller/runtime");
+        let (root, uid, _) = secure_runtime_fixture(0o700);
+        let mut command = Command::new("zellij");
+
+        configure_runtime_environment_from(&mut command, root.path(), uid);
+
+        assert_eq!(runtime_override(&command), None);
+        assert_eq!(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            Some(std::ffi::OsStr::new("/caller/runtime"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_directory_validation_rejects_unsafe_candidates() {
+        let uid = rustix::process::geteuid().as_raw();
+
+        let missing_root = tempfile::tempdir().unwrap();
+        assert_eq!(secure_systemd_runtime_dir(missing_root.path(), uid), None);
+
+        let file_root = tempfile::tempdir().unwrap();
+        fs::write(file_root.path().join(uid.to_string()), b"not a directory").unwrap();
+        assert_eq!(secure_systemd_runtime_dir(file_root.path(), uid), None);
+
+        let link_root = tempfile::tempdir().unwrap();
+        let link_target = tempfile::tempdir().unwrap();
+        symlink(link_target.path(), link_root.path().join(uid.to_string())).unwrap();
+        assert_eq!(secure_systemd_runtime_dir(link_root.path(), uid), None);
+
+        let (permissive_root, _, _) = secure_runtime_fixture(0o755);
+        assert_eq!(
+            secure_systemd_runtime_dir(permissive_root.path(), uid),
+            None
+        );
+
+        let foreign_uid = uid.wrapping_add(1);
+        let foreign_root = tempfile::tempdir().unwrap();
+        let foreign_candidate = foreign_root.path().join(foreign_uid.to_string());
+        fs::create_dir(&foreign_candidate).unwrap();
+        fs::set_permissions(&foreign_candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            secure_systemd_runtime_dir(foreign_root.path(), foreign_uid),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_dir_and_runtime_override_compose_on_one_command() {
+        let _env = EnvSandbox::new().unset("XDG_RUNTIME_DIR");
+        let (root, uid, candidate) = secure_runtime_fixture(0o700);
+        let adapter = ZellijAdapter::with_config_dir("/tmp/pa-zj-cfg");
+        let mut command = Command::new("zellij");
+        configure_runtime_environment_from(&mut command, root.path(), uid);
+        if let Some(dir) = &adapter.config_dir {
+            command.arg("--config-dir").arg(dir);
+        }
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["--config-dir", "/tmp/pa-zj-cfg"]);
+        assert_eq!(runtime_override(&command), Some(candidate));
     }
 
     #[test]
@@ -540,6 +737,40 @@ mod tests {
         assert!(
             layout.contains("zellij:tab-bar"),
             "missing tab-bar plugin:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_names_tab_after_declared_session() {
+        let s = Session {
+            name: r#"shell\"primary"#.into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "bash".into(),
+            kind: None,
+            env: std::collections::BTreeMap::new(),
+            description: None,
+        };
+        let layout = render_layout(&s);
+        assert!(
+            layout.contains(r#"tab name="shell\\\"primary""#),
+            "missing escaped session tab name:\n{layout}"
+        );
+    }
+
+    #[test]
+    fn render_layout_can_name_tab_after_workspace_and_session() {
+        let s = Session {
+            name: "shell".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: "bash".into(),
+            kind: None,
+            env: std::collections::BTreeMap::new(),
+            description: None,
+        };
+        let layout = render_layout_with_tab_name(&s, "project / shell");
+        assert!(
+            layout.contains(r#"tab name="project / shell""#),
+            "missing human-readable workspace/session tab name:\n{layout}"
         );
     }
 

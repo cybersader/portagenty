@@ -48,7 +48,7 @@ pressing `Esc` from the session list.
 | `A` | Toggle the archived-workspaces view |
 | `d` | Unregister workspace from global index (file stays on disk) |
 | `D` | Delete workspace file and unregister (with confirm) |
-| `X` | Kill **all** live sessions under the workspace (with confirm) |
+| `X` | Preview and stop workspace sessions: verified owned workloads use graceful + non-force systemd stop, unmanaged targets use mpx-native kill, and stale/ambiguous receipts are skipped. No bulk force escalation. |
 | `Ctrl+R` | Refresh live-session counts |
 | `?` | Help overlay |
 | `q` / `Esc` | Exit `pa` |
@@ -108,13 +108,16 @@ mouse poorly, so don't rely on it there).
 | `k` / `↑` / `Alt+K` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` / `l` / `→` | Attach-or-create the highlighted session (takeover) |
+| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, supervision-first start an eligible idle UUID-backed row (Claude kind: `3G` / `5G` / `512MiB` / `800%` / `1200`), or ordinarily create a no-ID/invalid/unsupported idle row |
 | `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `PgDn` / `PgUp` | 10-row jumps |
 | `a` | Add a new session (2-stage name → command modal) |
 | `e` | Edit session (name / cwd / command / kind / env) |
 | `d` | Delete session from workspace TOML (with confirm) |
-| `x` | Kill a live mpx session (with confirm) |
+| `S` | Advanced/custom supervision. Edit the same recommended limits, confirm-add a UUID to a legacy row, customize a stale replacement, or confirm a terminate-then-fresh-relaunch flow for a live shared row. Existing process trees are never migrated or claimed; `S` never silently falls back ordinary. |
+| `r` | Refresh resources for the selected owned workload |
+| `x` | Owned row: confirm graceful + non-force stop. Stale row: confirm receipt-only cleanup after proving the exact unit and target are absent (no signal is sent). Unmanaged row: confirm mpx-native kill. |
+| `X` | Separately confirm whole-cgroup SIGKILL for an owned-and-verified workload |
 | `z` | Toggle expand-on-select (see below) |
 | `m` | Switch workspace multiplexer (tmux ↔ zellij) |
 | `t` | Open the file tree rooted at the workspace's directory |
@@ -123,11 +126,30 @@ mouse poorly, so don't rely on it there).
 | `Esc` / `q` / `Ctrl+Q` | Back to workspace picker |
 | `Ctrl+C` | Exit `pa` directly |
 
+A receipt-backed row is non-attachable until exact reconciliation finishes. A v2
+owned row requires exact unit/InvocationID/cgroup/target plus workload
+PID/start-time/nonce proof and bounded descendant containment. A live v1 row becomes
+`legacy/restart`, attaches only to its exact target, and exposes no resource stop or
+force-kill. A `split` row can also attach to its exact target but withholds
+whole-workload metrics and control. `ambiguous` rows expose no action; a pending-launch journal blocks another supervised creation until its evidence is reconciled.
+
+If a receipt becomes `stale`, Portagenty never chases the old opaque target, and
+`X` remains unavailable because there is no verified cgroup to force-kill. On an
+idle declared row, Enter confirms one exact flow: prove the stored receipt is
+unchanged, prove both its systemd invocation and private multiplexer target absent,
+remove the receipt and durable marker without sending a signal, then create and
+attach a fresh supervised binding. Prior nonempty limits are reused; an empty prior
+policy resolves from the declared session kind. `S` exposes those values for
+editing, while `x` remains the cleanup-only option. If a real ordinary target is
+live beside the stale receipt, Enter attaches it normally instead of cleaning,
+stopping, or claiming it.
+
 ### Expand-on-select
 
 The highlighted session row expands in place to show its full
-**description**, its **real command**, and its **cwd** on dim,
-labeled lines (`desc ▸` / `cmd ▸` / `cwd ▸`). Collapsed rows stay
+**description**, its **real command**, its **cwd**, and any available
+supervised resource summary/details on labeled lines (`desc ▸` / `cmd ▸` /
+`cwd ▸` / `res ▸`). Collapsed rows stay
 one line, so the list stays scannable and only one row is ever tall.
 
 This is also how you see the real command on an **annotated** row:
@@ -180,7 +202,13 @@ entering the TUI.
 | `--dry-run` | off | Print what would happen, don't run it |
 | `--shared` | off | Don't detach other clients (see [attach modes](../../concepts/#attach-mode-takeover--shared)) |
 | `--resume` | off | Kind-aware resume. For `kind = "claude-code"` sessions, appends `--continue` before launch so Claude picks up its prior conversation. Other kinds print a one-line hint to stderr and launch unchanged. The workspace TOML command string is never mutated on disk. |
-| `--fresh` | off | Kill any existing mpx session with this name before launching. On zellij this is the only way to guarantee other clients are disconnected (zellij doesn't support per-client takeover). On tmux the default takeover already handles it — use `--fresh` only when you specifically want to wipe running state and restart from the workspace's declared command. |
+| `--fresh` | off | Kill any existing mpx session with this name before launching. On zellij this is the only way to guarantee other clients are disconnected (zellij doesn't support per-client takeover). On tmux the default takeover already handles it — use `--fresh` only when you specifically want to wipe running state and restart from the workspace's declared command. Owned supervised bindings refuse `--fresh`; stop them through `pa resources` instead. |
+| `--supervise` | off | Experimental Linux-only creation as a fresh transient systemd user service with an exact private tmux/Zellij target and versioned cgroup-v2 ownership receipt. Existing shared sessions are never claimed. |
+| `--memory-high <SIZE>` | kind-selected | Memory-reclaim threshold (`512M`, `3G`, etc.). Implies `--supervise`. Claude default: `3G`. |
+| `--memory-max <SIZE>` | kind-selected | Hard memory ceiling. Implies `--supervise`. Claude default: `5G`. |
+| `--memory-swap-max <SIZE>` | kind-selected | Hard swap ceiling. Implies `--supervise`. Claude default: `512MiB`. |
+| `--cpu-quota <PERCENT>` | kind-selected | Aggregate CPU quota; values above 100 allow multiple cores. Implies `--supervise`. Claude default: `800`. |
+| `--tasks-max <COUNT>` | kind-selected | Maximum task/thread count. Implies `--supervise`. Claude default: `1200`. |
 
 Examples:
 
@@ -190,7 +218,74 @@ pa launch claude --dry-run
 pa launch claude -w ~/code/my.portagenty.toml
 pa launch claude --shared            # leave other devices attached
 pa launch claude --resume            # claude-code → appends --continue
+pa launch claude --supervise
+pa launch claude --memory-high 2G --memory-max 4G --memory-swap-max 256MiB \
+  --cpu-quota 600 --tasks-max 1000
 ```
+
+Resource-limit flags imply supervision. Explicit CLI supervision requires a valid
+workspace UUID and a supported Linux systemd-user/cgroup-v2 environment; it never
+falls back ordinary. Exactly `kind = "claude-code"` selects the Claude defaults and
+`claude-code.slice`; a session merely named or commanded `claude` stays generic.
+Claude fields cannot be cleared and overrides must be equal to or stricter than
+`3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, and `1200`
+tasks, with MemoryHigh not exceeding MemoryMax. Generic sessions stay in normal
+user-manager placement and retain unset fields unless flags are supplied.
+
+Before a Claude-kind service is created, Portagenty verifies that the externally
+provisioned aggregate slice is structurally beneath `/claude.slice/claude-code.slice`
+with finite positive memory high/max, swap max, CPU quota, and
+`ManagedOOMPreference=omit`; aggregate `TasksMax` is optional and may be infinity,
+while every Claude service still receives finite `TasksMax`. Portagenty never
+creates or modifies the slice. Only after receipt and pending-launch state are known and non-creating
+preflight proves supervision capability/runtime unavailable does routine TUI Enter
+print a loud notice and launch ordinarily. Receipt ambiguity and every failure after
+creation may have begun remain fail-closed. Pending launches block attach, ordinary
+fallback, creation, stop, and kill until reconciled; partial artifact presence stays
+ambiguous. Private tmux servers are launched without user-bus/runtime variables to
+prevent sibling tmux scopes, while the pane receives the exact restored user bus.
+
+`S` edits all five limits or resolves cleared fields from the declared kind, can
+confirm-add a UUID to a writable legacy workspace, and can separately confirm
+termination of one exact live shared target before a fresh supervised launch. It
+does not migrate or retroactively claim the running process tree. Supervised Zellij
+layouts keep the stock tab/status bars and name the visible tab after both the
+workspace and declared session, while the private backend target remains opaque. A
+setup failure before the client starts reopens the same workspace/session row. Once
+a client actually runs and returns—normally, nonzero, by signal, or after forced
+disconnection—Portagenty prints `pa ← returned from "my-workspace / shell"` and then
+any abnormal diagnostics. No hand-back line is printed for dry runs or pre-client
+setup failures. There are no workspace-TOML enforcement fields.
+
+## `pa resources`
+
+Inspect or control only workloads Portagenty can revalidate from an exact
+machine-local ownership receipt.
+
+```sh
+pa resources capabilities
+pa resources status
+pa resources status claude
+pa resources cleanup claude
+pa resources stop claude
+pa resources kill claude --force
+```
+
+| Command | Behavior |
+|---|---|
+| `capabilities` | Reports backend, available metrics/actions, all five resource-limit kinds, and degraded or unsupported reasons. |
+| `status [session]` | Shows pending (active, dead-cleanable, or ambiguous), `owned`, `legacy-restart-required`, `split-containment`, `ambiguous-binding`, or `stale-binding` plus exact evidence, applied limits, and available/unavailable metrics. With no session, reports all declared sessions. |
+| `cleanup <session>` | Signal-free cleanup only. Removes a pending journal when its exact creator, unit, target, and marker are all absent, or removes a receipt after exact unit and target absence is revalidated. Refuses partial or live evidence. |
+| `stop <session>` | For owned-and-verified v2 containment only: revalidates ownership, requests graceful shutdown of the exact private multiplexer target, then performs a non-force systemd stop if needed. Never silently escalates to SIGKILL. |
+| `kill <session> --force` | For owned-and-verified v2 containment only: separately explicit whole-cgroup SIGKILL after immediate ownership revalidation. Refuses without `--force`. |
+
+Metrics include CPU totals/rate, cgroup-charged memory current/peak/events, swap
+current/peak/events, task/thread current/peak/events, aggregate I/O totals/rates,
+CPU/memory/I/O PSI, and cgroup state where the kernel exposes them. CPU rate may
+exceed 100% on multicore workloads. Event warnings surface deltas such as memory
+high/OOM/OOM-kill, task-limit hits, and CPU quota throttling. Portagenty keeps no
+resource history, inspects no terminal or log content, and runs no telemetry
+daemon.
 
 ## `pa claim [session]`
 

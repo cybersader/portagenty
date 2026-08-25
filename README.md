@@ -92,8 +92,10 @@ kind = "dev-server"
 EOF
 
 # 2. From any directory under the workspace file:
-pa                       # TUI — pick a session, Enter to launch
-pa launch claude         # one-shot: skip TUI, go straight to the mpx
+pa                       # TUI — Enter attaches or supervision-first starts eligible idle rows
+pa launch claude         # one-shot CLI remains ordinary unless supervision flags are explicit
+pa launch claude --supervise --memory-high 3G --memory-max 5G  # Linux containment
+pa resources status claude                    # owned workload metrics + events
 pa claim                 # cross-device takeover
 pa export -o starter.sh  # render a starter script to commit
 ```
@@ -120,11 +122,14 @@ pa                        # open the TUI
 | **Open in Terminal** | `o` in session list / tree mode / picker's reveal modal drops you into a plain shell at the chosen path — exits pa, no mpx, no session state. |
 | **pa://** URL scheme | `pa open <url>` dispatches `pa://open/<path>`, `pa://workspace/<uuid>`, `pa://launch/<uuid>/<session>`, and `pa://shell/<path>` links. `pa protocol install` registers the scheme with the OS (Linux `.desktop`, Windows / WSL registry); works with any detected or user-specified terminal emulator. |
 | **Cross-device** | `pa claim` takeover-attach. `pa launch --resume` appends `--continue` for claude-code sessions. |
+| **Resource supervision (experimental, Linux only)** | Enter is supervision-first for idle UUID-backed TUI rows. Only `kind = "claude-code"` selects Claude policy: `3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, finite per-service `1200` TasksMax, and placement beneath a pre-provisioned `claude-code.slice` whose aggregate TasksMax may remain unlimited; names and commands never imply it. Current v2 receipts prove the workload root by PID/start-time/nonce, exact tmux/Zellij target, and bounded all-thread descendant cgroup checks. Pending launches block fallback and control until reconciled; `pa resources cleanup` removes only proven-dead evidence without signalling. Legacy v1 services are exact-target attach-only until a normal restart; escaped descendants are reported as split containment, withholding whole-workload ownership and control. `S` edits equal-or-stricter Claude limits. Ordinary live sessions are never claimed or migrated. No daemon or history service. |
 | **Workspace scoping** | Session names prefixed with workspace name in the mpx (`my-project-shell`). Auto-re-register on walk-up (folder move resilience). Auto-maintained `previous_paths` when moves are detected. |
 | **Portaconv integration** | `pa convos list` / `pa convos dump <id>` forwards to [portaconv](https://github.com/cybersader/portaconv) scoped to this workspace. `pa init --with-agent-hooks` scaffolds `.mcp.json` + `.claude/` so agents self-discover the conversation extractor. |
 | **Extras** | Declarative export (`pa export`), onboarding wizard, shell completions, bundled bash snippets, per-session env vars. |
 
-**Still roadmapped**: Tags/Groups views, `pa up` eager-launch, datetime column, jump-back-to-pa from inside a session. See [ROADMAP.md](./ROADMAP.md).
+A setup failure before the multiplexer client starts reopens the same workspace and logical session row instead of dropping back to the picker or shell. Once a client actually runs and returns—normally, nonzero, by signal, or because the user was forced out—Portagenty prints the human `workspace / session` identity before any abnormal-exit diagnostics.
+
+**Still roadmapped**: Custom ordered groups, `pa up` eager-launch, datetime column, jump-back-to-pa from inside a session, non-Linux supervision adapters, and any external graphical resource dashboard. See [ROADMAP.md](./ROADMAP.md).
 
 ## What it is
 
@@ -132,11 +137,12 @@ pa                        # open the TUI
 - A **one-shot CLI** — same binary. `pa launch <name>` for scripted use; `pa` with no args for the TUI.
 - **Portable** — single static Rust binary. `scp` it to a new machine and run. No runtime to install.
 - A **workspace layer on top of the filesystem** — hierarchy on hierarchy.
-- An **attach-or-create orchestrator** over tmux and zellij.
+- An **attach-or-create orchestrator** over tmux and zellij; eligible idle TUI rows take a supervision-first create path, while live and legacy rows retain safe attach/create behavior.
+- On supported Linux hosts, a **proof-based workload containment and observation layer** for sessions Portagenty can prove it created. Scriptable CLI containment remains opt-in.
 
 ## What it is not
 
-- Not a VS Code extension. Not a browser app. Not a daemon.
+- Not a VS Code extension. Not a browser app. Not a Portagenty daemon. Experimental Linux supervision delegates workload lifetime to the existing systemd user manager.
 - Not an agent framework. It launches agents; it does not replace them.
 - Not a project scaffolder (workspace scaffolding is built in; project-level is someone else's job).
 - Not tied to one multiplexer.
@@ -173,7 +179,7 @@ Full docs: <https://cybersader.github.io/portagenty/>
 | Multiplexers | tmux + zellij | Cross-platform headless detach/reattach. |
 | Launch semantics | Workspace-scoped, lazy | Sessions spawn on first open, not on workspace entry. |
 | State store | Split: TOML config + live mpx polling | No SQLite. Inspectable files + rebuilt volatile state. |
-| Agent awareness | Agnostic core, optional `kind:` hint | `pa` doesn't parse agent state; hint unlocks integrations. |
+| Agent awareness | Agnostic core, explicit optional `kind:` selector | `pa` does not parse agent state or infer policy from names/commands; `claude-code` explicitly selects Claude-specific resume and containment behavior. |
 
 ## Non-goals
 
