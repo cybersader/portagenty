@@ -182,14 +182,17 @@ impl ZellijAdapter {
 /// path (notably Tailscale SSH) omitted `XDG_RUNTIME_DIR`. The override is
 /// child-only: PortAgenty's own environment and unrelated session commands are
 /// left untouched.
+#[cfg(target_os = "linux")]
 fn configure_runtime_environment(command: &mut Command) {
-    #[cfg(target_os = "linux")]
     configure_runtime_environment_from(
         command,
         Path::new("/run/user"),
         rustix::process::geteuid().as_raw(),
     );
 }
+
+#[cfg(not(target_os = "linux"))]
+fn configure_runtime_environment(_command: &mut Command) {}
 
 #[cfg(target_os = "linux")]
 fn configure_runtime_environment_from(command: &mut Command, root: &Path, uid: u32) {

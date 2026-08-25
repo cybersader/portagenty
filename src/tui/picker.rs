@@ -100,9 +100,15 @@ struct KillTarget {
 
 #[derive(Debug, Clone)]
 enum KillControl {
+    #[cfg(target_os = "linux")]
     Owned(Box<crate::supervision::BindingReceipt>),
-    MuxNative { mpx_name: String, tracked: bool },
-    Skipped { reason: String },
+    MuxNative {
+        mpx_name: String,
+        tracked: bool,
+    },
+    Skipped {
+        reason: String,
+    },
 }
 
 /// Destructive action awaiting user confirmation in the picker.
@@ -1251,45 +1257,37 @@ fn perform_kill_all_sessions(
                     target.display
                 )),
             },
+            #[cfg(target_os = "linux")]
             KillControl::Owned(receipt) => {
-                #[cfg(target_os = "linux")]
-                {
-                    use crate::supervision::SupervisionBackend as _;
-                    let result = (|| -> anyhow::Result<()> {
-                        let backend = supervision_backend.as_ref().map_err(|error| {
-                            anyhow::anyhow!("supervision backend unavailable: {error:#}")
-                        })?;
-                        match backend.reconcile(receipt)? {
-                            crate::supervision::OwnershipState::OwnedVerified(_) => {}
-                            state => {
-                                anyhow::bail!("ownership changed before non-force stop: {state:?}")
-                            }
+                use crate::supervision::SupervisionBackend as _;
+                let result = (|| -> anyhow::Result<()> {
+                    let backend = supervision_backend.as_ref().map_err(|error| {
+                        anyhow::anyhow!("supervision backend unavailable: {error:#}")
+                    })?;
+                    match backend.reconcile(receipt)? {
+                        crate::supervision::OwnershipState::OwnedVerified(_) => {}
+                        state => {
+                            anyhow::bail!("ownership changed before non-force stop: {state:?}")
                         }
-                        if let Err(error) = crate::cli::graceful_stop_target(&receipt.mux_target) {
-                            tracing::warn!(
-                                target = "portagenty::tui",
-                                error = %format!("{error:#}"),
-                                "bulk graceful multiplexer stop failed before systemd stop"
-                            );
-                        }
-                        let result = backend.stop_unit(receipt)?;
-                        if !result.completed {
-                            anyhow::bail!("{}", result.final_state);
-                        }
-                        crate::supervision::ReceiptStore::standard()?
-                            .remove(&receipt.logical_id)?;
-                        Ok(())
-                    })();
-                    match result {
-                        Ok(()) => stopped += 1,
-                        Err(error) => failed.push(format!("{}: {error:#}", target.display)),
                     }
+                    if let Err(error) = crate::cli::graceful_stop_target(&receipt.mux_target) {
+                        tracing::warn!(
+                            target = "portagenty::tui",
+                            error = %format!("{error:#}"),
+                            "bulk graceful multiplexer stop failed before systemd stop"
+                        );
+                    }
+                    let result = backend.stop_unit(receipt)?;
+                    if !result.completed {
+                        anyhow::bail!("{}", result.final_state);
+                    }
+                    crate::supervision::ReceiptStore::standard()?.remove(&receipt.logical_id)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => stopped += 1,
+                    Err(error) => failed.push(format!("{}: {error:#}", target.display)),
                 }
-                #[cfg(not(target_os = "linux"))]
-                failed.push(format!(
-                    "{}: resource supervision is unsupported on this platform",
-                    target.display
-                ));
             }
             KillControl::Skipped { reason } => {
                 skipped.push(format!("{}: {reason}", target.display));
@@ -1979,10 +1977,13 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
             targets,
         } => {
             let n = targets.len();
+            #[cfg(target_os = "linux")]
             let owned = targets
                 .iter()
                 .filter(|target| matches!(&target.control, KillControl::Owned(_)))
                 .count();
+            #[cfg(not(target_os = "linux"))]
+            let owned = 0usize;
             let mux_native = targets
                 .iter()
                 .filter(|target| matches!(&target.control, KillControl::MuxNative { .. }))
@@ -1992,6 +1993,7 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
                 .iter()
                 .map(|target| {
                     let tag = match &target.control {
+                        #[cfg(target_os = "linux")]
                         KillControl::Owned(_) => "owned: graceful + non-force systemd stop".into(),
                         KillControl::MuxNative { tracked, .. } => format!(
                             "{}: multiplexer-native kill",
@@ -2312,6 +2314,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bulk_stop_confirmation_names_each_control_path_and_skips_ambiguity() {
         let receipt = crate::supervision::BindingReceipt {

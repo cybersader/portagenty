@@ -13,9 +13,10 @@ use crate::mux::{
     AttachMode, ClientCompletion, ClientExit, Multiplexer, TmuxAdapter, ZellijAdapter,
 };
 use crate::supervision::model::{parse_cpu_quota, parse_memory_size, parse_tasks_max};
+use crate::supervision::{BindingReceipt, CapabilityState, MuxTarget, ResourceLimits};
+#[cfg(target_os = "linux")]
 use crate::supervision::{
-    BindingReceipt, CapabilityState, LimitKind, LogicalSessionId, MetricValue, MuxTarget,
-    OwnershipState, ResourceLimits, ResourceSnapshot, SupervisionBackend,
+    LimitKind, LogicalSessionId, MetricValue, OwnershipState, ResourceSnapshot, SupervisionBackend,
 };
 
 #[derive(Debug, Parser)]
@@ -692,6 +693,7 @@ fn parse_resource_limits(
 }
 
 pub(crate) enum RoutineSupervisedLaunch {
+    #[cfg(target_os = "linux")]
     ClientReturned(ClientCompletion<()>),
     FallbackSafe(anyhow::Error),
 }
@@ -907,6 +909,7 @@ pub(crate) fn launch_supervised_routine_resolved(
     )))
 }
 
+#[cfg(target_os = "linux")]
 fn effective_stale_replacement_limits(
     kind: Option<crate::domain::SessionKind>,
     legacy_receipt: bool,
@@ -1037,6 +1040,7 @@ pub(crate) fn attach_receipted_target(
     bail!("receipted resource targets are currently supported only on Linux")
 }
 
+#[cfg(target_os = "linux")]
 fn print_limits(out: &mut impl Write, limits: &ResourceLimits) -> Result<()> {
     writeln!(
         out,
@@ -1081,6 +1085,7 @@ fn print_limits(out: &mut impl Write, limits: &ResourceLimits) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn format_bytes(value: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -1097,6 +1102,7 @@ fn format_bytes(value: u64) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn metric_counter(snapshot: &ResourceSnapshot, group: &str, key: &str) -> Option<u64> {
     let metric = match group {
         "memory" => &snapshot.memory_events,
@@ -1110,6 +1116,7 @@ fn metric_counter(snapshot: &ResourceSnapshot, group: &str, key: &str) -> Option
     }
 }
 
+#[cfg(target_os = "linux")]
 fn print_resource_event_notice(previous: Option<&ResourceSnapshot>, current: &ResourceSnapshot) {
     let Some(previous) = previous else {
         return;
@@ -1343,6 +1350,7 @@ fn print_resource_status(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn print_snapshot(snapshot: &ResourceSnapshot) {
     println!(
         "captured at: {} ms since epoch",
@@ -1389,6 +1397,7 @@ fn print_snapshot(snapshot: &ResourceSnapshot) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn metric_bytes(metric: &MetricValue<u64>) -> String {
     match metric {
         MetricValue::Value(value) => format_bytes(*value),
@@ -1398,6 +1407,7 @@ fn metric_bytes(metric: &MetricValue<u64>) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn metric_u64(metric: &MetricValue<u64>) -> String {
     match metric {
         MetricValue::Value(value) => value.to_string(),
@@ -1407,6 +1417,7 @@ fn metric_u64(metric: &MetricValue<u64>) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn metric_number(metric: &MetricValue<f64>, suffix: &str) -> String {
     match metric {
         MetricValue::Value(value) => format!("{value:.2}{suffix}"),
@@ -1416,6 +1427,7 @@ fn metric_number(metric: &MetricValue<f64>, suffix: &str) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn metric_debug<T: std::fmt::Debug>(metric: &MetricValue<T>) -> String {
     match metric {
         MetricValue::Value(value) => format!("{value:?}"),
@@ -2745,6 +2757,7 @@ mod return_banner_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stale_replacement_limits_use_current_kind_policy_before_cleanup() {
         let legacy_claude = ResourceLimits {

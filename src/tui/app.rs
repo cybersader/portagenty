@@ -4,7 +4,9 @@
 //! `domain::Workspace`. Two-pane project/session layouts and the
 //! Tags / Custom Groups views come in v1.x per `ROADMAP.md`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -16,10 +18,9 @@ use ratatui::{
 
 use crate::domain::{Session, Workspace};
 use crate::mux::{Multiplexer, SessionInfo};
-use crate::supervision::{
-    BindingReceipt, LogicalSessionId, MetricValue, ResourceLimits, ResourceSnapshot,
-    SupervisionBackend,
-};
+use crate::supervision::{BindingReceipt, LogicalSessionId, ResourceLimits};
+#[cfg(target_os = "linux")]
+use crate::supervision::{MetricValue, ResourceSnapshot, SupervisionBackend};
 use crate::tui::view::{build_rows, RowOwnership, SessionRow, SessionState};
 
 /// Why the user requested a supervised launch. Only the routine Enter path is
@@ -183,8 +184,11 @@ pub struct App {
     receipts: BTreeMap<LogicalSessionId, BindingReceipt>,
     #[cfg(target_os = "linux")]
     pending_launches: BTreeMap<LogicalSessionId, crate::supervision::PendingLaunch>,
+    #[cfg(target_os = "linux")]
     resource_snapshots: BTreeMap<LogicalSessionId, ResourceSnapshot>,
+    #[cfg(target_os = "linux")]
     resource_refresh_pending: HashSet<LogicalSessionId>,
+    #[cfg(target_os = "linux")]
     last_resource_sample: std::time::Instant,
     #[cfg(target_os = "linux")]
     resource_worker: Option<crate::tui::resources::ResourceWorker>,
@@ -405,8 +409,11 @@ impl App {
             receipts: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             pending_launches: BTreeMap::new(),
+            #[cfg(target_os = "linux")]
             resource_snapshots: BTreeMap::new(),
+            #[cfg(target_os = "linux")]
             resource_refresh_pending: HashSet::new(),
+            #[cfg(target_os = "linux")]
             last_resource_sample: std::time::Instant::now(),
             #[cfg(target_os = "linux")]
             resource_worker: None,
@@ -444,6 +451,7 @@ impl App {
         self
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn workspace_id(&self) -> Option<&str> {
         self.workspace.id.as_deref()
     }
@@ -1927,84 +1935,82 @@ impl App {
                     self.set_status(format!("supervised restart preparation failed: {error:#}"));
                 }
             },
+            #[cfg(target_os = "linux")]
             PendingAction::StopOwned {
                 display_name,
                 receipt,
                 force,
             } => {
-                #[cfg(target_os = "linux")]
-                {
-                    let outcome = (|| -> Result<crate::supervision::ActionResult> {
-                        let backend = crate::supervision::LinuxSystemdBackend::connect()?;
-                        match backend.reconcile(&receipt)? {
-                            crate::supervision::OwnershipState::OwnedVerified(_) => {}
-                            state => {
-                                anyhow::bail!("ownership changed before control action: {state:?}")
-                            }
-                        }
-                        if force {
-                            backend.force_kill(&receipt)
-                        } else {
-                            if let Err(error) =
-                                crate::cli::graceful_stop_target(&receipt.mux_target)
-                            {
-                                tracing::warn!(
-                                    target = "portagenty::tui",
-                                    error = %format!("{error:#}"),
-                                    "graceful multiplexer stop failed before systemd stop"
-                                );
-                            }
-                            backend.stop_unit(&receipt)
-                        }
-                    })();
-                    match outcome {
-                        Ok(result) => {
-                            if result.completed {
-                                if let Ok(store) = crate::supervision::ReceiptStore::standard() {
-                                    let _ = store.remove(&receipt.logical_id);
-                                }
-                                self.receipts.remove(&receipt.logical_id);
-                                self.resource_snapshots.remove(&receipt.logical_id);
-                                self.reload_workspace();
-                            }
-                            self.set_status(format!("{display_name:?}: {}", result.final_state));
-                        }
-                        Err(error) => {
-                            self.set_status(format!("resource control failed: {error:#}"));
+                let outcome = (|| -> Result<crate::supervision::ActionResult> {
+                    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+                    match backend.reconcile(&receipt)? {
+                        crate::supervision::OwnershipState::OwnedVerified(_) => {}
+                        state => {
+                            anyhow::bail!("ownership changed before control action: {state:?}")
                         }
                     }
+                    if force {
+                        backend.force_kill(&receipt)
+                    } else {
+                        if let Err(error) = crate::cli::graceful_stop_target(&receipt.mux_target) {
+                            tracing::warn!(
+                                target = "portagenty::tui",
+                                error = %format!("{error:#}"),
+                                "graceful multiplexer stop failed before systemd stop"
+                            );
+                        }
+                        backend.stop_unit(&receipt)
+                    }
+                })();
+                match outcome {
+                    Ok(result) => {
+                        if result.completed {
+                            if let Ok(store) = crate::supervision::ReceiptStore::standard() {
+                                let _ = store.remove(&receipt.logical_id);
+                            }
+                            self.receipts.remove(&receipt.logical_id);
+                            self.resource_snapshots.remove(&receipt.logical_id);
+                            self.reload_workspace();
+                        }
+                        self.set_status(format!("{display_name:?}: {}", result.final_state));
+                    }
+                    Err(error) => {
+                        self.set_status(format!("resource control failed: {error:#}"));
+                    }
                 }
-                #[cfg(not(target_os = "linux"))]
+            }
+            #[cfg(not(target_os = "linux"))]
+            PendingAction::StopOwned { .. } => {
                 self.set_status("resource control is unsupported on this platform");
             }
+            #[cfg(target_os = "linux")]
             PendingAction::RemoveStaleReceipt {
                 display_name,
                 receipt,
             } => {
-                #[cfg(target_os = "linux")]
-                {
-                    let outcome = (|| -> Result<()> {
-                        let backend = crate::supervision::LinuxSystemdBackend::connect()?;
-                        let store = crate::supervision::ReceiptStore::standard()?;
-                        backend.remove_stale_binding(&store, &receipt)
-                    })();
-                    match outcome {
-                        Ok(()) => {
-                            self.receipts.remove(&receipt.logical_id);
-                            self.resource_snapshots.remove(&receipt.logical_id);
-                            self.resource_refresh_pending.remove(&receipt.logical_id);
-                            let live = self.mux.list_sessions().unwrap_or_default();
-                            self.rebuild_rows(&live);
-                            self.set_status(format!(
-                                "cleared dead receipt for {display_name:?}; no process was signalled"
-                            ));
-                        }
-                        Err(error) => {
-                            self.set_status(format!("stale receipt cleanup refused: {error:#}"));
-                        }
+                let outcome = (|| -> Result<()> {
+                    let backend = crate::supervision::LinuxSystemdBackend::connect()?;
+                    let store = crate::supervision::ReceiptStore::standard()?;
+                    backend.remove_stale_binding(&store, &receipt)
+                })();
+                match outcome {
+                    Ok(()) => {
+                        self.receipts.remove(&receipt.logical_id);
+                        self.resource_snapshots.remove(&receipt.logical_id);
+                        self.resource_refresh_pending.remove(&receipt.logical_id);
+                        let live = self.mux.list_sessions().unwrap_or_default();
+                        self.rebuild_rows(&live);
+                        self.set_status(format!(
+                            "cleared dead receipt for {display_name:?}; no process was signalled"
+                        ));
+                    }
+                    Err(error) => {
+                        self.set_status(format!("stale receipt cleanup refused: {error:#}"));
                     }
                 }
-                #[cfg(not(target_os = "linux"))]
+            }
+            #[cfg(not(target_os = "linux"))]
+            PendingAction::RemoveStaleReceipt { .. } => {
                 self.set_status("stale receipt cleanup is unsupported on this platform");
             }
             PendingAction::ReplaceStaleBinding { .. } => {
@@ -3059,6 +3065,7 @@ fn clip_end(s: &str, width: usize) -> String {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn resource_summary(snapshot: &ResourceSnapshot) -> String {
     let cpu = match &snapshot.cpu_percent {
         MetricValue::Value(value) => format!("CPU {value:.0}%"),
@@ -3079,6 +3086,7 @@ fn resource_summary(snapshot: &ResourceSnapshot) -> String {
     format!("{cpu} · {memory} · {swap} · {tasks}")
 }
 
+#[cfg(target_os = "linux")]
 fn resource_details(snapshot: &ResourceSnapshot) -> Vec<String> {
     let mut details = Vec::new();
     if let MetricValue::Value(events) = &snapshot.memory_events {
@@ -3110,6 +3118,7 @@ fn resource_details(snapshot: &ResourceSnapshot) -> Vec<String> {
     details
 }
 
+#[cfg(target_os = "linux")]
 fn resource_event_notice(
     previous: Option<&ResourceSnapshot>,
     current: &ResourceSnapshot,
@@ -3147,6 +3156,7 @@ fn resource_event_notice(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn compact_bytes(value: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
