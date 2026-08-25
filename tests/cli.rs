@@ -141,6 +141,7 @@ kind = "claude-code"
     tmp.child("supervised.portagenty.toml").path().to_path_buf()
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn supervised_launch_dry_run_prints_resource_limits() {
     let tmp = assert_fs::TempDir::new().unwrap();
@@ -175,6 +176,7 @@ fn supervised_launch_dry_run_prints_resource_limits() {
         .stdout(contains("1200"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn guardrail_flag_implies_supervision() {
     let tmp = assert_fs::TempDir::new().unwrap();
@@ -203,6 +205,7 @@ fn claude_policy_rejects_weaker_override() {
         .stderr(contains("weaker than the standard policy"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn generic_session_does_not_inherit_claude_defaults_from_its_name() {
     let tmp = assert_fs::TempDir::new().unwrap();
