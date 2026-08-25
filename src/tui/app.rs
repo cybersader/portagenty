@@ -334,6 +334,7 @@ enum PendingAction {
         assign_workspace_id: bool,
         restart_live: bool,
     },
+    #[cfg(target_os = "linux")]
     StopOwned {
         display_name: String,
         receipt: Box<BindingReceipt>,
@@ -342,6 +343,7 @@ enum PendingAction {
     /// Remove one exact receipt only after the backend proves both its
     /// systemd invocation and private multiplexer target are absent.
     /// This action never sends a signal.
+    #[cfg(target_os = "linux")]
     RemoveStaleReceipt {
         display_name: String,
         receipt: Box<BindingReceipt>,
@@ -1111,6 +1113,7 @@ impl App {
             return;
         }
         match row.ownership {
+            #[cfg(target_os = "linux")]
             RowOwnership::Owned => {
                 let Some(logical_id) = row.logical_id.clone() else {
                     self.set_status("x: owned row is missing its logical identity");
@@ -1125,6 +1128,12 @@ impl App {
                     receipt: Box::new(receipt),
                     force: false,
                 });
+            }
+            #[cfg(not(target_os = "linux"))]
+            RowOwnership::Owned => {
+                self.set_status(
+                    "x: receipt-backed resource control is unsupported on this platform",
+                );
             }
             RowOwnership::LegacyRestartRequired => {
                 self.set_status(
@@ -1144,6 +1153,7 @@ impl App {
             RowOwnership::Ambiguous => {
                 self.set_status("x: ownership is ambiguous; no control action is allowed");
             }
+            #[cfg(target_os = "linux")]
             RowOwnership::Stale => {
                 let Some(logical_id) = row.logical_id.clone() else {
                     self.set_status("x: stale row is missing its logical identity");
@@ -1158,6 +1168,10 @@ impl App {
                     receipt: Box::new(receipt),
                 });
             }
+            #[cfg(not(target_os = "linux"))]
+            RowOwnership::Stale => {
+                self.set_status("x: stale receipt cleanup is unsupported on this platform");
+            }
             _ if row.state == SessionState::NotStarted => {
                 self.set_status("x: no live session to stop on this row (it's idle)");
             }
@@ -1171,6 +1185,7 @@ impl App {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn open_force_kill_prompt(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -1192,6 +1207,11 @@ impl App {
             receipt: Box::new(receipt),
             force: true,
         });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open_force_kill_prompt(&mut self) {
+        self.set_status("X: receipt-backed force-kill is unsupported on this platform");
     }
 
     fn open_supervise_modal(&mut self) {
@@ -1979,10 +1999,6 @@ impl App {
                     }
                 }
             }
-            #[cfg(not(target_os = "linux"))]
-            PendingAction::StopOwned { .. } => {
-                self.set_status("resource control is unsupported on this platform");
-            }
             #[cfg(target_os = "linux")]
             PendingAction::RemoveStaleReceipt {
                 display_name,
@@ -2008,10 +2024,6 @@ impl App {
                         self.set_status(format!("stale receipt cleanup refused: {error:#}"));
                     }
                 }
-            }
-            #[cfg(not(target_os = "linux"))]
-            PendingAction::RemoveStaleReceipt { .. } => {
-                self.set_status("stale receipt cleanup is unsupported on this platform");
             }
             PendingAction::ReplaceStaleBinding { .. } => {
                 self.set_status("stale replacement must be handed to the launch coordinator");
@@ -3429,6 +3441,7 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
                 )
             }
         }
+        #[cfg(target_os = "linux")]
         PendingAction::StopOwned {
             display_name,
             force,
@@ -3453,6 +3466,7 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
                 )
             }
         }
+        #[cfg(target_os = "linux")]
         PendingAction::RemoveStaleReceipt { display_name, .. } => (
             "Clear dead ownership receipt".into(),
             format!(
