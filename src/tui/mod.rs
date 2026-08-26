@@ -399,8 +399,6 @@ fn run_session_tui(
     let mut app = App::new(workspace, mux, live);
     #[cfg(target_os = "linux")]
     {
-        let current_boot_id = crate::supervision::linux_systemd::read_current_boot_id().ok();
-        app = app.with_current_boot_id(current_boot_id);
         match crate::supervision::ReceiptStore::standard().and_then(|store| store.load()) {
             Ok(file) => {
                 let receipts = receipts_for_workspace(app.workspace_id(), file.bindings);
@@ -517,15 +515,12 @@ fn run_session_tui(
             session,
             receipt,
             limits,
-            prior_boot_relaunch,
         }) => {
             ratatui::restore();
-            if prior_boot_relaunch {
-                eprintln!();
-                eprintln!(
-                    "  pa: revalidating the exact prior-boot stale binding and relaunching without signalling the old workload."
-                );
-            }
+            eprintln!();
+            eprintln!(
+                "  pa: revalidating the exact stale binding and relaunching supervised without signalling any workload."
+            );
             print_launch_banner(mpx_kind, &session.name);
             let session_name = session.name.clone();
             classify_launch_result(

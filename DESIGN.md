@@ -216,12 +216,12 @@ When the user selects a session and hits Enter, ownership and live state determi
 4. A live ordinary or untracked target attaches in place; Enter never kills, migrates, or retroactively claims it.
 5. An idle UUID-backed `supervisable` row uses supervision-first creation. `kind = "claude-code"` selects the Claude defaults (`3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, `1200` tasks); generic kinds remain generic and receive no implied Claude policy.
 6. An idle legacy/no-ID, malformed-ID, or genuinely unsupported row retains ordinary `create_and_attach`; malformed identity remains ineligible for supervision.
-7. An idle stale declared row reuses its saved nonempty limits, or the declared kind defaults when the saved policy is empty. Enter directly dispatches the existing exact signal-free cleanup/relaunch coordinator only after a successful current-v2 stale reconciliation and valid unequal stored/current boot IDs prove that receipt came from a prior boot. An actual stale row with same, missing, malformed, or unreadable boot evidence retains the exact `y/N` replacement confirmation. A stale receipt beside a real live ordinary target follows rule 4 instead.
+7. An idle stale declared row reuses its saved nonempty limits, or the declared kind defaults when the saved policy is empty. A completed error-free stale reconciliation directly dispatches the existing exact signal-free cleanup/relaunch coordinator. That coordinator remains authoritative: it revalidates the unchanged receipt, pending absence, exact systemd invocation, exact private target, durable marker, capabilities, limits, and ordinary-target races before cleanup or creation, and refuses if the evidence changes. Optional boot provenance does not gate this path. A stale receipt beside a real live ordinary target follows rule 4 instead.
 8. Pending, ambiguous, errored, or unreconciled receipt evidence blocks Enter until exact reconciliation reaches a safe state. Split containment follows rule 3 and attaches only to its exact private target.
 
-This is imperative and on-demand. A workspace with 20 sessions defined never costs 20 startup processes: Portagenty launches only the session the user opens. Prior-boot provenance does not add TUI-startup mutation, bulk startup launch, or automatic relaunch of every stale row.
+This is imperative and on-demand. A workspace with 20 sessions defined never costs 20 startup processes: Portagenty launches only the session the user opens. Stale reconciliation does not add TUI-startup mutation, bulk startup launch, or automatic relaunch of every stale row.
 
-**Eager / "jump-in" launch** remains a deferred idea rather than part of the current supervision contract. Any future bulk launch must be an explicit user action and must not be inferred from stored prior-boot receipts.
+**Eager / "jump-in" launch** remains a deferred idea rather than part of the current supervision contract. Any future bulk launch must be an explicit user action and must not be inferred from stored stale receipts.
 
 ### Experimental Linux resource supervision
 

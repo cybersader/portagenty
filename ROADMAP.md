@@ -460,14 +460,13 @@ The implementation includes:
   single best-effort observation; live v1 services are legacy/restart-required
   exact-target attach-only, both unit and target absent may stale-clean, and
   partial presence remains ambiguous. Boot provenance is non-authoritative and
-  malformed/missing hints only disable modal bypass;
-- direct routine Enter for an idle current-v2 stale row only after an error-free
-  exact stale reconciliation and valid unequal launch/current boot IDs. The same
-  locked cleanup/relaunch coordinator revalidates every artifact and sends no
-  signal to the old workload. An actual stale row with same, missing, invalid, or
-  read-failed boot evidence retains `y/N`; pending, ambiguous, errored, and
-  unreconciled evidence blocks Enter, while split containment attaches only to its
-  exact private target;
+  does not gate stale-row Enter;
+- direct routine Enter for any idle declared stale row after an error-free exact
+  stale reconciliation. The same locked cleanup/relaunch coordinator revalidates
+  the unchanged receipt, pending absence, unit, target, marker, capabilities,
+  limits, and ordinary-target races before cleanup or creation and sends no signal
+  to an old workload. Pending, ambiguous, errored, and unreconciled evidence blocks
+  Enter, while split containment attaches only to its exact private target;
 - pending creator reconciliation where a valid boot mismatch proves only creator
   absence and `Dead` still requires exact unit, private target, and marker absence;
   missing/invalid/read-failed boot evidence retains PID/start-time checks;
@@ -490,8 +489,8 @@ monitor, restart manager, unattended telemetry service, TUI-startup mutation, or
 bulk startup relaunch. Portagenty observes but does not create or modify the
 aggregate Claude slice. Existing services and live ordinary multiplexer sessions
 are not stopped, migrated, upgraded, or retroactively claimed. `S` remains custom
-limit editing. `x` means signal-free cleanup-only on stale rows, confirmed
-graceful/non-force stop on owned rows, and confirmed multiplexer-native kill on
+limit editing. `x` means confirmed signal-free cleanup-only on stale rows,
+confirmed graceful/non-force stop on owned rows, and confirmed multiplexer-native kill on
 unmanaged live rows. `X` remains separately confirmed force-kill. `MemoryHigh`
 remains a reclaim threshold; `MemoryMax` and
 `MemorySwapMax` are hard ceilings.

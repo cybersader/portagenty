@@ -1158,7 +1158,7 @@ impl LinuxSystemdBackend {
                 .ok_or_else(|| anyhow!("the stale receipt is no longer present"))?;
             let current = &file.bindings[index];
             if current != expected {
-                bail!("the ownership receipt changed after confirmation; refresh and retry");
+                bail!("the ownership receipt changed before cleanup; refresh and retry");
             }
             if self.identity_if_present(current)?.is_some() {
                 bail!("the exact systemd invocation is still present; no receipt was removed");
@@ -3339,7 +3339,7 @@ mod tests {
             .remove_stale_binding_with_probe(&store, &expected, |_| Ok(false))
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("changed after confirmation"));
+        assert!(format!("{error:#}").contains("changed before cleanup"));
         assert_eq!(store.find(&expected.logical_id).unwrap(), Some(replacement));
     }
 

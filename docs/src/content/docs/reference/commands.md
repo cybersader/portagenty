@@ -108,7 +108,7 @@ mouse poorly, so don't rely on it there).
 | `k` / `↑` / `Alt+K` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, supervision-first start an eligible idle UUID-backed row (Claude kind: `3G` / `5G` / `512MiB` / `800%` / `1200`), directly relaunch one successfully reconciled current-v2 prior-boot stale row through the existing exact signal-free coordinator, or ordinarily create a no-ID/invalid/unsupported idle row |
+| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, supervision-first start an eligible idle UUID-backed row (Claude kind: `3G` / `5G` / `512MiB` / `800%` / `1200`), directly relaunch any safely reconciled idle stale row through the existing exact signal-free coordinator, or ordinarily create a no-ID/invalid/unsupported idle row |
 | `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `PgDn` / `PgUp` | 10-row jumps |
 | `a` | Add a new session (2-stage name → command modal) |
@@ -133,27 +133,27 @@ PID/start-time/nonce proof and bounded descendant containment. A live v1 row bec
 force-kill. A `split` row can also attach to its exact target but withholds
 whole-workload metrics and control. `ambiguous` rows expose no action; a pending-launch journal blocks another supervised creation until its evidence is reconciled.
 Optional launch/creator boot UUIDs are non-authoritative provenance: malformed,
-missing, or unreadable values do not invalidate otherwise complete receipt state and
-only disable direct prior-boot Enter.
+missing, or unreadable values do not invalidate otherwise complete receipt state or
+gate stale-row Enter.
 
 If a receipt becomes `stale`, Portagenty never chases the old opaque target, and
 `X` remains unavailable because there is no verified cgroup to force-kill. On an
-idle declared row, Enter uses one exact flow: prove the stored receipt is unchanged,
-prove both its systemd invocation and private multiplexer target absent, remove the
-receipt and durable marker without sending a signal, then create and attach a fresh
-supervised binding. A successful error-free current-v2 stale reconciliation with
-valid unequal stored/current boot IDs dispatches that existing coordinator directly;
-an actual stale row with same-boot, missing, invalid, or boot-read-error evidence
-retains the exact `y/N` confirmation. Pending, ambiguous, worker-error, and
-unreconciled evidence blocks Enter; split containment attaches only to its exact
-private target. Prior nonempty limits are reused; an empty prior policy resolves from
-the declared session kind. `S` exposes those values for editing. `x` means
-cleanup-only on a stale row, confirmed graceful/non-force stop on an owned row, and
-confirmed multiplexer-native kill on an unmanaged live row; `X` remains separately
-confirmed force-kill. If a real ordinary target is live
-beside the stale receipt, Enter attaches it normally instead of cleaning, stopping,
-or claiming it. Portagenty does not launch stale rows at TUI startup and provides no
-bulk startup relaunch.
+idle declared row, a completed error-free stale reconciliation dispatches the
+existing cleanup/relaunch coordinator directly. The coordinator remains authoritative:
+it proves the stored receipt is unchanged, pending evidence is absent, the exact
+systemd invocation and private multiplexer target are absent, and the durable marker,
+capabilities, limits, and ordinary-target races are safe before removing anything or
+creating a fresh supervised binding. It sends no signal to an old workload and may
+still refuse if the evidence changes. Optional boot provenance does not gate Enter.
+Pending, ambiguous, worker-error, and unreconciled evidence blocks Enter; split
+containment attaches only to its exact private target. Prior nonempty limits are
+reused; an empty prior policy resolves from the declared session kind. `S` exposes
+those values for editing. `x` means confirmed cleanup-only on a stale row, confirmed
+graceful/non-force stop on an owned row, and confirmed multiplexer-native kill on an
+unmanaged live row; `X` remains separately confirmed force-kill. If a real ordinary
+target is live beside the stale receipt, Enter attaches it normally instead of
+cleaning, stopping, or claiming it. Portagenty does not launch stale rows at TUI
+startup and provides no bulk startup relaunch.
 
 ### Expand-on-select
 

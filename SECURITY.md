@@ -57,7 +57,7 @@ private multiplexer target, resolved limits, requested slice, and workload-ancho
 evidence (nonce, marker, PID, and `/proc` start time). Current v2 receipts and
 pending journals may also carry optional Linux boot-ID provenance. These UUID
 strings are non-authoritative hints: malformed or missing values do not invalidate
-the store and only disable direct prior-boot Enter. A pending-launch journal
+the store or gate stale-row Enter. A pending-launch journal
 protects the interval between transient-unit creation and durable receipt
 persistence. The store uses a private directory, mode-`0600` files, advisory
 locking, same-directory temporary writes, fsync, and atomic rename.
@@ -77,17 +77,17 @@ Existing v1 services remain legacy/restart-required exact-target attach-only unt
 they exit and are launched normally under v2. Portagenty does not auto-stop,
 upgrade, or migrate them. Both the stored unit and target absent may permit
 signal-free stale cleanup; partial presence is ambiguous and disables control.
-Only a successful, error-free current-v2 stale reconciliation plus valid unequal
-launch/current boot IDs authorizes routine Enter to bypass the replacement modal.
-The existing locked coordinator still revalidates the exact receipt, unit, target,
-marker, pending absence, and races before relaunch and sends no signal to the old
-workload. An actual stale row with same, missing, invalid, or unreadable boot
-evidence retains replacement confirmation. Pending, ambiguous, errored, and
-unreconciled evidence blocks Enter; split containment attaches only to its exact
-private target. `S` remains custom-limit editing. `x` is row-scoped: stale means
-signal-free cleanup-only, owned means confirmed graceful/non-force stop, and
-unmanaged live means confirmed multiplexer-native kill. `X` remains separately
-confirmed force-kill. No boot hint causes startup or bulk launch.
+Any successful, error-free stale reconciliation authorizes routine Enter to dispatch
+the existing locked cleanup/relaunch coordinator directly. The coordinator remains
+authoritative: it revalidates the exact receipt, pending absence, unit, target,
+marker, capabilities, limits, and ordinary-target races before cleanup or creation,
+and sends no signal to an old workload. Optional launch/current boot IDs do not gate
+this path. Pending, ambiguous, errored, and unreconciled evidence blocks Enter;
+split containment attaches only to its exact private target. `S` remains custom-limit
+editing. `x` is row-scoped: stale means confirmed signal-free cleanup-only, owned
+means confirmed graceful/non-force stop, and unmanaged live means confirmed
+multiplexer-native kill. `X` remains separately confirmed force-kill. No stale
+receipt or boot hint causes startup or bulk launch.
 Pending launches record exact creator process proof and block attach, fallback,
 creation, stop, and kill. A valid unequal stored/current boot ID proves only that
 the creator is gone; same, missing, invalid, or unreadable boot evidence retains
