@@ -66,6 +66,7 @@ pub enum LaunchKind {
         session: Session,
         receipt: Box<BindingReceipt>,
         limits: ResourceLimits,
+        prior_boot_relaunch: bool,
     },
     /// Already live on the workspace's ordinary shared multiplexer target.
     Attach {
@@ -120,6 +121,7 @@ pub enum Action {
         session: Session,
         receipt: Box<BindingReceipt>,
         limits: ResourceLimits,
+        prior_boot_relaunch: bool,
     },
     /// `o` pressed — ask the outer driver to exit pa and spawn a
     /// plain shell at the given directory. From the session list's
@@ -192,6 +194,10 @@ pub struct App {
     last_resource_sample: std::time::Instant,
     #[cfg(target_os = "linux")]
     resource_worker: Option<crate::tui::resources::ResourceWorker>,
+    #[cfg(target_os = "linux")]
+    current_boot_id: Option<String>,
+    #[cfg(target_os = "linux")]
+    proven_prior_boot_stale: HashSet<LogicalSessionId>,
     supervising: Option<SuperviseState>,
     supervision_preflight: fn() -> Result<()>,
     supervision_evidence_available: bool,
@@ -419,10 +425,21 @@ impl App {
             last_resource_sample: std::time::Instant::now(),
             #[cfg(target_os = "linux")]
             resource_worker: None,
+            #[cfg(target_os = "linux")]
+            current_boot_id: None,
+            #[cfg(target_os = "linux")]
+            proven_prior_boot_stale: HashSet::new(),
             supervising: None,
             supervision_preflight: default_supervision_preflight,
             supervision_evidence_available: true,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_current_boot_id(mut self, current_boot_id: Option<String>) -> Self {
+        self.current_boot_id = current_boot_id;
+        self.proven_prior_boot_stale.clear();
+        self
     }
 
     #[cfg(target_os = "linux")]
@@ -436,6 +453,7 @@ impl App {
         receipts: Vec<BindingReceipt>,
         pending_launches: Vec<crate::supervision::PendingLaunch>,
     ) -> Self {
+        self.proven_prior_boot_stale.clear();
         self.receipts = receipts
             .into_iter()
             .map(|receipt| (receipt.logical_id.clone(), receipt))
@@ -536,7 +554,7 @@ impl App {
                 self.rows.push(SessionRow {
                     mpx_name: target_name,
                     display_name: receipt.logical_id.session_name.clone(),
-                    state: SessionState::Untracked,
+                    state: SessionState::NotStarted,
                     logical_id: Some(receipt.logical_id.clone()),
                     mux_target: Some(receipt.mux_target.clone()),
                     ownership,
@@ -556,6 +574,7 @@ impl App {
     #[cfg(target_os = "linux")]
     fn apply_pending_annotations(&mut self) {
         for pending in self.pending_launches.values() {
+            self.proven_prior_boot_stale.remove(&pending.logical_id);
             let target_name = match &pending.mux_target {
                 crate::supervision::MuxTarget::TmuxPrivate { session, .. }
                 | crate::supervision::MuxTarget::TmuxShared { session }
@@ -861,6 +880,15 @@ impl App {
                     } else {
                         receipt.limits.clone()
                     };
+                    #[cfg(target_os = "linux")]
+                    if self.proven_prior_boot_stale.contains(&logical_id) {
+                        return self.reduce_action(Action::LaunchStaleSupervised {
+                            session,
+                            receipt: Box::new(receipt),
+                            limits,
+                            prior_boot_relaunch: true,
+                        });
+                    }
                     self.pending = Some(PendingAction::ReplaceStaleBinding {
                         session,
                         receipt: Box::new(receipt),
@@ -895,10 +923,12 @@ impl App {
                 session,
                 receipt,
                 limits,
+                prior_boot_relaunch,
             } => Some(AppOutcome::Launch(LaunchKind::ReplaceStaleSupervised {
                 session,
                 receipt,
                 limits,
+                prior_boot_relaunch,
             })),
             Action::OpenShellAt(dir) => Some(AppOutcome::OpenShellAt(dir)),
         }
@@ -990,6 +1020,32 @@ impl App {
     }
 
     #[cfg(target_os = "linux")]
+    fn update_prior_boot_stale_provenance(&mut self, result: &crate::tui::resources::SampleResult) {
+        self.proven_prior_boot_stale.remove(&result.logical_id);
+        if self.pending_launches.contains_key(&result.logical_id)
+            || result.error.is_some()
+            || !matches!(
+                result.ownership,
+                crate::supervision::OwnershipState::StaleBinding(_)
+            )
+        {
+            return;
+        }
+        let Some(receipt) = self.receipts.get(&result.logical_id) else {
+            return;
+        };
+        if receipt.schema_version == crate::supervision::model::RECEIPT_SCHEMA_VERSION
+            && crate::supervision::linux_systemd::boot_ids_prove_prior_boot(
+                receipt.launch_boot_id.as_deref(),
+                self.current_boot_id.as_deref(),
+            )
+        {
+            self.proven_prior_boot_stale
+                .insert(result.logical_id.clone());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn poll_resource_results(&mut self) {
         let results: Vec<_> = self
             .resource_worker
@@ -999,6 +1055,7 @@ impl App {
         let mut rebuild_from_mux = false;
         for result in results {
             self.resource_refresh_pending.remove(&result.logical_id);
+            self.update_prior_boot_stale_provenance(&result);
             if self.pending_launches.contains_key(&result.logical_id) {
                 continue;
             }
@@ -1635,6 +1692,7 @@ impl App {
                                         session,
                                         receipt,
                                         limits,
+                                        prior_boot_relaunch: false,
                                     });
                                 }
                                 return Some(Action::LaunchSupervisedSelected(limits));
@@ -2331,6 +2389,7 @@ impl App {
                             session,
                             receipt,
                             limits,
+                            prior_boot_relaunch: false,
                         };
                     }
                     action => self.perform_pending(action),
@@ -4994,6 +5053,38 @@ mod tests {
             session_kind: None,
             requested_slice: None,
             workload_anchor: None,
+            launch_boot_id: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_test_receipt(launch_boot_id: Option<&str>) -> BindingReceipt {
+        let mut receipt = test_receipt();
+        receipt.schema_version = crate::supervision::model::RECEIPT_SCHEMA_VERSION;
+        receipt.workload_anchor = Some(crate::supervision::model::WorkloadAnchorProof {
+            protocol_version: 1,
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            marker_path: PathBuf::from(
+                "/run/user/1000/portagenty/workloads/0123456789abcdef0123456789abcdef.marker.toml",
+            ),
+            pid: 123,
+            start_time_ticks: 456,
+        });
+        receipt.launch_boot_id = launch_boot_id.map(str::to_string);
+        receipt
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resource_result(
+        logical_id: LogicalSessionId,
+        ownership: crate::supervision::OwnershipState,
+        error: Option<&str>,
+    ) -> crate::tui::resources::SampleResult {
+        crate::tui::resources::SampleResult {
+            logical_id,
+            ownership,
+            snapshot: None,
+            error: error.map(str::to_string),
         }
     }
 
@@ -5040,6 +5131,7 @@ mod tests {
             created_at_unix_ms: 1,
             creator_pid: 123,
             creator_start_time_ticks: 456,
+            creator_boot_id: None,
             last_error: Some("interrupted".into()),
         };
         let mut app = supervised_app().with_supervision_evidence(Vec::new(), vec![pending]);
@@ -5056,6 +5148,71 @@ mod tests {
             assert!(app.pending.is_none());
             assert!(app.supervising.is_none());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_receipt_orphan_is_non_live_cleanup_only() {
+        let mut app = supervised_app();
+        let mut receipt = test_receipt();
+        receipt.logical_id =
+            LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "receipt-orphan")
+                .unwrap();
+        receipt.mux_target = crate::supervision::MuxTarget::TmuxPrivate {
+            socket: PathBuf::from("/run/user/1000/portagenty/orphan/tmux.sock"),
+            session: "ordinary-looking-name".into(),
+        };
+        let logical_id = receipt.logical_id.clone();
+        app.receipts.insert(logical_id.clone(), receipt.clone());
+        app.apply_receipt_annotations(&BTreeMap::from([(
+            logical_id,
+            (RowOwnership::Stale, None, Vec::new()),
+        )]));
+        let orphan_index = app
+            .rows
+            .iter()
+            .position(|row| row.display_name == "receipt-orphan")
+            .unwrap();
+        app.list_state.select(Some(orphan_index));
+
+        assert_eq!(app.rows[orphan_index].state, SessionState::NotStarted);
+        assert!(app.rows[orphan_index].session.is_none());
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app.pending.is_none());
+
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::RemoveStaleReceipt { .. })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_receipt_orphan_attaches_only_to_exact_private_target() {
+        let mut app = supervised_app();
+        let mut receipt = test_receipt();
+        receipt.logical_id =
+            LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "owned-orphan").unwrap();
+        let expected = receipt.mux_target.clone();
+        let logical_id = receipt.logical_id.clone();
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.apply_receipt_annotations(&BTreeMap::from([(
+            logical_id,
+            (RowOwnership::Owned, None, Vec::new()),
+        )]));
+        let orphan_index = app
+            .rows
+            .iter()
+            .position(|row| row.display_name == "owned-orphan")
+            .unwrap();
+        app.list_state.select(Some(orphan_index));
+
+        assert!(matches!(
+            app.reduce_action(Action::LaunchSelected),
+            Some(AppOutcome::Launch(LaunchKind::AttachOwned { target, .. }))
+                if target == expected
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -5142,13 +5299,228 @@ mod tests {
                 session,
                 receipt,
                 limits,
+                prior_boot_relaunch,
             } => {
                 assert_eq!(session.name, "s0");
                 assert_eq!(*receipt, test_receipt());
                 assert_eq!(limits, ResourceLimits::claude_defaults());
+                assert!(!prior_boot_relaunch);
             }
             other => panic!("expected stale supervised action, got {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proven_cross_boot_stale_enter_relaunches_directly_with_existing_limits() {
+        let old_boot = "550e8400-e29b-41d4-a716-446655440000";
+        let current_boot = "123e4567-e89b-12d3-a456-426614174000";
+        let mut receipt = current_test_receipt(Some(old_boot));
+        receipt.limits = ResourceLimits {
+            memory_high_bytes: Some(ResourceLimits::GIB),
+            memory_max_bytes: Some(2 * ResourceLimits::GIB),
+            memory_swap_max_bytes: Some(256 * ResourceLimits::MIB),
+            cpu_quota_percent: Some(200.0),
+            tasks_max: Some(300),
+        };
+        let logical_id = receipt.logical_id.clone();
+        let expected_limits = receipt.limits.clone();
+        let mut app = supervised_app().with_current_boot_id(Some(current_boot.into()));
+        app.receipts.insert(logical_id.clone(), receipt.clone());
+        app.rows[0].ownership = RowOwnership::Stale;
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id,
+            crate::supervision::OwnershipState::StaleBinding("gone".into()),
+            None,
+        ));
+
+        match app.reduce_action(Action::LaunchSelected) {
+            Some(AppOutcome::Launch(LaunchKind::ReplaceStaleSupervised {
+                session,
+                receipt: launched_receipt,
+                limits,
+                prior_boot_relaunch,
+            })) => {
+                assert_eq!(session.name, "s0");
+                assert_eq!(*launched_receipt, receipt);
+                assert_eq!(limits, expected_limits);
+                assert!(prior_boot_relaunch);
+                assert!(app.pending.is_none());
+            }
+            other => panic!("expected direct prior-boot relaunch, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proven_cross_boot_stale_enter_uses_kind_defaults_for_empty_limits() {
+        let old_boot = "550e8400-e29b-41d4-a716-446655440000";
+        let current_boot = "123e4567-e89b-12d3-a456-426614174000";
+        let receipt = current_test_receipt(Some(old_boot));
+        let logical_id = receipt.logical_id.clone();
+        let mut app = supervised_app().with_current_boot_id(Some(current_boot.into()));
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.rows[0].ownership = RowOwnership::Stale;
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id,
+            crate::supervision::OwnershipState::StaleBinding("gone".into()),
+            None,
+        ));
+
+        assert!(matches!(
+            app.reduce_action(Action::LaunchSelected),
+            Some(AppOutcome::Launch(LaunchKind::ReplaceStaleSupervised {
+                limits,
+                prior_boot_relaunch: true,
+                ..
+            })) if limits == ResourceLimits::claude_defaults()
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_direct_relaunch_requires_exact_successful_cross_boot_provenance() {
+        let old_boot = "550e8400-e29b-41d4-a716-446655440000";
+        let current_boot = "123e4567-e89b-12d3-a456-426614174000";
+        let cases = [
+            (
+                current_test_receipt(Some(current_boot)),
+                Some(current_boot.to_string()),
+                crate::supervision::OwnershipState::StaleBinding("same boot".into()),
+                None,
+            ),
+            (
+                current_test_receipt(None),
+                Some(current_boot.to_string()),
+                crate::supervision::OwnershipState::StaleBinding("missing stored boot".into()),
+                None,
+            ),
+            (
+                current_test_receipt(Some("not-a-uuid")),
+                Some(current_boot.to_string()),
+                crate::supervision::OwnershipState::StaleBinding("invalid stored boot".into()),
+                None,
+            ),
+            (
+                current_test_receipt(Some(old_boot)),
+                None,
+                crate::supervision::OwnershipState::StaleBinding("boot read failed".into()),
+                None,
+            ),
+            (
+                current_test_receipt(Some(old_boot)),
+                Some("not-a-uuid".into()),
+                crate::supervision::OwnershipState::StaleBinding("invalid current boot".into()),
+                None,
+            ),
+            (
+                test_receipt(),
+                Some(current_boot.to_string()),
+                crate::supervision::OwnershipState::StaleBinding("legacy".into()),
+                None,
+            ),
+        ];
+
+        for (receipt, observed_boot, ownership, error) in cases {
+            let logical_id = receipt.logical_id.clone();
+            let mut app = supervised_app().with_current_boot_id(observed_boot);
+            app.receipts.insert(logical_id.clone(), receipt);
+            app.rows[0].ownership = RowOwnership::Stale;
+            app.update_prior_boot_stale_provenance(&resource_result(logical_id, ownership, error));
+            assert!(app.reduce_action(Action::LaunchSelected).is_none());
+            assert!(matches!(
+                app.pending,
+                Some(PendingAction::ReplaceStaleBinding { .. })
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ambiguous_error_and_split_results_clear_direct_relaunch_authority() {
+        let old_boot = "550e8400-e29b-41d4-a716-446655440000";
+        let current_boot = "123e4567-e89b-12d3-a456-426614174000";
+        let receipt = current_test_receipt(Some(old_boot));
+        let logical_id = receipt.logical_id.clone();
+        let mut app = supervised_app().with_current_boot_id(Some(current_boot.into()));
+        app.receipts.insert(logical_id.clone(), receipt.clone());
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id.clone(),
+            crate::supervision::OwnershipState::StaleBinding("gone".into()),
+            None,
+        ));
+        assert!(app.proven_prior_boot_stale.contains(&logical_id));
+
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id.clone(),
+            crate::supervision::OwnershipState::AmbiguousBinding("probe failed".into()),
+            Some("probe failed"),
+        ));
+        app.rows[0].ownership = RowOwnership::Ambiguous;
+        assert!(!app.proven_prior_boot_stale.contains(&logical_id));
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app.pending.is_none());
+
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id.clone(),
+            crate::supervision::OwnershipState::StaleBinding("gone".into()),
+            None,
+        ));
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id.clone(),
+            crate::supervision::OwnershipState::SplitContainment("split".into()),
+            None,
+        ));
+        app.rows[0].ownership = RowOwnership::SplitContainment;
+        app.rows[0].state = SessionState::Live;
+        app.rows[0].mux_target = Some(receipt.mux_target.clone());
+        assert!(!app.proven_prior_boot_stale.contains(&logical_id));
+        assert!(matches!(
+            app.reduce_action(Action::LaunchSelected),
+            Some(AppOutcome::Launch(LaunchKind::AttachOwned { target, .. }))
+                if target == receipt.mux_target
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_result_clears_prior_boot_relaunch_provenance() {
+        let old_boot = "550e8400-e29b-41d4-a716-446655440000";
+        let current_boot = "123e4567-e89b-12d3-a456-426614174000";
+        let receipt = current_test_receipt(Some(old_boot));
+        let logical_id = receipt.logical_id.clone();
+        let mut app = supervised_app().with_current_boot_id(Some(current_boot.into()));
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id.clone(),
+            crate::supervision::OwnershipState::StaleBinding("gone".into()),
+            None,
+        ));
+        assert!(app.proven_prior_boot_stale.contains(&logical_id));
+
+        let pending = crate::supervision::PendingLaunch {
+            logical_id: logical_id.clone(),
+            unit_name: "portagenty-wpending.service".into(),
+            mux_target: crate::supervision::MuxTarget::TmuxPrivate {
+                socket: PathBuf::from("/run/user/1000/portagenty/tmux/pending.sock"),
+                session: "main".into(),
+            },
+            marker_path: PathBuf::from(
+                "/run/user/1000/portagenty/workloads/0123456789abcdef0123456789abcdef.marker.toml",
+            ),
+            created_at_unix_ms: 1,
+            creator_pid: 123,
+            creator_start_time_ticks: 456,
+            creator_boot_id: Some(old_boot.into()),
+            last_error: None,
+        };
+        app.pending_launches.insert(logical_id.clone(), pending);
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id.clone(),
+            crate::supervision::OwnershipState::StaleBinding("gone".into()),
+            None,
+        ));
+        assert!(!app.proven_prior_boot_stale.contains(&logical_id));
     }
 
     #[cfg(target_os = "linux")]
@@ -5213,13 +5585,19 @@ mod tests {
             Box::new(MockMultiplexer::new()),
             vec![live_session("s0")],
         );
-        let receipt = test_receipt();
-        app.receipts
-            .insert(receipt.logical_id.clone(), receipt.clone());
+        let receipt = current_test_receipt(Some("550e8400-e29b-41d4-a716-446655440000"));
+        let logical_id = receipt.logical_id.clone();
+        app.current_boot_id = Some("123e4567-e89b-12d3-a456-426614174000".into());
+        app.receipts.insert(logical_id.clone(), receipt.clone());
         app.apply_receipt_annotations(&BTreeMap::from([(
-            receipt.logical_id,
+            logical_id.clone(),
             (RowOwnership::Stale, None, Vec::new()),
         )]));
+        app.update_prior_boot_stale_provenance(&resource_result(
+            logical_id,
+            crate::supervision::OwnershipState::StaleBinding("prior boot".into()),
+            None,
+        ));
 
         assert_eq!(app.rows[0].ownership, RowOwnership::Stale);
         assert_eq!(app.rows[0].state, SessionState::Live);

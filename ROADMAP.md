@@ -455,9 +455,25 @@ The implementation includes:
   explicit external-bounded-scope explanation for `build-contained` descendants
   beneath `background.slice`; split rows may attach but receive no whole-workload
   metrics, stop, or force-kill authority;
-- mixed receipt transition semantics: new launches write v2 evidence, live v1
-  services are legacy/restart-required exact-target attach-only, both unit and
-  target absent may stale-clean, and partial presence remains ambiguous;
+- mixed receipt transition semantics: new launches write v2 evidence plus an
+  optional canonical Linux launch-boot UUID copied from the pending journal's
+  single best-effort observation; live v1 services are legacy/restart-required
+  exact-target attach-only, both unit and target absent may stale-clean, and
+  partial presence remains ambiguous. Boot provenance is non-authoritative and
+  malformed/missing hints only disable modal bypass;
+- direct routine Enter for an idle current-v2 stale row only after an error-free
+  exact stale reconciliation and valid unequal launch/current boot IDs. The same
+  locked cleanup/relaunch coordinator revalidates every artifact and sends no
+  signal to the old workload. An actual stale row with same, missing, invalid, or
+  read-failed boot evidence retains `y/N`; pending, ambiguous, errored, and
+  unreconciled evidence blocks Enter, while split containment attaches only to its
+  exact private target;
+- pending creator reconciliation where a valid boot mismatch proves only creator
+  absence and `Dead` still requires exact unit, private target, and marker absence;
+  missing/invalid/read-failed boot evidence retains PID/start-time checks;
+- signal-free marker cleanup that validates exact runtime/path/nonce shape first,
+  accepts missing Portagenty/workloads/marker components without creating them,
+  and preserves all checks for components that exist;
 - `pa resources capabilities|status|stop|kill --force` and TUI ownership labels,
   editable five-field limits, bounded sampling, event warnings, and separately
   confirmed force-kill only for complete owned-and-verified v2 containment;
@@ -470,10 +486,14 @@ The implementation includes:
   supervised creation without granting control.
 
 This does **not** add a Portagenty daemon, listener, GUI, history database, log
-monitor, restart manager, or unattended telemetry service. Portagenty observes but
-does not create or modify the aggregate Claude slice. Existing services and live
-ordinary multiplexer sessions are not stopped, migrated, upgraded, or retroactively
-claimed. `MemoryHigh` remains a reclaim threshold; `MemoryMax` and
+monitor, restart manager, unattended telemetry service, TUI-startup mutation, or
+bulk startup relaunch. Portagenty observes but does not create or modify the
+aggregate Claude slice. Existing services and live ordinary multiplexer sessions
+are not stopped, migrated, upgraded, or retroactively claimed. `S` remains custom
+limit editing. `x` means signal-free cleanup-only on stale rows, confirmed
+graceful/non-force stop on owned rows, and confirmed multiplexer-native kill on
+unmanaged live rows. `X` remains separately confirmed force-kill. `MemoryHigh`
+remains a reclaim threshold; `MemoryMax` and
 `MemorySwapMax` are hard ceilings.
 
 The backend, store, parser, CLI, TUI, picker, and multiplexer seams have bounded

@@ -32,6 +32,16 @@ pub struct ResourceWorker {
     thread: Option<JoinHandle<()>>,
 }
 
+fn reconciliation_failure(logical_id: LogicalSessionId, error: &anyhow::Error) -> SampleResult {
+    let error = format!("{error:#}");
+    SampleResult {
+        logical_id,
+        ownership: OwnershipState::AmbiguousBinding(error.clone()),
+        snapshot: None,
+        error: Some(error),
+    }
+}
+
 impl ResourceWorker {
     pub fn start() -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel::<SampleRequest>(REQUEST_CAPACITY);
@@ -64,12 +74,7 @@ impl ResourceWorker {
                             snapshot: None,
                             error: None,
                         },
-                        Err(error) => SampleResult {
-                            logical_id,
-                            ownership: OwnershipState::StaleBinding(format!("{error:#}")),
-                            snapshot: None,
-                            error: Some(format!("{error:#}")),
-                        },
+                        Err(error) => reconciliation_failure(logical_id, &error),
                     },
                     Err(error) => SampleResult {
                         logical_id,
@@ -115,5 +120,22 @@ impl Drop for ResourceWorker {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconciliation_errors_are_ambiguous_never_stale() {
+        let logical_id =
+            LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "shell").unwrap();
+        let result = reconciliation_failure(logical_id, &anyhow::anyhow!("probe failed"));
+        assert!(matches!(
+            result.ownership,
+            OwnershipState::AmbiguousBinding(ref reason) if reason.contains("probe failed")
+        ));
+        assert_eq!(result.error.as_deref(), Some("probe failed"));
     }
 }
