@@ -3144,6 +3144,7 @@ fn resource_event_notice(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn compact_bytes(value: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
