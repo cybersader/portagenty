@@ -392,6 +392,8 @@ pub struct BindingReceipt {
     pub requested_slice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_anchor: Option<WorkloadAnchorProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_boot_id: Option<String>,
 }
 
 impl BindingReceipt {

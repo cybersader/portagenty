@@ -517,6 +517,10 @@ fn run_session_tui(
             limits,
         }) => {
             ratatui::restore();
+            eprintln!();
+            eprintln!(
+                "  pa: revalidating the exact stale binding and relaunching supervised without signalling any workload."
+            );
             print_launch_banner(mpx_kind, &session.name);
             let session_name = session.name.clone();
             classify_launch_result(
@@ -745,6 +749,7 @@ mod tests {
             session_kind: None,
             requested_slice: None,
             workload_anchor: None,
+            launch_boot_id: None,
         }
     }
 

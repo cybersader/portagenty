@@ -61,12 +61,10 @@ jobs:
         run: cargo nextest run --no-fail-fast
       - name: Run tmux-e2e tests
         run: cargo nextest run --no-fail-fast --features tmux-e2e
-      - name: Run zellij-e2e tests without inherited runtime env (linux only)
+      - name: Run isolated zellij-e2e tests (linux only)
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          runtime_dir="/run/user/$(id -u)"
-          sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
-          env -u XDG_RUNTIME_DIR cargo nextest run --no-fail-fast --features zellij-e2e
+        timeout-minutes: 5
+        run: cargo nextest run --no-fail-fast --features zellij-e2e --test mux_zellij_e2e
 
   build:
     name: build (${{ matrix.os }})

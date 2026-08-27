@@ -12,6 +12,7 @@ pub mod export;
 pub mod find;
 pub mod mux;
 pub mod onboarding;
+pub(crate) mod process;
 pub mod protocol;
 pub mod scaffold;
 pub mod snippets;

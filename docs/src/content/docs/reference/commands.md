@@ -108,7 +108,7 @@ mouse poorly, so don't rely on it there).
 | `k` / `↑` / `Alt+K` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, supervision-first start an eligible idle UUID-backed row (Claude kind: `3G` / `5G` / `512MiB` / `800%` / `1200`), or ordinarily create a no-ID/invalid/unsupported idle row |
+| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, supervision-first start an eligible idle UUID-backed row (Claude kind: `3G` / `5G` / `512MiB` / `800%` / `1200`), directly relaunch any safely reconciled idle stale row through the existing exact signal-free coordinator, or ordinarily create a no-ID/invalid/unsupported idle row |
 | `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `PgDn` / `PgUp` | 10-row jumps |
 | `a` | Add a new session (2-stage name → command modal) |
@@ -132,17 +132,28 @@ PID/start-time/nonce proof and bounded descendant containment. A live v1 row bec
 `legacy/restart`, attaches only to its exact target, and exposes no resource stop or
 force-kill. A `split` row can also attach to its exact target but withholds
 whole-workload metrics and control. `ambiguous` rows expose no action; a pending-launch journal blocks another supervised creation until its evidence is reconciled.
+Optional launch/creator boot UUIDs are non-authoritative provenance: malformed,
+missing, or unreadable values do not invalidate otherwise complete receipt state or
+gate stale-row Enter.
 
 If a receipt becomes `stale`, Portagenty never chases the old opaque target, and
 `X` remains unavailable because there is no verified cgroup to force-kill. On an
-idle declared row, Enter confirms one exact flow: prove the stored receipt is
-unchanged, prove both its systemd invocation and private multiplexer target absent,
-remove the receipt and durable marker without sending a signal, then create and
-attach a fresh supervised binding. Prior nonempty limits are reused; an empty prior
-policy resolves from the declared session kind. `S` exposes those values for
-editing, while `x` remains the cleanup-only option. If a real ordinary target is
-live beside the stale receipt, Enter attaches it normally instead of cleaning,
-stopping, or claiming it.
+idle declared row, a completed error-free stale reconciliation dispatches the
+existing cleanup/relaunch coordinator directly. The coordinator remains authoritative:
+it proves the stored receipt is unchanged, pending evidence is absent, the exact
+systemd invocation and private multiplexer target are absent, and the durable marker,
+capabilities, limits, and ordinary-target races are safe before removing anything or
+creating a fresh supervised binding. It sends no signal to an old workload and may
+still refuse if the evidence changes. Optional boot provenance does not gate Enter.
+Pending, ambiguous, worker-error, and unreconciled evidence blocks Enter; split
+containment attaches only to its exact private target. Prior nonempty limits are
+reused; an empty prior policy resolves from the declared session kind. `S` exposes
+those values for editing. `x` means confirmed cleanup-only on a stale row, confirmed
+graceful/non-force stop on an owned row, and confirmed multiplexer-native kill on an
+unmanaged live row; `X` remains separately confirmed force-kill. If a real ordinary
+target is live beside the stale receipt, Enter attaches it normally instead of
+cleaning, stopping, or claiming it. Portagenty does not launch stale rows at TUI
+startup and provides no bulk startup relaunch.
 
 ### Expand-on-select
 
@@ -241,8 +252,11 @@ creates or modifies the slice. Only after receipt and pending-launch state are k
 preflight proves supervision capability/runtime unavailable does routine TUI Enter
 print a loud notice and launch ordinarily. Receipt ambiguity and every failure after
 creation may have begun remain fail-closed. Pending launches block attach, ordinary
-fallback, creation, stop, and kill until reconciled; partial artifact presence stays
-ambiguous. Private tmux servers are launched without user-bus/runtime variables to
+fallback, creation, stop, and kill until reconciled. A valid unequal stored/current
+boot UUID proves only that the pending creator is gone; otherwise PID/start-time
+proof remains required. `Dead` still requires the exact unit, private target, and
+marker all absent, and probe errors or partial presence stay ambiguous. Private tmux
+servers are launched without user-bus/runtime variables to
 prevent sibling tmux scopes, while the pane receives the exact restored user bus.
 
 `S` edits all five limits or resolves cleared fields from the declared kind, can
@@ -275,7 +289,7 @@ pa resources kill claude --force
 |---|---|
 | `capabilities` | Reports backend, available metrics/actions, all five resource-limit kinds, and degraded or unsupported reasons. |
 | `status [session]` | Shows pending (active, dead-cleanable, or ambiguous), `owned`, `legacy-restart-required`, `split-containment`, `ambiguous-binding`, or `stale-binding` plus exact evidence, applied limits, and available/unavailable metrics. With no session, reports all declared sessions. |
-| `cleanup <session>` | Signal-free cleanup only. Removes a pending journal when its exact creator, unit, target, and marker are all absent, or removes a receipt after exact unit and target absence is revalidated. Refuses partial or live evidence. |
+| `cleanup <session>` | Signal-free cleanup only. Removes a pending journal when its creator is proven gone and its exact unit, private target, and marker are all absent, or removes a receipt after exact unit and target absence is revalidated. Exact runtime/path/nonce shape is checked first; an absent `portagenty` directory, `workloads` directory, or marker succeeds without creating directories, while existing components retain owner/mode/type/content checks. Refuses partial, live, or probe-error evidence. |
 | `stop <session>` | For owned-and-verified v2 containment only: revalidates ownership, requests graceful shutdown of the exact private multiplexer target, then performs a non-force systemd stop if needed. Never silently escalates to SIGKILL. |
 | `kill <session> --force` | For owned-and-verified v2 containment only: separately explicit whole-cgroup SIGKILL after immediate ownership revalidation. Refuses without `--force`. |
 

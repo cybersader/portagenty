@@ -8,7 +8,9 @@
 //!   stuck `fd` from blocking the TUI's event loop.
 
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::process::TimedOutput;
 
 /// Is `bin` resolvable on `$PATH`? Mirrors the same check from
 /// `crate::clipboard::on_path` — duplicated here rather than
@@ -40,23 +42,9 @@ pub fn on_path(bin: &str) -> bool {
 /// the stdlib doesn't ship one and we don't want to take on `tokio`
 /// or `wait-timeout` for this single use case (CLAUDE.md
 /// single-static-binary preference).
-pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
-    let mut child = cmd.spawn().ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                return child.wait_with_output().ok();
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => return None,
-        }
+pub fn run_with_timeout(cmd: Command, timeout: Duration) -> Option<Output> {
+    match crate::process::run_with_timeout(cmd, timeout).ok()? {
+        TimedOutput::Completed(output) => Some(output),
+        TimedOutput::TimedOut => None,
     }
 }

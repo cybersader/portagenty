@@ -23,12 +23,19 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 
 use crate::domain::Session;
 use crate::mux::{AttachMode, ClientCompletion, CreationDisposition, Multiplexer, SessionInfo};
+use crate::process::{self, TimedOutput};
+
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const VISIBILITY_TIMEOUT: Duration = Duration::from_secs(5);
+const VISIBILITY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STDERR_LIMIT: usize = 4 * 1024;
 
 /// zellij-backed [`Multiplexer`].
 #[derive(Debug, Clone, Default)]
@@ -75,6 +82,56 @@ impl ZellijAdapter {
         c
     }
 
+    fn run_control(
+        &self,
+        mut command: Command,
+        operation: &str,
+        timeout: Duration,
+    ) -> Result<Output> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        match process::run_with_timeout(command, timeout) {
+            Ok(TimedOutput::Completed(output)) => Ok(output),
+            Ok(TimedOutput::TimedOut) => {
+                bail!("{operation} timed out after {timeout:?}")
+            }
+            Err(error) => Err(friendly_io_err(&format!("spawning {operation}"), error)),
+        }
+    }
+
+    fn list_sessions_with_timeout(&self, timeout: Duration) -> Result<Vec<SessionInfo>> {
+        let mut command = self.cmd();
+        command.arg("list-sessions").arg("-n").arg("-s");
+        let output = self.run_control(command, "zellij list-sessions", timeout)?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if is_no_session_error(&stderr) {
+                return Ok(Vec::new());
+            }
+            bail!(
+                "zellij list-sessions failed with status {}: {}",
+                output.status,
+                bounded_stderr(&output.stderr)
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|name| SessionInfo {
+                name: name.to_string(),
+                cwd: None,
+                attached: None,
+            })
+            .collect())
+    }
+
     /// Detect whether we're currently inside a zellij client. zellij
     /// sets `ZELLIJ` and `ZELLIJ_SESSION_NAME` on every child process.
     pub fn is_inside_zellij() -> bool {
@@ -88,34 +145,45 @@ impl ZellijAdapter {
     ///
     /// zellij's session registration is briefly async after the CLI
     /// returns — the child process can exit successfully before
-    /// `list-sessions` reports the new name. This method polls
-    /// `has_session` for up to five seconds so the return is
-    /// synchronous-to-visibility, which keeps tests deterministic on
-    /// slow or concurrently exercised CI runners without every test having to retry.
+    /// `list-sessions` reports the new name. This method polls the bounded
+    /// session-list probe for up to five seconds so the return is
+    /// synchronous-to-visibility without allowing one stuck probe to block
+    /// indefinitely.
     pub fn create_background(&self, name: &str) -> Result<()> {
-        let status = self
-            .cmd()
-            .arg("attach")
-            .arg(name)
-            .arg("--create-background")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| friendly_io_err("spawning zellij attach --create-background", e))?;
-        if !status.success() {
-            bail!("zellij attach --create-background failed for session {name:?}");
+        let mut command = self.cmd();
+        command.arg("attach").arg(name).arg("--create-background");
+        let output = self.run_control(
+            command,
+            &format!("zellij attach --create-background for session {name:?}"),
+            CONTROL_TIMEOUT,
+        )?;
+        if !output.status.success() {
+            bail!(
+                "zellij attach --create-background failed for session {name:?} with status {}: {}",
+                output.status,
+                bounded_stderr(&output.stderr)
+            );
         }
 
-        // Wait for the session to appear in list-sessions. 100 × 50ms
-        // = 5s max; most runs return on the first check. Concurrent
-        // Zellij e2e tests can make shared registry propagation slower.
-        for _ in 0..100 {
-            if self.has_session(name)? {
+        let deadline = Instant::now() + VISIBILITY_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let sessions = self.list_sessions_with_timeout(remaining.min(CONTROL_TIMEOUT))?;
+            if sessions.iter().any(|session| session.name == name) {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(VISIBILITY_POLL_INTERVAL));
         }
-        bail!("zellij session {name:?} was created but did not appear in list within 5s")
+        bail!(
+            "zellij session {name:?} was created but did not appear in list within {VISIBILITY_TIMEOUT:?}"
+        )
     }
 
     /// Best-effort "are other clients attached to this session?"
@@ -132,10 +200,11 @@ impl ZellijAdapter {
         if !Self::is_inside_zellij() {
             return false;
         }
-        let out = self.cmd().arg("action").arg("list-clients").output();
-        match out {
-            Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
+        let mut command = self.cmd();
+        command.arg("action").arg("list-clients");
+        match self.run_control(command, "zellij action list-clients", CONTROL_TIMEOUT) {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
                 // One client per line (approximately). If more than
                 // one line of real content, there are other clients.
                 stdout.lines().filter(|l| !l.trim().is_empty()).count() > 1
@@ -155,26 +224,46 @@ impl ZellijAdapter {
         }
     }
 
-    /// Kill + delete the named session. Each step is best-effort so a
-    /// half-broken state (killed but not deleted) still gets cleaned
-    /// up. Returns Ok whether or not the session existed.
+    /// Kill + delete the named session. Both bounded operations are attempted
+    /// even if the first fails, and a missing session remains an idempotent
+    /// success.
     pub fn kill_and_delete(&self, name: &str) -> Result<()> {
-        let _ = self
-            .cmd()
-            .arg("kill-session")
-            .arg(name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = self
-            .cmd()
-            .arg("delete-session")
-            .arg("-f")
-            .arg(name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        Ok(())
+        let operations: [(&str, &[&str]); 2] =
+            [("kill-session", &[name]), ("delete-session", &["-f", name])];
+        let mut failures = Vec::new();
+
+        for (subcommand, args) in operations {
+            let operation = format!("zellij {subcommand} for session {name:?}");
+            let mut command = self.cmd();
+            command.arg(subcommand).args(args);
+            match self.run_control(command, &operation, CONTROL_TIMEOUT) {
+                Ok(output)
+                    if output.status.success()
+                        || is_no_session_error(&String::from_utf8_lossy(&output.stderr)) => {}
+                Ok(output) => failures.push(format!(
+                    "{operation} failed with status {}: {}",
+                    output.status,
+                    bounded_stderr(&output.stderr)
+                )),
+                Err(error) => failures.push(format!("{error:#}")),
+            }
+        }
+
+        if failures.is_empty() {
+            return Ok(());
+        }
+
+        match self.list_sessions_with_timeout(CONTROL_TIMEOUT) {
+            Ok(sessions) if !sessions.iter().any(|session| session.name == name) => Ok(()),
+            Ok(_) => bail!(
+                "zellij cleanup failed for session {name:?} and the target remains listed: {}",
+                failures.join("; ")
+            ),
+            Err(verification_error) => bail!(
+                "zellij cleanup failed for session {name:?}: {}; absence verification failed: {verification_error:#}",
+                failures.join("; ")
+            ),
+        }
     }
 }
 
@@ -238,9 +327,23 @@ fn ensure_cwd_exists(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+fn bounded_stderr(stderr: &[u8]) -> String {
+    let truncated = stderr.len() > STDERR_LIMIT;
+    let text = String::from_utf8_lossy(&stderr[..stderr.len().min(STDERR_LIMIT)]);
+    let text = text.trim();
+    match (text.is_empty(), truncated) {
+        (true, _) => "<no stderr>".to_string(),
+        (false, true) => format!("{text}… [truncated]"),
+        (false, false) => text.to_string(),
+    }
+}
+
 fn is_no_session_error(stderr: &str) -> bool {
-    let s = stderr.to_ascii_lowercase();
-    s.contains("no active zellij sessions") || s.contains("no sessions")
+    let text = stderr.to_ascii_lowercase();
+    text.contains("no active zellij sessions")
+        || text.contains("no sessions")
+        || (text.contains("session") && text.contains("not found"))
+        || (text.contains("session") && text.contains("does not exist"))
 }
 
 /// Escape a raw string for embedding inside a KDL double-quoted
@@ -355,33 +458,7 @@ fn write_layout_file(session: &Session, sanitized_name: &str) -> Result<PathBuf>
 
 impl Multiplexer for ZellijAdapter {
     fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
-        let out = self
-            .cmd()
-            .arg("list-sessions")
-            .arg("-n")
-            .arg("-s")
-            .output()
-            .map_err(|e| friendly_io_err("spawning zellij list-sessions", e))?;
-
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if is_no_session_error(&stderr) {
-                return Ok(Vec::new());
-            }
-            bail!("zellij list-sessions failed: {}", stderr.trim());
-        }
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        Ok(stdout
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(|name| SessionInfo {
-                name: name.to_string(),
-                cwd: None,
-                attached: None,
-            })
-            .collect())
+        self.list_sessions_with_timeout(CONTROL_TIMEOUT)
     }
 
     fn has_session(&self, name: &str) -> Result<bool> {
@@ -640,7 +717,20 @@ mod tests {
     fn no_session_error_matches_known_messages() {
         assert!(is_no_session_error("No active zellij sessions found."));
         assert!(is_no_session_error("No sessions are running currently."));
+        assert!(is_no_session_error("Session example not found"));
+        assert!(is_no_session_error("Session example does not exist"));
         assert!(!is_no_session_error("some unrelated error"));
+    }
+
+    #[test]
+    fn bounded_stderr_handles_empty_and_truncated_output() {
+        assert_eq!(bounded_stderr(b"  \n"), "<no stderr>");
+        assert_eq!(bounded_stderr(b" short error\n"), "short error");
+
+        let oversized = vec![b'x'; STDERR_LIMIT + 128];
+        let rendered = bounded_stderr(&oversized);
+        assert!(rendered.ends_with("… [truncated]"));
+        assert!(rendered.len() <= STDERR_LIMIT + "… [truncated]".len());
     }
 
     #[test]

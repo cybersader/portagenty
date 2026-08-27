@@ -2338,6 +2338,7 @@ mod tests {
             session_kind: None,
             requested_slice: None,
             workload_anchor: None,
+            launch_boot_id: None,
         };
         let pending = PickerPending::KillAllSessions {
             ws_display_name: "example".into(),

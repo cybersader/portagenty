@@ -38,6 +38,7 @@ const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const SERVICE_INTERFACE: &str = "org.freedesktop.systemd1.Service";
 const SLICE_INTERFACE: &str = "org.freedesktop.systemd1.Slice";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 const TARGET_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_TIMEOUT_USEC: u64 = 8_000_000;
@@ -75,6 +76,12 @@ pub enum PendingLaunchState {
     Active(String),
     Dead(String),
     Ambiguous(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailedLaunchCleanupDecision {
+    ClearPending,
+    RetainPending(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,10 +454,52 @@ fn is_direct_claude_service_cgroup(control_group: &str) -> bool {
         .is_some_and(|parent| parent.ends_with("claude.slice/claude-code.slice"))
 }
 
+pub(crate) fn read_current_boot_id() -> Result<String> {
+    read_boot_id_from(Path::new(BOOT_ID_PATH))
+}
+
+fn read_boot_id_from(path: &Path) -> Result<String> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading Linux boot id {}", path.display()))?;
+    let boot_id = uuid::Uuid::parse_str(raw.trim())
+        .with_context(|| format!("parsing Linux boot id {}", path.display()))?;
+    Ok(boot_id.hyphenated().to_string())
+}
+
+pub(crate) fn boot_ids_prove_prior_boot(stored: Option<&str>, current: Option<&str>) -> bool {
+    let Some(stored) = stored.and_then(|value| uuid::Uuid::parse_str(value).ok()) else {
+        return false;
+    };
+    let Some(current) = current.and_then(|value| uuid::Uuid::parse_str(value).ok()) else {
+        return false;
+    };
+    stored != current
+}
+
+fn pending_launch_receipt(
+    prepared: &PreparedLaunch,
+    creator_pid: u32,
+    creator_start_time_ticks: u64,
+    creator_boot_id: Option<String>,
+) -> PendingLaunch {
+    PendingLaunch {
+        logical_id: prepared.logical_id.clone(),
+        unit_name: prepared.spec.unit_name.clone(),
+        mux_target: prepared.mux_target.clone(),
+        marker_path: prepared.expected_anchor.marker_path.clone(),
+        created_at_unix_ms: now_unix_ms(),
+        creator_pid,
+        creator_start_time_ticks,
+        creator_boot_id,
+        last_error: None,
+    }
+}
+
 fn current_binding_receipt(
     prepared: &PreparedLaunch,
     identity: &SystemdUnitIdentity,
     workload_anchor: WorkloadAnchorProof,
+    launch_boot_id: Option<String>,
 ) -> Result<BindingReceipt> {
     let receipt = BindingReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
@@ -465,6 +514,7 @@ fn current_binding_receipt(
         session_kind: prepared.spec.session_kind,
         requested_slice: prepared.spec.requested_slice.clone(),
         workload_anchor: Some(workload_anchor),
+        launch_boot_id,
     };
     receipt.validate_shape()?;
     Ok(receipt)
@@ -552,6 +602,14 @@ fn marker_matches_proof(marker: &WorkloadMarker, proof: &WorkloadAnchorProof) ->
         && marker.start_time_ticks == proof.start_time_ticks
 }
 
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("probing {}", path.display())),
+    }
+}
+
 pub(crate) fn remove_verified_workload_marker(proof: &WorkloadAnchorProof) -> Result<()> {
     remove_verified_workload_marker_in(&validated_runtime_dir()?, proof)
 }
@@ -561,7 +619,21 @@ fn remove_verified_workload_marker_in(
     proof: &WorkloadAnchorProof,
 ) -> Result<()> {
     super::model::validate_workload_marker_shape(&proof.marker_path, &proof.nonce)?;
-    validate_runtime_workload_path_in(runtime_dir, &proof.marker_path, &proof.nonce, "marker")?;
+    let portagenty_dir = runtime_dir.join("portagenty");
+    let workloads_dir = portagenty_dir.join("workloads");
+    let expected = workloads_dir.join(format!("{}.marker.toml", proof.nonce));
+    if proof.marker_path != expected {
+        bail!(
+            "workload file {} is outside the exact owner runtime namespace",
+            proof.marker_path.display()
+        );
+    }
+    validate_owner_private_dir(runtime_dir, "runtime directory")?;
+    if !validate_owner_private_dir_if_exists(&portagenty_dir, "Portagenty runtime directory")?
+        || !validate_owner_private_dir_if_exists(&workloads_dir, "workload directory")?
+    {
+        return Ok(());
+    }
     let marker = match read_workload_marker(&proof.marker_path) {
         Ok(marker) => marker,
         Err(error)
@@ -855,6 +927,14 @@ impl LinuxSystemdBackend {
     }
 
     pub fn start_prepared(&self, prepared: &PreparedLaunch) -> Result<BindingReceipt> {
+        self.start_prepared_with_boot_id(prepared, read_current_boot_id().ok())
+    }
+
+    fn start_prepared_with_boot_id(
+        &self,
+        prepared: &PreparedLaunch,
+        launch_boot_id: Option<String>,
+    ) -> Result<BindingReceipt> {
         let identity = self.api.start_transient_service(&prepared.spec)?;
         let launch_result = (|| {
             if identity.unit_name != prepared.spec.unit_name {
@@ -879,7 +959,7 @@ impl LinuxSystemdBackend {
                 &prepared.mux_target,
                 TARGET_TIMEOUT,
             )?;
-            current_binding_receipt(prepared, &identity, workload_anchor)
+            current_binding_receipt(prepared, &identity, workload_anchor, launch_boot_id)
         })();
         if launch_result.is_err() {
             let _ = self.api.stop_unit(&prepared.spec.unit_name);
@@ -937,19 +1017,17 @@ impl LinuxSystemdBackend {
         prepared: &PreparedLaunch,
     ) -> Result<BindingReceipt> {
         let creator_pid = std::process::id();
-        let pending = PendingLaunch {
-            logical_id: prepared.logical_id.clone(),
-            unit_name: prepared.spec.unit_name.clone(),
-            mux_target: prepared.mux_target.clone(),
-            marker_path: prepared.expected_anchor.marker_path.clone(),
-            created_at_unix_ms: now_unix_ms(),
+        let creator_start_time_ticks = process_start_time_ticks(creator_pid)
+            .context("recording pending-launch creator process proof")?;
+        let launch_boot_id = read_current_boot_id().ok();
+        let pending = pending_launch_receipt(
+            prepared,
             creator_pid,
-            creator_start_time_ticks: process_start_time_ticks(creator_pid)
-                .context("recording pending-launch creator process proof")?,
-            last_error: None,
-        };
+            creator_start_time_ticks,
+            launch_boot_id.clone(),
+        );
         store.begin_pending(pending)?;
-        match self.start_prepared(prepared) {
+        match self.start_prepared_with_boot_id(prepared, launch_boot_id) {
             Ok(receipt) => {
                 if let Err(error) = store.finalize_pending(receipt.clone()) {
                     let _ = self.api.stop_unit(&receipt.unit_name);
@@ -969,31 +1047,21 @@ impl LinuxSystemdBackend {
                 let unit_present = self
                     .api
                     .unit_by_name(&prepared.spec.unit_name)
-                    .unwrap_or(Some(SystemdUnitIdentity {
-                        unit_name: prepared.spec.unit_name.clone(),
-                        invocation_id: Vec::new(),
-                        control_group: String::new(),
-                        active_state: String::new(),
-                        sub_state: String::new(),
-                        transient: true,
-                        slice: String::new(),
-                        memory_high: UINT64_MAX,
-                        memory_max: UINT64_MAX,
-                        memory_swap_max: UINT64_MAX,
-                        cpu_quota_per_sec_usec: UINT64_MAX,
-                        tasks_max: UINT64_MAX,
-                        managed_oom_preference: String::new(),
-                    }))
-                    .is_some();
-                let target_present = mux_target_exists(&prepared.mux_target).unwrap_or(true);
-                let marker_present = prepared.expected_anchor.marker_path.exists();
-                if !unit_present && !target_present && !marker_present {
-                    let _ = store.clear_pending(&prepared.logical_id);
-                } else {
-                    let _ = store.mark_pending_error(
-                        &prepared.logical_id,
-                        format!("post-creation validation failed: {error:#}"),
-                    );
+                    .map(|unit| unit.is_some());
+                let target_present = mux_target_exists(&prepared.mux_target);
+                let marker_present = path_entry_exists(&prepared.expected_anchor.marker_path);
+                match failed_launch_cleanup_decision(unit_present, target_present, marker_present) {
+                    FailedLaunchCleanupDecision::ClearPending => {
+                        let _ = store.clear_pending(&prepared.logical_id);
+                    }
+                    FailedLaunchCleanupDecision::RetainPending(reason) => {
+                        let _ = store.mark_pending_error(
+                            &prepared.logical_id,
+                            format!(
+                                "post-creation validation failed: {error:#}; pending cleanup evidence: {reason}"
+                            ),
+                        );
+                    }
                 }
                 Err(error)
             }
@@ -1002,19 +1070,17 @@ impl LinuxSystemdBackend {
 
     pub fn reconcile_pending(&self, pending: &PendingLaunch) -> Result<PendingLaunchState> {
         pending.validate_shape()?;
-        if !pending.has_creator_proof() {
-            return Ok(PendingLaunchState::Ambiguous(
-                "pending launch has no creator process proof".into(),
-            ));
-        }
-        let creator_alive = match process_start_time_ticks(pending.creator_pid) {
-            Ok(start_time) => start_time == pending.creator_start_time_ticks,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                false
+        let current_boot_id = read_current_boot_id().ok();
+        let creator_alive = match pending_creator_alive_with(
+            pending,
+            current_boot_id.as_deref(),
+            process_start_time_ticks,
+        ) {
+            Ok(Some(creator_alive)) => creator_alive,
+            Ok(None) => {
+                return Ok(PendingLaunchState::Ambiguous(
+                    "pending launch has no creator process proof".into(),
+                ))
             }
             Err(error) => {
                 return Ok(PendingLaunchState::Ambiguous(format!(
@@ -1022,13 +1088,13 @@ impl LinuxSystemdBackend {
                 )))
             }
         };
-        let unit_present = self.api.unit_by_name(&pending.unit_name)?.is_some();
-        let target_present = mux_target_exists(&pending.mux_target)?;
-        let marker_present = pending
-            .marker_path
-            .try_exists()
-            .with_context(|| format!("probing {}", pending.marker_path.display()))?;
-        Ok(classify_pending_launch(
+        let unit_present = self
+            .api
+            .unit_by_name(&pending.unit_name)
+            .map(|unit| unit.is_some());
+        let target_present = mux_target_exists(&pending.mux_target);
+        let marker_present = path_entry_exists(&pending.marker_path);
+        Ok(classify_pending_artifact_probes(
             creator_alive,
             unit_present,
             target_present,
@@ -1092,7 +1158,7 @@ impl LinuxSystemdBackend {
                 .ok_or_else(|| anyhow!("the stale receipt is no longer present"))?;
             let current = &file.bindings[index];
             if current != expected {
-                bail!("the ownership receipt changed after confirmation; refresh and retry");
+                bail!("the ownership receipt changed before cleanup; refresh and retry");
             }
             if self.identity_if_present(current)?.is_some() {
                 bail!("the exact systemd invocation is still present; no receipt was removed");
@@ -1873,6 +1939,76 @@ fn verify_workload_anchor(
     classify_containment_paths(control_group, &root_cgroup, &descendant_cgroups)
 }
 
+fn pending_creator_alive_with(
+    pending: &PendingLaunch,
+    current_boot_id: Option<&str>,
+    process_start_time: impl FnOnce(u32) -> Result<u64>,
+) -> Result<Option<bool>> {
+    if boot_ids_prove_prior_boot(pending.creator_boot_id.as_deref(), current_boot_id) {
+        return Ok(Some(false));
+    }
+    if !pending.has_creator_proof() {
+        return Ok(None);
+    }
+    match process_start_time(pending.creator_pid) {
+        Ok(start_time) => Ok(Some(start_time == pending.creator_start_time_ticks)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(Some(false))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn classify_pending_artifact_probes(
+    creator_alive: bool,
+    unit_present: Result<bool>,
+    target_present: Result<bool>,
+    marker_present: Result<bool>,
+) -> PendingLaunchState {
+    let unit_present = match unit_present {
+        Ok(present) => present,
+        Err(error) => {
+            return PendingLaunchState::Ambiguous(format!(
+                "pending exact unit probe failed: {error:#}"
+            ))
+        }
+    };
+    let target_present = match target_present {
+        Ok(present) => present,
+        Err(error) => {
+            return PendingLaunchState::Ambiguous(format!(
+                "pending exact private target probe failed: {error:#}"
+            ))
+        }
+    };
+    let marker_present = match marker_present {
+        Ok(present) => present,
+        Err(error) => {
+            return PendingLaunchState::Ambiguous(format!(
+                "pending exact marker probe failed: {error:#}"
+            ))
+        }
+    };
+    classify_pending_launch(creator_alive, unit_present, target_present, marker_present)
+}
+
+fn failed_launch_cleanup_decision(
+    unit_present: Result<bool>,
+    target_present: Result<bool>,
+    marker_present: Result<bool>,
+) -> FailedLaunchCleanupDecision {
+    match classify_pending_artifact_probes(false, unit_present, target_present, marker_present) {
+        PendingLaunchState::Dead(_) => FailedLaunchCleanupDecision::ClearPending,
+        PendingLaunchState::Active(reason) | PendingLaunchState::Ambiguous(reason) => {
+            FailedLaunchCleanupDecision::RetainPending(reason)
+        }
+    }
+}
+
 fn classify_pending_launch(
     creator_alive: bool,
     unit_present: bool,
@@ -2100,6 +2236,24 @@ fn validate_owner_private_dir(path: &Path, label: &str) -> Result<()> {
         bail!("{label} is not an owner-only regular directory");
     }
     Ok(())
+}
+
+fn validate_owner_private_dir_if_exists(path: &Path, label: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let uid = rustix::process::geteuid().as_raw();
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != uid
+                || metadata.mode() & 0o777 != 0o700
+            {
+                bail!("{label} is not an owner-only regular directory");
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("reading {label} {}", path.display())),
+    }
 }
 
 fn create_owner_private_dir(path: &Path) -> Result<()> {
@@ -2481,7 +2635,22 @@ mod tests {
     }
 
     #[test]
-    fn new_binding_receipts_use_v2_workload_evidence() {
+    fn boot_id_reader_canonicalizes_and_rejects_bad_or_missing_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let boot_id_path = temp.path().join("boot_id");
+        fs::write(&boot_id_path, "550E8400-E29B-41D4-A716-446655440000\n").unwrap();
+        assert_eq!(
+            read_boot_id_from(&boot_id_path).unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+
+        fs::write(&boot_id_path, "not-a-uuid\n").unwrap();
+        assert!(read_boot_id_from(&boot_id_path).is_err());
+        assert!(read_boot_id_from(&temp.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn new_binding_receipts_use_v2_workload_evidence_and_one_boot_observation() {
         let logical_id =
             LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "shell").unwrap();
         let nonce = "0123456789abcdef0123456789abcdef".to_string();
@@ -2514,6 +2683,8 @@ mod tests {
             vec![1; 16],
             "/user.slice/user-1000.slice/user@1000.service/app.slice/portagenty-wtest.service",
         );
+        let launch_boot_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        let pending = pending_launch_receipt(&prepared, 123, 456, launch_boot_id.clone());
         let receipt = current_binding_receipt(
             &prepared,
             &identity,
@@ -2524,12 +2695,15 @@ mod tests {
                 pid: 123,
                 start_time_ticks: 456,
             },
+            launch_boot_id.clone(),
         )
         .unwrap();
 
         assert_eq!(receipt.schema_version, RECEIPT_SCHEMA_VERSION);
         assert_eq!(receipt.logical_id, logical_id);
         assert!(receipt.workload_anchor.is_some());
+        assert_eq!(pending.creator_boot_id, launch_boot_id);
+        assert_eq!(receipt.launch_boot_id, pending.creator_boot_id);
     }
 
     fn stale_receipt() -> BindingReceipt {
@@ -2553,6 +2727,7 @@ mod tests {
             session_kind: None,
             requested_slice: None,
             workload_anchor: None,
+            launch_boot_id: None,
         }
     }
 
@@ -2855,11 +3030,81 @@ mod tests {
             session_kind: None,
             requested_slice: None,
             workload_anchor: None,
+            launch_boot_id: None,
         };
         assert!(matches!(
             backend.reconcile(&receipt).unwrap(),
             OwnershipState::AmbiguousBinding(_)
         ));
+    }
+
+    fn pending_with_boot(creator_boot_id: Option<&str>) -> PendingLaunch {
+        PendingLaunch {
+            logical_id: LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "pending")
+                .unwrap(),
+            unit_name: "portagenty-wpending.service".into(),
+            mux_target: MuxTarget::TmuxPrivate {
+                socket: PathBuf::from("/run/user/1000/portagenty/tmux/pending.sock"),
+                session: "main".into(),
+            },
+            marker_path: PathBuf::from(
+                "/run/user/1000/portagenty/workloads/0123456789abcdef0123456789abcdef.marker.toml",
+            ),
+            created_at_unix_ms: 1,
+            creator_pid: 123,
+            creator_start_time_ticks: 456,
+            creator_boot_id: creator_boot_id.map(str::to_string),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn pending_boot_mismatch_only_replaces_creator_process_proof() {
+        let old_boot = "550e8400-e29b-41d4-a716-446655440000";
+        let current_boot = "123e4567-e89b-12d3-a456-426614174000";
+        let mut cross_boot = pending_with_boot(Some(old_boot));
+        cross_boot.creator_pid = 0;
+        cross_boot.creator_start_time_ticks = 0;
+        assert_eq!(
+            pending_creator_alive_with(&cross_boot, Some(current_boot), |_| {
+                panic!("cross-boot proof must not probe the old pid")
+            })
+            .unwrap(),
+            Some(false)
+        );
+        assert!(matches!(
+            classify_pending_launch(false, true, false, false),
+            PendingLaunchState::Ambiguous(_)
+        ));
+
+        for (stored, current) in [
+            (Some(old_boot), Some(old_boot)),
+            (None, Some(current_boot)),
+            (Some("not-a-uuid"), Some(current_boot)),
+            (Some(old_boot), Some("not-a-uuid")),
+            (Some(old_boot), None),
+        ] {
+            let pending = pending_with_boot(stored);
+            assert_eq!(
+                pending_creator_alive_with(&pending, current, |_| Ok(456)).unwrap(),
+                Some(true)
+            );
+        }
+
+        let mut unproven = pending_with_boot(None);
+        unproven.creator_pid = 0;
+        unproven.creator_start_time_ticks = 0;
+        assert_eq!(
+            pending_creator_alive_with(&unproven, Some(current_boot), |_| Ok(456)).unwrap(),
+            None
+        );
+
+        let pending = pending_with_boot(Some(old_boot));
+        let error = pending_creator_alive_with(&pending, Some(old_boot), |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied").into())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("denied"));
     }
 
     #[test]
@@ -2886,6 +3131,88 @@ mod tests {
     }
 
     #[test]
+    fn pending_probe_errors_are_ambiguous_with_specific_reasons() {
+        let unit = classify_pending_artifact_probes(
+            false,
+            Err(anyhow!("unit unavailable")),
+            Ok(false),
+            Ok(false),
+        );
+        assert!(matches!(
+            unit,
+            PendingLaunchState::Ambiguous(ref reason)
+                if reason.contains("exact unit probe failed")
+                    && reason.contains("unit unavailable")
+        ));
+
+        let target = classify_pending_artifact_probes(
+            false,
+            Ok(false),
+            Err(anyhow!("target unavailable")),
+            Ok(false),
+        );
+        assert!(matches!(
+            target,
+            PendingLaunchState::Ambiguous(ref reason)
+                if reason.contains("exact private target probe failed")
+                    && reason.contains("target unavailable")
+        ));
+
+        let marker = classify_pending_artifact_probes(
+            false,
+            Ok(false),
+            Ok(false),
+            Err(anyhow!("marker unavailable")),
+        );
+        assert!(matches!(
+            marker,
+            PendingLaunchState::Ambiguous(ref reason)
+                if reason.contains("exact marker probe failed")
+                    && reason.contains("marker unavailable")
+        ));
+    }
+
+    #[test]
+    fn failed_launch_cleanup_retains_pending_on_marker_probe_error() {
+        let decision = failed_launch_cleanup_decision(
+            Ok(false),
+            Ok(false),
+            Err(anyhow!("metadata I/O failure")),
+        );
+        assert!(matches!(
+            decision,
+            FailedLaunchCleanupDecision::RetainPending(ref reason)
+                if reason.contains("exact marker probe failed")
+                    && reason.contains("metadata I/O failure")
+        ));
+    }
+
+    #[test]
+    fn dangling_marker_entry_blocks_failed_cleanup_and_pending_dead_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join("dangling.marker.toml");
+        std::os::unix::fs::symlink(temp.path().join("missing-target"), &marker_path).unwrap();
+
+        let marker_present = path_entry_exists(&marker_path).unwrap();
+        assert!(marker_present);
+        assert!(matches!(
+            failed_launch_cleanup_decision(Ok(false), Ok(false), Ok(marker_present)),
+            FailedLaunchCleanupDecision::RetainPending(ref reason)
+                if reason.contains("marker_present=true")
+        ));
+        assert!(matches!(
+            classify_pending_artifact_probes(
+                false,
+                Ok(false),
+                Ok(false),
+                Ok(marker_present),
+            ),
+            PendingLaunchState::Ambiguous(ref reason)
+                if reason.contains("marker_present=true")
+        ));
+    }
+
+    #[test]
     fn non_force_stop_treats_an_absent_exact_invocation_as_complete() {
         let receipt = stale_receipt();
         let backend = fake_backend(None);
@@ -2909,6 +3236,35 @@ mod tests {
     }
 
     #[test]
+    fn marker_cleanup_accepts_missing_runtime_namespace_without_creating_it() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let portagenty = temp.path().join("portagenty");
+        let workloads = portagenty.join("workloads");
+        let proof = WorkloadAnchorProof {
+            protocol_version: ANCHOR_PROTOCOL_VERSION,
+            nonce: nonce.into(),
+            marker_path: workloads.join(format!("{nonce}.marker.toml")),
+            pid: 123,
+            start_time_ticks: 456,
+        };
+
+        remove_verified_workload_marker_in(temp.path(), &proof).unwrap();
+        assert!(!portagenty.exists());
+
+        fs::create_dir(&portagenty).unwrap();
+        fs::set_permissions(&portagenty, fs::Permissions::from_mode(0o700)).unwrap();
+        remove_verified_workload_marker_in(temp.path(), &proof).unwrap();
+        assert!(!workloads.exists());
+
+        fs::create_dir(&workloads).unwrap();
+        fs::set_permissions(&workloads, fs::Permissions::from_mode(0o700)).unwrap();
+        remove_verified_workload_marker_in(temp.path(), &proof).unwrap();
+        assert!(!proof.marker_path.exists());
+    }
+
+    #[test]
     fn verified_marker_cleanup_requires_exact_path_and_content() {
         let temp = tempfile::tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -2929,6 +3285,14 @@ mod tests {
             pid: 123,
             start_time_ticks: 456,
         };
+        std::os::unix::fs::symlink(workloads.join("missing-target"), &marker_path).unwrap();
+        assert!(remove_verified_workload_marker_in(temp.path(), &proof).is_err());
+        assert!(fs::symlink_metadata(&marker_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_file(&marker_path).unwrap();
+
         write_private_file(
             &marker_path,
             toml::to_string(&WorkloadMarker {
@@ -2975,7 +3339,7 @@ mod tests {
             .remove_stale_binding_with_probe(&store, &expected, |_| Ok(false))
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("changed after confirmation"));
+        assert!(format!("{error:#}").contains("changed before cleanup"));
         assert_eq!(store.find(&expected.logical_id).unwrap(), Some(replacement));
     }
 

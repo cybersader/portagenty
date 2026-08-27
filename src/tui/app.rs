@@ -61,7 +61,7 @@ pub enum LaunchKind {
         intent: SupervisionIntent,
     },
     /// Replace one exact stale receipt, create a fresh owned binding, and attach
-    /// in a single confirmed flow. Stale cleanup itself never sends a signal.
+    /// in one revalidated flow. Stale cleanup itself never sends a signal.
     ReplaceStaleSupervised {
         session: Session,
         receipt: Box<BindingReceipt>,
@@ -348,13 +348,6 @@ enum PendingAction {
         display_name: String,
         receipt: Box<BindingReceipt>,
     },
-    /// Confirm one exact stale receipt replacement. Execution is handed to the
-    /// outer launch coordinator so cleanup, creation, and attach remain one flow.
-    ReplaceStaleBinding {
-        session: Session,
-        receipt: Box<BindingReceipt>,
-        limits: ResourceLimits,
-    },
     /// Switch the workspace's pinned multiplexer between tmux and
     /// zellij. Edits the TOML in place via toml_edit (preserves
     /// comments + sessions). Doesn't touch any live mpx sessions
@@ -536,7 +529,7 @@ impl App {
                 self.rows.push(SessionRow {
                     mpx_name: target_name,
                     display_name: receipt.logical_id.session_name.clone(),
-                    state: SessionState::Untracked,
+                    state: SessionState::NotStarted,
                     logical_id: Some(receipt.logical_id.clone()),
                     mux_target: Some(receipt.mux_target.clone()),
                     ownership,
@@ -861,12 +854,11 @@ impl App {
                     } else {
                         receipt.limits.clone()
                     };
-                    self.pending = Some(PendingAction::ReplaceStaleBinding {
+                    return self.reduce_action(Action::LaunchStaleSupervised {
                         session,
                         receipt: Box::new(receipt),
                         limits,
                     });
-                    return None;
                 }
                 let session_kind = session.kind;
                 let kind = if ownership == RowOwnership::IdleSupported {
@@ -2025,9 +2017,6 @@ impl App {
                     }
                 }
             }
-            PendingAction::ReplaceStaleBinding { .. } => {
-                self.set_status("stale replacement must be handed to the launch coordinator");
-            }
             PendingAction::DeleteSession { name } => {
                 let Some(path) = self.workspace.file_path.clone() else {
                     self.set_status("delete failed: no workspace file on disk");
@@ -2321,20 +2310,7 @@ impl App {
         // performs the pending action, anything else cancels.
         if let Some(action) = self.pending.take() {
             match crate::tui::confirm::classify(code) {
-                crate::tui::confirm::ConfirmKey::Confirm => match action {
-                    PendingAction::ReplaceStaleBinding {
-                        session,
-                        receipt,
-                        limits,
-                    } => {
-                        return Action::LaunchStaleSupervised {
-                            session,
-                            receipt,
-                            limits,
-                        };
-                    }
-                    action => self.perform_pending(action),
-                },
+                crate::tui::confirm::ConfirmKey::Confirm => self.perform_pending(action),
                 crate::tui::confirm::ConfirmKey::Cancel => {
                     self.set_status("cancelled");
                 }
@@ -3168,6 +3144,7 @@ fn resource_event_notice(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn compact_bytes(value: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -3475,37 +3452,6 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
                  multiplexer target are both absent. This sends no signal and stops no process."
             ),
         ),
-        PendingAction::ReplaceStaleBinding {
-            session, limits, ..
-        } => {
-            let memory = limits
-                .memory_high_bytes
-                .map(compact_bytes)
-                .unwrap_or_else(|| "unset".into());
-            let memory_max = limits
-                .memory_max_bytes
-                .map(compact_bytes)
-                .unwrap_or_else(|| "unset".into());
-            let swap_max = limits
-                .memory_swap_max_bytes
-                .map(compact_bytes)
-                .unwrap_or_else(|| "unset".into());
-            let cpu = limits
-                .cpu_quota_percent
-                .map(|value| format!("{value}%"))
-                .unwrap_or_else(|| "unset".into());
-            let tasks = limits
-                .tasks_max
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unset".into());
-            (
-                "Replace stale supervised binding".into(),
-                format!(
-                    "Prove the exact dead receipt for {:?} has no systemd invocation or private multiplexer target, remove only that receipt without sending a signal, then relaunch it supervised with MemoryHigh {memory}, MemoryMax {memory_max}, SwapMax {swap_max}, CPU {cpu}, and TasksMax {tasks}?",
-                    session.name
-                ),
-            )
-        }
         PendingAction::SwitchMpx {
             from,
             to,
@@ -4994,7 +4940,25 @@ mod tests {
             session_kind: None,
             requested_slice: None,
             workload_anchor: None,
+            launch_boot_id: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_test_receipt(launch_boot_id: Option<&str>) -> BindingReceipt {
+        let mut receipt = test_receipt();
+        receipt.schema_version = crate::supervision::model::RECEIPT_SCHEMA_VERSION;
+        receipt.workload_anchor = Some(crate::supervision::model::WorkloadAnchorProof {
+            protocol_version: 1,
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            marker_path: PathBuf::from(
+                "/run/user/1000/portagenty/workloads/0123456789abcdef0123456789abcdef.marker.toml",
+            ),
+            pid: 123,
+            start_time_ticks: 456,
+        });
+        receipt.launch_boot_id = launch_boot_id.map(str::to_string);
+        receipt
     }
 
     #[cfg(target_os = "linux")]
@@ -5040,6 +5004,7 @@ mod tests {
             created_at_unix_ms: 1,
             creator_pid: 123,
             creator_start_time_ticks: 456,
+            creator_boot_id: None,
             last_error: Some("interrupted".into()),
         };
         let mut app = supervised_app().with_supervision_evidence(Vec::new(), vec![pending]);
@@ -5056,6 +5021,71 @@ mod tests {
             assert!(app.pending.is_none());
             assert!(app.supervising.is_none());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_receipt_orphan_is_non_live_cleanup_only() {
+        let mut app = supervised_app();
+        let mut receipt = test_receipt();
+        receipt.logical_id =
+            LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "receipt-orphan")
+                .unwrap();
+        receipt.mux_target = crate::supervision::MuxTarget::TmuxPrivate {
+            socket: PathBuf::from("/run/user/1000/portagenty/orphan/tmux.sock"),
+            session: "ordinary-looking-name".into(),
+        };
+        let logical_id = receipt.logical_id.clone();
+        app.receipts.insert(logical_id.clone(), receipt.clone());
+        app.apply_receipt_annotations(&BTreeMap::from([(
+            logical_id,
+            (RowOwnership::Stale, None, Vec::new()),
+        )]));
+        let orphan_index = app
+            .rows
+            .iter()
+            .position(|row| row.display_name == "receipt-orphan")
+            .unwrap();
+        app.list_state.select(Some(orphan_index));
+
+        assert_eq!(app.rows[orphan_index].state, SessionState::NotStarted);
+        assert!(app.rows[orphan_index].session.is_none());
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app.pending.is_none());
+
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::RemoveStaleReceipt { .. })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_receipt_orphan_attaches_only_to_exact_private_target() {
+        let mut app = supervised_app();
+        let mut receipt = test_receipt();
+        receipt.logical_id =
+            LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "owned-orphan").unwrap();
+        let expected = receipt.mux_target.clone();
+        let logical_id = receipt.logical_id.clone();
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.apply_receipt_annotations(&BTreeMap::from([(
+            logical_id,
+            (RowOwnership::Owned, None, Vec::new()),
+        )]));
+        let orphan_index = app
+            .rows
+            .iter()
+            .position(|row| row.display_name == "owned-orphan")
+            .unwrap();
+        app.list_state.select(Some(orphan_index));
+
+        assert!(matches!(
+            app.reduce_action(Action::LaunchSelected),
+            Some(AppOutcome::Launch(LaunchKind::AttachOwned { target, .. }))
+                if target == expected
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -5120,35 +5150,138 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn idle_stale_enter_confirms_exact_replacement_with_recommended_limits() {
+    fn idle_stale_enter_relaunches_directly_with_kind_defaults_without_modal() {
         let mut app = app_with_test_receipt();
         app.rows[0].ownership = RowOwnership::Stale;
         app.rebuild_rows(&[]);
 
-        assert!(app.reduce_action(Action::LaunchSelected).is_none());
-        assert!(matches!(
-            app.pending,
-            Some(PendingAction::ReplaceStaleBinding { .. })
-        ));
-        let (_, copy) = confirm_copy(app.pending.as_ref().unwrap(), "x");
-        assert!(copy.contains("without sending a signal"), "copy: {copy}");
-        assert!(copy.contains("MemoryHigh 3.0G"), "copy: {copy}");
-        assert!(copy.contains("MemoryMax 5.0G"), "copy: {copy}");
-        assert!(copy.contains("SwapMax 512M"), "copy: {copy}");
-
-        let action = app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
-        match action {
-            Action::LaunchStaleSupervised {
+        match app.reduce_action(Action::LaunchSelected) {
+            Some(AppOutcome::Launch(LaunchKind::ReplaceStaleSupervised {
                 session,
                 receipt,
                 limits,
-            } => {
+            })) => {
                 assert_eq!(session.name, "s0");
                 assert_eq!(*receipt, test_receipt());
                 assert_eq!(limits, ResourceLimits::claude_defaults());
+                assert!(app.pending.is_none());
             }
-            other => panic!("expected stale supervised action, got {other:?}"),
+            other => panic!("expected direct stale relaunch, got {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_enter_reuses_existing_limits() {
+        let mut receipt = current_test_receipt(None);
+        receipt.limits = ResourceLimits {
+            memory_high_bytes: Some(ResourceLimits::GIB),
+            memory_max_bytes: Some(2 * ResourceLimits::GIB),
+            memory_swap_max_bytes: Some(256 * ResourceLimits::MIB),
+            cpu_quota_percent: Some(200.0),
+            tasks_max: Some(300),
+        };
+        let expected_limits = receipt.limits.clone();
+        let mut app = supervised_app();
+        app.receipts
+            .insert(receipt.logical_id.clone(), receipt.clone());
+        app.rows[0].ownership = RowOwnership::Stale;
+
+        assert!(matches!(
+            app.reduce_action(Action::LaunchSelected),
+            Some(AppOutcome::Launch(LaunchKind::ReplaceStaleSupervised {
+                receipt: launched_receipt,
+                limits,
+                ..
+            })) if *launched_receipt == receipt && limits == expected_limits
+        ));
+        assert!(app.pending.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_enter_ignores_optional_boot_provenance() {
+        let receipts = [
+            current_test_receipt(Some("123e4567-e89b-12d3-a456-426614174000")),
+            current_test_receipt(Some("550e8400-e29b-41d4-a716-446655440000")),
+            current_test_receipt(None),
+            current_test_receipt(Some("not-a-uuid")),
+            test_receipt(),
+        ];
+
+        for receipt in receipts {
+            let mut app = supervised_app();
+            app.receipts
+                .insert(receipt.logical_id.clone(), receipt.clone());
+            app.rows[0].ownership = RowOwnership::Stale;
+
+            assert!(matches!(
+                app.reduce_action(Action::LaunchSelected),
+                Some(AppOutcome::Launch(LaunchKind::ReplaceStaleSupervised {
+                    receipt: launched_receipt,
+                    ..
+                })) if *launched_receipt == receipt
+            ));
+            assert!(app.pending.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ambiguous_and_split_rows_keep_fail_closed_routing() {
+        let receipt = current_test_receipt(None);
+        let mut app = supervised_app();
+        app.receipts
+            .insert(receipt.logical_id.clone(), receipt.clone());
+
+        app.rows[0].ownership = RowOwnership::Ambiguous;
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app.pending.is_none());
+
+        app.rows[0].ownership = RowOwnership::SplitContainment;
+        app.rows[0].state = SessionState::Live;
+        app.rows[0].mux_target = Some(receipt.mux_target.clone());
+        assert!(matches!(
+            app.reduce_action(Action::LaunchSelected),
+            Some(AppOutcome::Launch(LaunchKind::AttachOwned { target, .. }))
+                if target == receipt.mux_target
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_row_blocks_direct_stale_relaunch() {
+        let receipt = current_test_receipt(None);
+        let logical_id = receipt.logical_id.clone();
+        let mut app = supervised_app();
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.pending_launches.insert(
+            logical_id.clone(),
+            crate::supervision::PendingLaunch {
+                logical_id,
+                unit_name: "portagenty-wpending.service".into(),
+                mux_target: crate::supervision::MuxTarget::TmuxPrivate {
+                    socket: PathBuf::from("/run/user/1000/portagenty/tmux/pending.sock"),
+                    session: "main".into(),
+                },
+                marker_path: PathBuf::from(
+                    "/run/user/1000/portagenty/workloads/0123456789abcdef0123456789abcdef.marker.toml",
+                ),
+                created_at_unix_ms: 1,
+                creator_pid: 123,
+                creator_start_time_ticks: 456,
+                creator_boot_id: None,
+                last_error: None,
+            },
+        );
+        app.rows[0].ownership = RowOwnership::Pending;
+
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app.pending.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("pending supervision evidence")));
     }
 
     #[cfg(target_os = "linux")]
@@ -5213,11 +5346,11 @@ mod tests {
             Box::new(MockMultiplexer::new()),
             vec![live_session("s0")],
         );
-        let receipt = test_receipt();
-        app.receipts
-            .insert(receipt.logical_id.clone(), receipt.clone());
+        let receipt = current_test_receipt(Some("550e8400-e29b-41d4-a716-446655440000"));
+        let logical_id = receipt.logical_id.clone();
+        app.receipts.insert(logical_id.clone(), receipt.clone());
         app.apply_receipt_annotations(&BTreeMap::from([(
-            receipt.logical_id,
+            logical_id,
             (RowOwnership::Stale, None, Vec::new()),
         )]));
 

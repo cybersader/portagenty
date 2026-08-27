@@ -937,14 +937,14 @@ pub(crate) fn replace_stale_supervised_resolved(
         .ok_or_else(|| anyhow!("stale supervised replacement requires a valid workspace UUID"))?;
     let logical_id = LogicalSessionId::new(workspace_id, sess.name.clone())?;
     if expected.logical_id != logical_id {
-        bail!("the confirmed stale receipt does not match the selected workspace/session");
+        bail!("the selected stale receipt does not match the selected workspace/session");
     }
     let store = crate::supervision::ReceiptStore::standard()?;
     if store.find_pending(&logical_id)?.is_some() {
         bail!("a pending supervision launch exists; no stale receipt was removed");
     }
     if store.find(&logical_id)?.as_ref() != Some(&expected) {
-        bail!("the ownership receipt changed after confirmation; refresh and retry");
+        bail!("the ownership receipt changed before replacement; refresh and retry");
     }
     let ordinary_target = crate::mux::workspace_session_name(&ws.name, &sess.name);
     let ordinary_mux = build_mux(ws.multiplexer)?;

@@ -39,6 +39,8 @@ pub struct PendingLaunch {
     #[serde(default)]
     pub creator_start_time_ticks: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
@@ -381,6 +383,7 @@ mod tests {
             session_kind: None,
             requested_slice: None,
             workload_anchor: None,
+            launch_boot_id: None,
         }
     }
 
@@ -454,6 +457,64 @@ mod tests {
             .bindings
             .iter()
             .any(|binding| binding.schema_version == RECEIPT_SCHEMA_VERSION));
+        assert!(loaded
+            .bindings
+            .iter()
+            .all(|binding| binding.launch_boot_id.is_none()));
+        assert!(!fs::read_to_string(store.path())
+            .unwrap()
+            .contains("launch-boot-id"));
+    }
+
+    #[test]
+    fn optional_boot_provenance_round_trips_without_shape_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+        let mut stamped = receipt("stamped", "11112222333344445555666677778888");
+        stamped.launch_boot_id = Some("550e8400-e29b-41d4-a716-446655440000".into());
+        store.upsert(stamped.clone()).unwrap();
+
+        let pending = PendingLaunch {
+            logical_id: logical("pending-boot"),
+            unit_name: "portagenty-wpending.service".into(),
+            mux_target: MuxTarget::TmuxPrivate {
+                socket: temp.path().join("pending.sock"),
+                session: "main".into(),
+            },
+            marker_path: temp
+                .path()
+                .join("portagenty/workloads/fedcba9876543210fedcba9876543210.marker.toml"),
+            created_at_unix_ms: 1,
+            creator_pid: 123,
+            creator_start_time_ticks: 456,
+            creator_boot_id: Some("not-a-uuid".into()),
+            last_error: None,
+        };
+        store.begin_pending(pending.clone()).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.bindings, vec![stamped]);
+        assert_eq!(loaded.pending_launches, vec![pending]);
+    }
+
+    #[test]
+    fn malformed_receipt_boot_hint_is_nonfatal() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+        let mut malformed = receipt("malformed", "11112222333344445555666677778888");
+        malformed.schema_version = RECEIPT_SCHEMA_VERSION;
+        malformed.workload_anchor = Some(super::super::model::WorkloadAnchorProof {
+            protocol_version: 1,
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            marker_path: temp
+                .path()
+                .join("portagenty/workloads/0123456789abcdef0123456789abcdef.marker.toml"),
+            pid: 123,
+            start_time_ticks: 456,
+        });
+        malformed.launch_boot_id = Some("not-a-uuid".into());
+        store.upsert(malformed.clone()).unwrap();
+        assert_eq!(store.load().unwrap().bindings, vec![malformed]);
     }
 
     #[test]
@@ -474,11 +535,19 @@ mod tests {
             created_at_unix_ms: 1,
             creator_pid: 123,
             creator_start_time_ticks: 456,
+            creator_boot_id: None,
             last_error: None,
         };
         store.begin_pending(pending.clone()).unwrap();
         assert!(store.begin_pending(pending).is_err());
-        assert!(store.find_pending(&logical_id).unwrap().is_some());
+        assert_eq!(
+            store
+                .find_pending(&logical_id)
+                .unwrap()
+                .unwrap()
+                .creator_boot_id,
+            None
+        );
 
         let mut current = receipt("pending", "00112233445566778899aabbccddeeff");
         current.schema_version = RECEIPT_SCHEMA_VERSION;
