@@ -2,186 +2,179 @@
 //! `zellij-e2e` cargo feature. See `tests/mux_tmux_e2e.rs` for the
 //! tmux-side counterpart.
 //!
-//! Caveats specific to zellij:
-//!
-//! - zellij doesn't support per-socket isolation the way tmux's `-S`
-//!   does. Session names are in a shared per-UID namespace. Tests
-//!   therefore use a unique prefix (`pa-e2e-<pid>-<nanos>-`) and
-//!   filter when reading back from `list_sessions`.
-//! - `create_and_attach` and `attach` cannot be exercised here: both
-//!   would either block on the TTY (outside zellij) or be rejected
-//!   by zellij's nested-session check (inside zellij, where CI
-//!   runners effectively aren't but WSL might be). These paths are
-//!   covered by their own unit tests; the e2e suite stays in the
-//!   create-background / list / has / kill quadrant where it can
-//!   actually automate cleanly.
+//! Every test targets a private temporary `$XDG_RUNTIME_DIR`, so parallel
+//! nextest processes do not share a Zellij server, registry, or user session
+//! namespace. `create_and_attach` and `attach` remain outside this suite because
+//! both intentionally own a TTY until detach or exit.
 
 #![cfg(feature = "zellij-e2e")]
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use portagenty::mux::{Multiplexer, ZellijAdapter};
-use serial_test::serial;
+use portagenty::mux::{Multiplexer, SessionInfo, ZellijAdapter};
 
-fn test_prefix() -> String {
+fn unique_name(suffix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    format!("pa-e2e-{}-{}-", std::process::id(), nanos)
+    format!("pa-e2e-{}-{nanos}-{suffix}", std::process::id())
 }
 
-fn unique_name(prefix: &str, suffix: &str) -> String {
-    format!("{prefix}{suffix}")
+struct E2e {
+    adapter: ZellijAdapter,
+    runtime: tempfile::TempDir,
+    cleanup_names: Vec<String>,
 }
 
-/// RAII guard that kills + deletes a session on drop. Test bodies can
-/// early-return without worrying about leaks.
-struct SessionGuard<'a> {
-    adapter: &'a ZellijAdapter,
-    names: Vec<String>,
-}
-
-impl<'a> SessionGuard<'a> {
-    fn new(adapter: &'a ZellijAdapter) -> Self {
+impl E2e {
+    fn new() -> Self {
+        // Zellij embeds both the runtime and session name in a Unix socket path,
+        // whose platform limit is only 107 bytes. Keep the disposable runtime
+        // short even when the caller's TMPDIR is a deep agent scratch path.
+        #[cfg(unix)]
+        let runtime = tempfile::Builder::new()
+            .prefix("pa-zj-")
+            .tempdir_in("/tmp")
+            .expect("create private zellij runtime");
+        #[cfg(not(unix))]
+        let runtime = tempfile::tempdir().expect("create private zellij runtime");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("secure private zellij runtime");
+        }
+        let adapter = ZellijAdapter::with_runtime_dir(runtime.path());
         Self {
             adapter,
-            names: Vec::new(),
+            runtime,
+            cleanup_names: Vec::new(),
         }
     }
 
-    fn track(&mut self, name: impl Into<String>) {
-        self.names.push(name.into());
+    fn context(&self, name: &str) -> String {
+        format!(
+            "session {name:?} in runtime {}",
+            self.runtime.path().display()
+        )
+    }
+
+    fn create_background(&mut self, name: &str) {
+        self.cleanup_names.push(name.to_string());
+        self.adapter
+            .create_background(name)
+            .unwrap_or_else(|error| panic!("create {}: {error:#}", self.context(name)));
+    }
+
+    fn list_sessions(&self) -> Vec<SessionInfo> {
+        self.adapter.list_sessions().unwrap_or_else(|error| {
+            panic!(
+                "list sessions in runtime {}: {error:#}",
+                self.runtime.path().display()
+            )
+        })
     }
 }
 
-impl Drop for SessionGuard<'_> {
+impl Drop for E2e {
     fn drop(&mut self) {
-        for n in &self.names {
-            let _ = self.adapter.kill_and_delete(n);
+        for name in &self.cleanup_names {
+            if let Err(error) = self.adapter.kill_and_delete(name) {
+                eprintln!("cleanup {} failed: {error:#}", self.context(name));
+            }
         }
     }
 }
 
 #[test]
-#[serial]
-fn list_sessions_succeeds_and_does_not_error() {
-    let a = ZellijAdapter::new();
-    let list = a.list_sessions().expect("list_sessions");
-    // Shared namespace: can't assert emptiness. Just make sure no
-    // session in the list has a name collision with our prefix.
-    let prefix = test_prefix();
+fn list_sessions_on_private_runtime_is_empty() {
+    let harness = E2e::new();
+    let list = harness.list_sessions();
     assert!(
-        !list.iter().any(|s| s.name.starts_with(&prefix)),
-        "stale pa-e2e sessions visible: {list:?}"
+        list.is_empty(),
+        "unexpected sessions in private runtime {}: {list:?}",
+        harness.runtime.path().display()
     );
 }
 
 #[test]
-#[serial]
 fn create_background_then_list_shows_session() {
-    let a = ZellijAdapter::new();
-    let mut guard = SessionGuard::new(&a);
+    let mut harness = E2e::new();
+    let name = unique_name("list-shows");
+    harness.create_background(&name);
 
-    let name = unique_name(&test_prefix(), "list-shows");
-    a.create_background(&name).expect("create_background");
-    guard.track(&name);
-
-    // Zellij's session registration is asynchronous — poll briefly
-    // before giving up so CI runners with slow I/O don't flake.
-    let mut found = false;
-    for _ in 0..10 {
-        let list = a.list_sessions().expect("list");
-        if list.iter().any(|s| s.name == name) {
-            found = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    assert!(found, "expected {name:?} in list after 2s of polling");
+    let list = harness.list_sessions();
+    assert!(
+        list.iter().any(|session| session.name == name),
+        "expected {} in {list:?}",
+        harness.context(&name)
+    );
 }
 
 #[test]
-#[serial]
 fn has_session_returns_true_after_create_background() {
-    let a = ZellijAdapter::new();
-    let mut guard = SessionGuard::new(&a);
-
-    let name = unique_name(&test_prefix(), "has");
+    let mut harness = E2e::new();
+    let name = unique_name("has");
     assert!(
-        !a.has_session(&name).unwrap(),
-        "session shouldn't exist yet"
+        !harness.adapter.has_session(&name).unwrap(),
+        "{} should not exist yet",
+        harness.context(&name)
     );
-    a.create_background(&name).unwrap();
-    guard.track(&name);
+
+    harness.create_background(&name);
     assert!(
-        a.has_session(&name).unwrap(),
-        "expected has_session -> true"
+        harness.adapter.has_session(&name).unwrap(),
+        "expected has_session -> true for {}",
+        harness.context(&name)
     );
 }
 
 #[test]
-#[serial]
 fn kill_removes_session() {
-    let a = ZellijAdapter::new();
+    let mut harness = E2e::new();
+    let name = unique_name("kill");
+    harness.create_background(&name);
+    assert!(harness.adapter.has_session(&name).unwrap());
 
-    let name = unique_name(&test_prefix(), "kill");
-    a.create_background(&name).unwrap();
-    assert!(a.has_session(&name).unwrap());
-
-    a.kill(&name).unwrap();
-    assert!(!a.has_session(&name).unwrap());
+    harness.adapter.kill(&name).unwrap();
+    assert!(
+        !harness.adapter.has_session(&name).unwrap(),
+        "{} survived kill",
+        harness.context(&name)
+    );
 }
 
 #[test]
-#[serial]
 fn kill_is_idempotent_on_missing_session() {
-    let a = ZellijAdapter::new();
-    let name = unique_name(&test_prefix(), "idem");
-    // Session doesn't exist. kill should succeed silently.
-    a.kill(&name).unwrap();
-    a.kill(&name).unwrap();
+    let harness = E2e::new();
+    let name = unique_name("idem");
+    harness.adapter.kill(&name).unwrap();
+    harness.adapter.kill(&name).unwrap();
 }
 
 #[test]
-#[serial]
 fn session_info_cwd_and_attached_are_none_from_list() {
-    let a = ZellijAdapter::new();
-    let mut guard = SessionGuard::new(&a);
+    let mut harness = E2e::new();
+    let name = unique_name("opt");
+    harness.create_background(&name);
 
-    let name = unique_name(&test_prefix(), "opt");
-    a.create_background(&name).unwrap();
-    guard.track(&name);
-
-    // Under CI load zellij's session registry propagation can trail
-    // create_background's own poll by a beat or two when other e2e
-    // tests are racing create/kill on the same $XDG_RUNTIME_DIR.
-    // Retry the lookup briefly rather than failing on the first miss —
-    // same contract, just with slack matching real observed timing.
-    let mut found = None;
-    for _ in 0..20 {
-        let list = a.list_sessions().unwrap();
-        if let Some(info) = list.iter().find(|s| s.name == name) {
-            found = Some(info.clone());
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let found = found.expect("session should be in list within 1s");
-    // zellij doesn't expose these; adapter reports None to match the
-    // SessionInfo contract.
+    let list = harness.list_sessions();
+    let found = list
+        .iter()
+        .find(|session| session.name == name)
+        .unwrap_or_else(|| panic!("{} missing from {list:?}", harness.context(&name)));
     assert_eq!(found.cwd, None);
     assert_eq!(found.attached, None);
 }
 
 #[test]
-#[serial]
 fn detach_current_is_not_supported() {
-    let a = ZellijAdapter::new();
-    let err = a.detach_current().unwrap_err();
-    let msg = format!("{err:#}");
+    let harness = E2e::new();
+    let error = harness.adapter.detach_current().unwrap_err();
+    let message = format!("{error:#}");
     assert!(
-        msg.contains("no CLI detach"),
-        "expected 'no CLI detach' hint, got: {msg}"
+        message.contains("no CLI detach"),
+        "expected 'no CLI detach' hint, got: {message}"
     );
 }
