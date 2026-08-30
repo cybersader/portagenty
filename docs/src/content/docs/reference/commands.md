@@ -255,9 +255,11 @@ target races, and every failure after creation may have begun return to the same
 actionable row without creating an ordinary target. Pending launches block attach,
 fallback, creation, stop, and kill until reconciled. A valid unequal stored/current
 boot UUID proves only that the pending creator is gone; otherwise PID/start-time
-proof remains required. `Dead` still requires the exact unit, private target, and
-marker all absent, and probe errors or partial presence stay ambiguous. Private tmux
-servers are launched without user-bus/runtime variables to
+proof remains required. Cleanup requires exact unit and private-target absence. An
+absent marker is already clean; an exact marker may be removed only after its full
+owner-runtime identity is revalidated and its recorded anchor PID/start time is
+proven dead. Probe errors, live anchors, mismatches, and partial presence stay
+ambiguous. Private tmux servers are launched without user-bus/runtime variables to
 prevent sibling tmux scopes, while the pane receives the exact restored user bus.
 
 `S` edits all five limits or resolves cleared fields from the declared kind, can
@@ -290,7 +292,7 @@ pa resources kill claude --force
 |---|---|
 | `capabilities` | Reports backend, available metrics/actions, all five resource-limit kinds, and degraded or unsupported reasons. |
 | `status [session]` | Shows pending (active, dead-cleanable, or ambiguous), `owned`, `legacy-restart-required`, `split-containment`, `ambiguous-binding`, or `stale-binding` plus exact evidence, applied limits, and available/unavailable metrics. With no session, reports all declared sessions. |
-| `cleanup <session>` | Signal-free cleanup only. Removes a pending journal when its creator is proven gone and its exact unit, private target, and marker are all absent, or removes a receipt after exact unit and target absence is revalidated. Exact runtime/path/nonce shape is checked first; an absent `portagenty` directory, `workloads` directory, or marker succeeds without creating directories, while existing components retain owner/mode/type/content checks. Refuses partial, live, or probe-error evidence. |
+| `cleanup <session>` | Signal-free cleanup only. Removes a pending journal when its creator, exact unit, and private target are proven gone and its marker is either absent or exactly validated with a dead recorded anchor; removes a receipt after exact unit and target absence is revalidated. Exact runtime/path/nonce shape is checked first; absent runtime components succeed without being recreated, while existing components retain owner/mode/type/protocol/nonce/PID/start-time checks. Refuses partial, live, mismatched, or probe-error evidence. |
 | `stop <session>` | For owned-and-verified v2 containment only: revalidates ownership, requests graceful shutdown of the exact private multiplexer target, then performs a non-force systemd stop if needed. Never silently escalates to SIGKILL. |
 | `kill <session> --force` | For owned-and-verified v2 containment only: separately explicit whole-cgroup SIGKILL after immediate ownership revalidation. Refuses without `--force`. |
 

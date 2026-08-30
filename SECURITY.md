@@ -96,14 +96,19 @@ supervision preflight or runtime failure into ordinary creation. A valid unequal
 stored/current boot ID proves only that
 the creator is gone; same, missing, invalid, or unreadable boot evidence retains
 the PID/start-time check. They may be signal-free cleaned only when the creator,
-exact unit, exact private target, and exact owner-runtime marker are all absent;
-artifact probe errors and partial presence remain ambiguous. Existing shared
-tmux/Zellij sessions are never retroactively claimed.
+exact unit, and exact private target are absent. An absent owner-runtime marker is
+already clean; an exact marker may be unlinked only after its full path, owner,
+mode, type, protocol, nonce, PID, and start-time proof is revalidated and its
+recorded anchor is proven dead. Artifact probe errors, live exact anchors,
+mismatches, and partial presence remain ambiguous. Existing shared tmux/Zellij
+sessions are never retroactively claimed.
 
 Supervised tmux uses a private mode-`0700` runtime/socket directory and one server
 per logical session. Supervised Zellij uses an exact validated runtime directory,
 a mode-`0600` generated layout, and PTY file descriptors passed through D-Bus.
-Both launch the same owner-only one-shot workload-anchor protocol. Launch specs
+Both launch the same owner-only one-shot workload-anchor protocol. The hidden
+anchor starts with its random nonce already observable in `/proc`; it refuses to
+publish a marker until that exact process environment is verified. Launch specs
 and markers are constrained to `$XDG_RUNTIME_DIR/portagenty/workloads` with exact
 nonce filenames; marker protocol, nonce, PID, and start time are verified before
 unlink. Cleanup validates the exact runtime/path/nonce shape first. An absent

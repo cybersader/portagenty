@@ -468,11 +468,15 @@ The implementation includes:
   to an old workload. Pending, ambiguous, errored, and unreconciled evidence blocks
   Enter, while split containment attaches only to its exact private target;
 - pending creator reconciliation where a valid boot mismatch proves only creator
-  absence and `Dead` still requires exact unit, private target, and marker absence;
+  absence and cleanup still requires exact unit and private-target absence;
   missing/invalid/read-failed boot evidence retains PID/start-time checks;
 - signal-free marker cleanup that validates exact runtime/path/nonce shape first,
   accepts missing Portagenty/workloads/marker components without creating them,
-  and preserves all checks for components that exist;
+  and removes an existing marker only after owner/mode/type/protocol/nonce/PID/
+  start-time revalidation proves its exact recorded anchor dead; live anchors,
+  mismatches, partial presence, and probe errors remain ambiguous;
+- workload-anchor marker publication only after the exact random nonce is already
+  observable in the anchor process's `/proc` environment;
 - `pa resources capabilities|status|stop|kill --force` and TUI ownership labels,
   editable five-field limits, bounded sampling, event warnings, and separately
   confirmed force-kill only for complete owned-and-verified v2 containment;

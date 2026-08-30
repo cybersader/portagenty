@@ -540,6 +540,19 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn render_workload_anchor_command(
+    portagenty_executable: &Path,
+    spec_path: &Path,
+    nonce: &str,
+) -> Result<String> {
+    Ok(format!(
+        "PORTAGENTY_WORKLOAD_NONCE={} exec {} __workload-anchor --spec {}",
+        shell_quote(nonce),
+        shell_quote(path_to_utf8(portagenty_executable, "Portagenty executable")?.as_str()),
+        shell_quote(path_to_utf8(spec_path, "workload launch specification")?.as_str())
+    ))
+}
+
 fn prepare_workload_anchor(
     session: &Session,
     runtime_dir: &Path,
@@ -560,11 +573,7 @@ fn prepare_workload_anchor(
     };
     let serialized = toml::to_string(&spec).context("serializing workload launch specification")?;
     write_private_file(&spec_path, serialized.as_bytes())?;
-    let command = format!(
-        "exec {} __workload-anchor --spec {}",
-        shell_quote(path_to_utf8(portagenty_executable, "Portagenty executable")?.as_str()),
-        shell_quote(path_to_utf8(&spec_path, "workload launch specification")?.as_str())
-    );
+    let command = render_workload_anchor_command(portagenty_executable, &spec_path, &nonce)?;
     Ok((ExpectedAnchor { nonce, marker_path }, spec_path, command))
 }
 
@@ -652,6 +661,81 @@ fn remove_verified_workload_marker_in(
         .with_context(|| format!("removing workload marker {}", proof.marker_path.display()))
 }
 
+fn pending_marker_nonce(pending: &PendingLaunch) -> Result<&str> {
+    pending.validate_shape()?;
+    pending
+        .marker_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".marker.toml"))
+        .ok_or_else(|| anyhow!("pending marker filename is invalid"))
+}
+
+fn remove_exact_dead_pending_marker_in(
+    runtime_dir: &Path,
+    pending: &PendingLaunch,
+    process_start_time: impl FnOnce(u32) -> Result<u64>,
+) -> Result<bool> {
+    let nonce = pending_marker_nonce(pending)?;
+    let expected = runtime_dir
+        .join("portagenty/workloads")
+        .join(format!("{nonce}.marker.toml"));
+    if pending.marker_path != expected {
+        bail!(
+            "pending workload marker {} is outside the exact owner runtime namespace",
+            pending.marker_path.display()
+        );
+    }
+    validate_owner_private_dir(runtime_dir, "runtime directory")?;
+    let portagenty_dir = runtime_dir.join("portagenty");
+    let workloads_dir = portagenty_dir.join("workloads");
+    if !validate_owner_private_dir_if_exists(&portagenty_dir, "Portagenty runtime directory")?
+        || !validate_owner_private_dir_if_exists(&workloads_dir, "workload directory")?
+        || !path_entry_exists(&pending.marker_path)?
+    {
+        return Ok(false);
+    }
+    validate_runtime_workload_path_in(runtime_dir, &pending.marker_path, nonce, "marker")?;
+    let marker = read_workload_marker(&pending.marker_path)?;
+    if marker.nonce != nonce || marker.pid == 0 || marker.start_time_ticks == 0 {
+        bail!("pending workload marker does not match its exact pending generation");
+    }
+    let proof = WorkloadAnchorProof {
+        protocol_version: marker.protocol_version,
+        nonce: nonce.to_string(),
+        marker_path: pending.marker_path.clone(),
+        pid: marker.pid,
+        start_time_ticks: marker.start_time_ticks,
+    };
+    match process_start_time(proof.pid) {
+        Ok(start_time) if start_time == proof.start_time_ticks => {
+            bail!(
+                "pending workload marker still identifies live anchor PID {}",
+                proof.pid
+            )
+        }
+        Ok(_) => {}
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("verifying pending workload marker PID {}", proof.pid))
+        }
+    }
+    remove_verified_workload_marker_in(runtime_dir, &proof)?;
+    Ok(true)
+}
+
+fn remove_exact_dead_pending_marker(pending: &PendingLaunch) -> Result<bool> {
+    remove_exact_dead_pending_marker_in(
+        &validated_runtime_dir()?,
+        pending,
+        process_start_time_ticks,
+    )
+}
+
 pub fn run_workload_anchor(spec_path: &Path) -> Result<()> {
     let filename = spec_path
         .file_name()
@@ -709,6 +793,10 @@ pub fn run_workload_anchor(spec_path: &Path) -> Result<()> {
         bail!("workload marker directory is not owner-only");
     }
     let pid = std::process::id();
+    let process_environment = fs::read(format!("/proc/{pid}/environ"))
+        .context("reading workload-anchor process environment before marker publication")?;
+    verify_workload_nonce(&process_environment, &spec.nonce)
+        .context("verifying workload-anchor nonce before marker publication")?;
     let marker = WorkloadMarker {
         protocol_version: ANCHOR_PROTOCOL_VERSION,
         nonce: spec.nonce.clone(),
@@ -1026,7 +1114,7 @@ impl LinuxSystemdBackend {
             creator_start_time_ticks,
             launch_boot_id.clone(),
         );
-        store.begin_pending(pending)?;
+        store.begin_pending(pending.clone())?;
         match self.start_prepared_with_boot_id(prepared, launch_boot_id) {
             Ok(receipt) => {
                 if let Err(error) = store.finalize_pending(receipt.clone()) {
@@ -1041,29 +1129,53 @@ impl LinuxSystemdBackend {
             }
             Err(error) => {
                 // Creation may already have started. Request only the normal
-                // non-force stop, then retain the pending journal unless every
-                // unit/target/marker probe proves the partial launch absent.
+                // non-force stop. Keep the exact pending generation locked while
+                // deciding whether a dead anchor marker and its journal are safe
+                // to remove.
                 let _ = self.api.stop_unit(&prepared.spec.unit_name);
-                let unit_present = self
-                    .api
-                    .unit_by_name(&prepared.spec.unit_name)
-                    .map(|unit| unit.is_some());
-                let target_present = mux_target_exists(&prepared.mux_target);
-                let marker_present = path_entry_exists(&prepared.expected_anchor.marker_path);
-                match failed_launch_cleanup_decision(unit_present, target_present, marker_present) {
-                    FailedLaunchCleanupDecision::ClearPending => {
-                        let _ = store.clear_pending(&prepared.logical_id);
+                let cleanup_result = store.update_locked(|file| {
+                    let index = file
+                        .pending_launches
+                        .iter()
+                        .position(|current| current.logical_id == pending.logical_id)
+                        .ok_or_else(|| anyhow!("the failed launch pending journal disappeared"))?;
+                    if file.pending_launches[index] != pending {
+                        bail!("the failed launch pending generation changed during rollback");
                     }
-                    FailedLaunchCleanupDecision::RetainPending(reason) => {
-                        let _ = store.mark_pending_error(
-                            &prepared.logical_id,
-                            format!(
+                    let unit_present = self
+                        .api
+                        .unit_by_name(&prepared.spec.unit_name)
+                        .map(|unit| unit.is_some());
+                    let target_present = mux_target_exists(&prepared.mux_target);
+                    let marker_present = failed_launch_marker_presence_with(
+                        &pending,
+                        &unit_present,
+                        &target_present,
+                        remove_exact_dead_pending_marker,
+                        path_entry_exists,
+                    );
+                    match failed_launch_cleanup_decision(
+                        unit_present,
+                        target_present,
+                        marker_present,
+                    ) {
+                        FailedLaunchCleanupDecision::ClearPending => {
+                            file.pending_launches.remove(index);
+                        }
+                        FailedLaunchCleanupDecision::RetainPending(reason) => {
+                            file.pending_launches[index].last_error = Some(format!(
                                 "post-creation validation failed: {error:#}; pending cleanup evidence: {reason}"
-                            ),
-                        );
+                            ));
+                        }
                     }
+                    Ok(())
+                });
+                match cleanup_result {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(error).context(format!(
+                        "post-creation cleanup could not reconcile the exact pending generation: {cleanup_error:#}"
+                    )),
                 }
-                Err(error)
             }
         }
     }
@@ -1107,23 +1219,88 @@ impl LinuxSystemdBackend {
         store: &ReceiptStore,
         expected: &PendingLaunch,
     ) -> Result<()> {
+        let runtime_dir = validated_runtime_dir()?;
+        let current_boot_id = read_current_boot_id().ok();
+        self.remove_dead_pending_with_probes(
+            store,
+            expected,
+            &runtime_dir,
+            current_boot_id.as_deref(),
+            process_start_time_ticks,
+            mux_target_exists,
+        )
+    }
+
+    fn remove_dead_pending_with_probes(
+        &self,
+        store: &ReceiptStore,
+        expected: &PendingLaunch,
+        runtime_dir: &Path,
+        current_boot_id: Option<&str>,
+        process_start_time: impl Fn(u32) -> Result<u64> + Copy,
+        target_exists: impl Fn(&MuxTarget) -> Result<bool>,
+    ) -> Result<()> {
         store.update_locked(|file| {
             let index = file
                 .pending_launches
                 .iter()
                 .position(|pending| pending.logical_id == expected.logical_id)
                 .ok_or_else(|| anyhow!("the pending launch is no longer present"))?;
-            let current = &file.pending_launches[index];
-            if current != expected {
+            let current = file.pending_launches[index].clone();
+            if &current != expected {
                 bail!("the pending launch changed after confirmation; refresh and retry");
             }
-            match self.reconcile_pending(current)? {
+            match pending_creator_alive_with(&current, current_boot_id, process_start_time) {
+                Ok(Some(false)) => {}
+                Ok(Some(true)) => {
+                    bail!("pending launch creator is still active; nothing was removed")
+                }
+                Ok(None) => {
+                    bail!("pending launch has no creator process proof; nothing was removed")
+                }
+                Err(error) => {
+                    return Err(error).context(
+                        "pending creator process could not be verified; nothing was removed",
+                    )
+                }
+            }
+            if self.api.unit_by_name(&current.unit_name)?.is_some() {
+                bail!("pending exact unit is still present; nothing was removed");
+            }
+            if target_exists(&current.mux_target)? {
+                bail!("pending exact private target is still present; nothing was removed");
+            }
+            remove_exact_dead_pending_marker_in(runtime_dir, &current, process_start_time)?;
+
+            let creator_alive =
+                match pending_creator_alive_with(&current, current_boot_id, process_start_time) {
+                    Ok(Some(creator_alive)) => creator_alive,
+                    Ok(None) => {
+                        bail!("pending launch has no creator process proof after cleanup")
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("revalidating pending creator process after marker cleanup")
+                    }
+                };
+            let unit_present = self
+                .api
+                .unit_by_name(&current.unit_name)
+                .map(|unit| unit.is_some());
+            let target_present = target_exists(&current.mux_target);
+            let marker_present = path_entry_exists(&current.marker_path);
+            match classify_pending_artifact_probes(
+                creator_alive,
+                unit_present,
+                target_present,
+                marker_present,
+            ) {
                 PendingLaunchState::Dead(_) => {
                     file.pending_launches.remove(index);
                     Ok(())
                 }
                 PendingLaunchState::Active(reason) => {
-                    bail!("pending launch creator is still active ({reason}); nothing was removed")
+                    bail!("pending launch creator became active ({reason}); nothing was removed")
                 }
                 PendingLaunchState::Ambiguous(reason) => {
                     bail!("pending launch remains ambiguous ({reason}); nothing was removed")
@@ -1880,6 +2057,14 @@ fn process_environment_value<'a>(environment: &'a [u8], key: &str) -> Option<&'a
         .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
 }
 
+fn verify_workload_nonce(environment: &[u8], nonce: &str) -> Result<()> {
+    if process_environment_value(environment, "PORTAGENTY_WORKLOAD_NONCE") != Some(nonce.as_bytes())
+    {
+        bail!("workload root nonce is absent from /proc");
+    }
+    Ok(())
+}
+
 fn verify_mux_anchor_with(
     proof: &WorkloadAnchorProof,
     mux_target: &MuxTarget,
@@ -1936,13 +2121,7 @@ fn verify_workload_anchor(
         bail!("workload root PID was reused");
     }
     let environment = fs::read(format!("/proc/{}/environ", proof.pid))?;
-    let expected_nonce = format!("PORTAGENTY_WORKLOAD_NONCE={}", proof.nonce);
-    if !environment
-        .split(|byte| *byte == 0)
-        .any(|entry| entry == expected_nonce.as_bytes())
-    {
-        bail!("workload root nonce is absent from /proc");
-    }
+    verify_workload_nonce(&environment, &proof.nonce)?;
     verify_mux_anchor_with(proof, mux_target, &environment, |socket, session| {
         TmuxAdapter::with_socket(socket).pane_pid(session)
     })?;
@@ -2021,6 +2200,20 @@ fn classify_pending_artifact_probes(
         }
     };
     classify_pending_launch(creator_alive, unit_present, target_present, marker_present)
+}
+
+fn failed_launch_marker_presence_with(
+    pending: &PendingLaunch,
+    unit_present: &Result<bool>,
+    target_present: &Result<bool>,
+    remove_dead_marker: impl FnOnce(&PendingLaunch) -> Result<bool>,
+    marker_present: impl FnOnce(&Path) -> Result<bool>,
+) -> Result<bool> {
+    if matches!((unit_present, target_present), (Ok(false), Ok(false))) {
+        remove_dead_marker(pending)
+            .context("removing exact dead workload marker during failed-launch rollback")?;
+    }
+    marker_present(&pending.marker_path)
 }
 
 fn failed_launch_cleanup_decision(
@@ -3010,6 +3203,37 @@ mod tests {
     }
 
     #[test]
+    fn workload_anchor_command_exports_nonce_before_exec() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let command = render_workload_anchor_command(
+            Path::new("/opt/Portagenty bin/pa"),
+            Path::new("/run/user/1000/portagenty/workloads/test launch.toml"),
+            nonce,
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            "PORTAGENTY_WORKLOAD_NONCE='0123456789abcdef0123456789abcdef' exec '/opt/Portagenty bin/pa' __workload-anchor --spec '/run/user/1000/portagenty/workloads/test launch.toml'"
+        );
+    }
+
+    #[test]
+    fn workload_nonce_must_be_exactly_visible_in_proc_environment() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        verify_workload_nonce(
+            format!("PATH=/usr/bin\0PORTAGENTY_WORKLOAD_NONCE={nonce}\0").as_bytes(),
+            nonce,
+        )
+        .unwrap();
+        assert!(verify_workload_nonce(b"PATH=/usr/bin\0", nonce).is_err());
+        assert!(verify_workload_nonce(
+            b"PORTAGENTY_WORKLOAD_NONCE=fedcba9876543210fedcba9876543210\0",
+            nonce,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn systemd_version_parser_handles_distribution_suffixes() {
         assert_eq!(
             parse_systemd_version("systemd 259 (259.8-1.fc44)"),
@@ -3119,6 +3343,53 @@ mod tests {
             creator_boot_id: creator_boot_id.map(str::to_string),
             last_error: None,
         }
+    }
+
+    fn pending_in_runtime(runtime_dir: &Path) -> PendingLaunch {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        PendingLaunch {
+            logical_id: LogicalSessionId::new("550e8400-e29b-41d4-a716-446655440000", "pending")
+                .unwrap(),
+            unit_name: "portagenty-wpending.service".into(),
+            mux_target: MuxTarget::TmuxPrivate {
+                socket: runtime_dir.join("portagenty/tmux/pending.sock"),
+                session: "main".into(),
+            },
+            marker_path: runtime_dir
+                .join("portagenty/workloads")
+                .join(format!("{nonce}.marker.toml")),
+            created_at_unix_ms: 1,
+            creator_pid: 123,
+            creator_start_time_ticks: 456,
+            creator_boot_id: None,
+            last_error: None,
+        }
+    }
+
+    fn create_private_workload_runtime(runtime_dir: &Path) {
+        fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let portagenty = runtime_dir.join("portagenty");
+        let workloads = portagenty.join("workloads");
+        fs::create_dir(&portagenty).unwrap();
+        fs::set_permissions(&portagenty, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&workloads).unwrap();
+        fs::set_permissions(&workloads, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn write_pending_marker(pending: &PendingLaunch, pid: u32, start_time_ticks: u64) {
+        let nonce = pending_marker_nonce(pending).unwrap();
+        write_private_file(
+            &pending.marker_path,
+            toml::to_string(&WorkloadMarker {
+                protocol_version: ANCHOR_PROTOCOL_VERSION,
+                nonce: nonce.into(),
+                pid,
+                start_time_ticks,
+            })
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3251,6 +3522,53 @@ mod tests {
     }
 
     #[test]
+    fn failed_launch_rollback_only_removes_marker_after_unit_and_target_absence() {
+        let pending = pending_with_boot(None);
+        let mut removed = false;
+        let marker_present = failed_launch_marker_presence_with(
+            &pending,
+            &Ok(false),
+            &Ok(false),
+            |_| {
+                removed = true;
+                Ok(true)
+            },
+            |path| {
+                assert_eq!(path, pending.marker_path);
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert!(removed);
+        assert!(!marker_present);
+        assert!(matches!(
+            failed_launch_cleanup_decision(Ok(false), Ok(false), Ok(marker_present)),
+            FailedLaunchCleanupDecision::ClearPending
+        ));
+
+        let marker_present = failed_launch_marker_presence_with(
+            &pending,
+            &Ok(true),
+            &Ok(false),
+            |_| panic!("a present unit must block marker removal"),
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert!(marker_present);
+
+        let error = failed_launch_marker_presence_with(
+            &pending,
+            &Ok(false),
+            &Ok(false),
+            |_| Err(anyhow!("anchor probe denied")),
+            |_| panic!("a failed dead-anchor proof must block the marker presence probe"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("anchor probe denied"));
+        assert!(format!("{error:#}").contains("failed-launch rollback"));
+    }
+
+    #[test]
     fn dangling_marker_entry_blocks_failed_cleanup_and_pending_dead_state() {
         let temp = tempfile::tempdir().unwrap();
         let marker_path = temp.path().join("dangling.marker.toml");
@@ -3273,6 +3591,159 @@ mod tests {
             PendingLaunchState::Ambiguous(ref reason)
                 if reason.contains("marker_present=true")
         ));
+    }
+
+    #[test]
+    fn dead_pending_cleanup_removes_exact_marker_when_anchor_pid_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        create_private_workload_runtime(temp.path());
+        let pending = pending_in_runtime(temp.path());
+        write_pending_marker(&pending, 789, 654);
+        let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+        store.begin_pending(pending.clone()).unwrap();
+
+        fake_backend(None)
+            .remove_dead_pending_with_probes(
+                &store,
+                &pending,
+                temp.path(),
+                None,
+                |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()),
+                |_| Ok(false),
+            )
+            .unwrap();
+
+        assert!(!pending.marker_path.exists());
+        assert!(store.find_pending(&pending.logical_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn dead_pending_cleanup_accepts_pid_reuse_but_refuses_live_exact_anchor() {
+        for (observed_start, should_succeed) in [(999, true), (654, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            create_private_workload_runtime(temp.path());
+            let pending = pending_in_runtime(temp.path());
+            write_pending_marker(&pending, 789, 654);
+            let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+            store.begin_pending(pending.clone()).unwrap();
+
+            let result = fake_backend(None).remove_dead_pending_with_probes(
+                &store,
+                &pending,
+                temp.path(),
+                None,
+                move |pid| {
+                    if pid == 789 {
+                        Ok(observed_start)
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+                    }
+                },
+                |_| Ok(false),
+            );
+
+            assert_eq!(result.is_ok(), should_succeed);
+            assert_eq!(pending.marker_path.exists(), !should_succeed);
+            assert_eq!(
+                store.find_pending(&pending.logical_id).unwrap().is_some(),
+                !should_succeed
+            );
+        }
+    }
+
+    #[test]
+    fn dead_pending_cleanup_refuses_unit_target_and_process_probe_uncertainty() {
+        for blocker in ["unit", "target", "process"] {
+            let temp = tempfile::tempdir().unwrap();
+            create_private_workload_runtime(temp.path());
+            let pending = pending_in_runtime(temp.path());
+            write_pending_marker(&pending, 789, 654);
+            let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+            store.begin_pending(pending.clone()).unwrap();
+            let unit = (blocker == "unit").then(|| {
+                fake_unit(
+                    pending.unit_name.clone(),
+                    vec![1; 16],
+                    "/user.slice/user-1000.slice/user@1000.service/app.slice/pending.service",
+                )
+            });
+
+            let result = fake_backend(unit).remove_dead_pending_with_probes(
+                &store,
+                &pending,
+                temp.path(),
+                None,
+                move |pid| {
+                    if blocker == "process" && pid == 789 {
+                        Err(
+                            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")
+                                .into(),
+                        )
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
+                    }
+                },
+                move |_| Ok(blocker == "target"),
+            );
+
+            assert!(result.is_err(), "{blocker} unexpectedly allowed cleanup");
+            assert!(pending.marker_path.exists());
+            assert!(store.find_pending(&pending.logical_id).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn dead_pending_cleanup_refuses_replaced_generation_and_symlink_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        create_private_workload_runtime(temp.path());
+        let expected = pending_in_runtime(temp.path());
+        let mut replacement = expected.clone();
+        replacement.created_at_unix_ms += 1;
+        let store = ReceiptStore::new(temp.path().join("state/supervision.toml"));
+        store.begin_pending(replacement.clone()).unwrap();
+        let error = fake_backend(None)
+            .remove_dead_pending_with_probes(
+                &store,
+                &expected,
+                temp.path(),
+                None,
+                |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()),
+                |_| Ok(false),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("changed after confirmation"));
+        assert_eq!(
+            store.find_pending(&expected.logical_id).unwrap(),
+            Some(replacement)
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        create_private_workload_runtime(other.path());
+        let pending = pending_in_runtime(other.path());
+        std::os::unix::fs::symlink(other.path().join("missing"), &pending.marker_path).unwrap();
+        let error = remove_exact_dead_pending_marker_in(other.path(), &pending, |_| {
+            panic!("a symlink marker must be rejected before probing its pid")
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("owner-only regular file"));
+        assert!(fs::symlink_metadata(&pending.marker_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let parent_link = tempfile::tempdir().unwrap();
+        fs::set_permissions(parent_link.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(
+            parent_link.path().join("outside"),
+            parent_link.path().join("portagenty"),
+        )
+        .unwrap();
+        let pending = pending_in_runtime(parent_link.path());
+        let error = remove_exact_dead_pending_marker_in(parent_link.path(), &pending, |_| {
+            panic!("a symlink runtime parent must be rejected before probing its pid")
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("Portagenty runtime directory"));
     }
 
     #[test]
