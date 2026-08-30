@@ -108,7 +108,7 @@ mouse poorly, so don't rely on it there).
 | `k` / `↑` / `Alt+K` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, supervision-first start an eligible idle UUID-backed row (Claude kind: `3G` / `5G` / `512MiB` / `800%` / `1200`), directly relaunch any safely reconciled idle stale row through the existing exact signal-free coordinator, or ordinarily create a no-ID/invalid/unsupported idle row |
+| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, require supervision with the complete `3G` / `5G` / `512MiB` / `800%` / `1200` baseline when starting an eligible idle UUID-backed row, directly relaunch any safely reconciled idle stale row through the existing exact signal-free coordinator, or ordinarily create a no-ID/invalid/unsupported idle row |
 | `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `PgDn` / `PgUp` | 10-row jumps |
 | `a` | Add a new session (2-stage name → command modal) |
@@ -236,22 +236,23 @@ pa launch claude --memory-high 2G --memory-max 4G --memory-swap-max 256MiB \
 
 Resource-limit flags imply supervision. Explicit CLI supervision requires a valid
 workspace UUID and a supported Linux systemd-user/cgroup-v2 environment; it never
-falls back ordinary. Exactly `kind = "claude-code"` selects the Claude defaults and
-`claude-code.slice`; a session merely named or commanded `claude` stays generic.
-Claude fields cannot be cleared and overrides must be equal to or stricter than
+falls back ordinary. Every supervised kind resolves missing fields from the complete
 `3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, and `1200`
-tasks, with MemoryHigh not exceeding MemoryMax. Generic sessions stay in normal
-user-manager placement and retain unset fields unless flags are supplied.
+task baseline. Exactly `kind = "claude-code"` additionally selects
+`claude-code.slice`, resume behavior, and oomd metadata; a session merely named or
+commanded `claude` stays generic. Claude fields cannot be cleared and overrides must
+be equal to or stricter than the baseline, with MemoryHigh not exceeding MemoryMax.
+Generic sessions stay in normal user-manager placement with the same finite baseline.
 
 Before a Claude-kind service is created, Portagenty verifies that the externally
 provisioned aggregate slice is structurally beneath `/claude.slice/claude-code.slice`
 with finite positive memory high/max, swap max, CPU quota, and
 `ManagedOOMPreference=omit`; aggregate `TasksMax` is optional and may be infinity,
 while every Claude service still receives finite `TasksMax`. Portagenty never
-creates or modifies the slice. Only after receipt and pending-launch state are known and non-creating
-preflight proves supervision capability/runtime unavailable does routine TUI Enter
-print a loud notice and launch ordinarily. Receipt ambiguity and every failure after
-creation may have begun remain fail-closed. Pending launches block attach, ordinary
+creates or modifies the slice. Eligible UUID-backed routine TUI Enter is
+supervision-required: unavailable capability/runtime, receipt ambiguity, identity or
+target races, and every failure after creation may have begun return to the same
+actionable row without creating an ordinary target. Pending launches block attach,
 fallback, creation, stop, and kill until reconciled. A valid unequal stored/current
 boot UUID proves only that the pending creator is gone; otherwise PID/start-time
 proof remains required. `Dead` still requires the exact unit, private target, and

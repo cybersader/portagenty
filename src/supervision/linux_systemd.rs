@@ -1288,6 +1288,11 @@ impl LinuxSystemdBackend {
         if receipt.schema_version == LEGACY_RECEIPT_SCHEMA_VERSION {
             bail!("legacy v1 receipt is attach-only and requires restart for resource ownership");
         }
+        if !receipt.limits.is_complete() {
+            bail!(
+                "supervised service has an incomplete legacy resource policy and is attach-only until restart"
+            );
+        }
         let identity = self.verified_identity(receipt)?;
         if !mux_target_exists(&receipt.mux_target)? {
             bail!("recorded multiplexer target is no longer present");
@@ -1437,6 +1442,36 @@ impl LinuxSystemdBackend {
     }
 }
 
+fn reconcile_verified_containment(
+    receipt: &BindingReceipt,
+    containment: Result<ContainmentStatus>,
+) -> OwnershipState {
+    match containment {
+        Ok(ContainmentStatus::Verified) if !receipt.limits.is_complete() => {
+            OwnershipState::LegacyRestartRequired(
+                "supervised service predates the complete automatic resource policy; attach-only until it exits and is relaunched".into(),
+            )
+        }
+        Ok(ContainmentStatus::Verified) => OwnershipState::OwnedVerified(Box::new(receipt.clone())),
+        Ok(ContainmentStatus::Split(reason)) => OwnershipState::SplitContainment(reason),
+        Err(error) => OwnershipState::AmbiguousBinding(format!(
+            "workload-anchor proof could not be verified: {error:#}"
+        )),
+    }
+}
+
+fn reconcile_current_presence(unit_present: bool, target_present: bool) -> Option<OwnershipState> {
+    match (unit_present, target_present) {
+        (false, false) => Some(OwnershipState::StaleBinding(
+            "service and private multiplexer target are both absent".into(),
+        )),
+        (true, true) => None,
+        _ => Some(OwnershipState::AmbiguousBinding(
+            "service and private multiplexer target are only partially present".into(),
+        )),
+    }
+}
+
 impl SupervisionBackend for LinuxSystemdBackend {
     fn capabilities(&self) -> CapabilityReport {
         capability_report(self.api.as_ref(), &self.cgroup_root)
@@ -1462,31 +1497,18 @@ impl SupervisionBackend for LinuxSystemdBackend {
                 )))
             }
         };
-        match (unit_present, target_present) {
-            (false, false) => Ok(OwnershipState::StaleBinding(
-                "service and private multiplexer target are both absent".into(),
-            )),
-            (true, true) => {
-                let anchor = receipt
-                    .workload_anchor
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("current receipt is missing workload-anchor proof"))?;
-                match verify_workload_anchor(anchor, &receipt.control_group, &receipt.mux_target) {
-                    Ok(ContainmentStatus::Verified) => {
-                        Ok(OwnershipState::OwnedVerified(Box::new(receipt.clone())))
-                    }
-                    Ok(ContainmentStatus::Split(reason)) => {
-                        Ok(OwnershipState::SplitContainment(reason))
-                    }
-                    Err(error) => Ok(OwnershipState::AmbiguousBinding(format!(
-                        "workload-anchor proof could not be verified: {error:#}"
-                    ))),
-                }
-            }
-            _ => Ok(OwnershipState::AmbiguousBinding(
-                "service and private multiplexer target are only partially present".into(),
-            )),
+        if let Some(ownership) = reconcile_current_presence(unit_present, target_present) {
+            return Ok(ownership);
         }
+
+        let anchor = receipt
+            .workload_anchor
+            .as_ref()
+            .ok_or_else(|| anyhow!("current receipt is missing workload-anchor proof"))?;
+        Ok(reconcile_verified_containment(
+            receipt,
+            verify_workload_anchor(anchor, &receipt.control_group, &receipt.mux_target),
+        ))
     }
 
     fn snapshot(
@@ -1501,6 +1523,11 @@ impl SupervisionBackend for LinuxSystemdBackend {
     }
 
     fn stop_unit(&self, receipt: &BindingReceipt) -> Result<ActionResult> {
+        if !receipt.limits.is_complete() {
+            bail!(
+                "supervised service has an incomplete legacy resource policy and is attach-only until restart"
+            );
+        }
         let invocation_id = decode_hex(&receipt.invocation_id)?;
         if self.identity_if_present(receipt)?.is_none() {
             return Ok(ActionResult {
@@ -2039,8 +2066,8 @@ fn classify_containment_paths(
     }
     for (pid, cgroup) in descendants {
         if cgroup != control_group {
-            let label = if cgroup.contains("/background.slice/") {
-                "intentional external background scope"
+            let label = if cgroup.contains("/agent-work.slice/") {
+                "intentional external agent-work scope"
             } else {
                 "escaped descendant"
             };
@@ -2445,6 +2472,26 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn current_presence_preserves_partial_ambiguity_and_exact_stale_state() {
+        assert!(matches!(
+            reconcile_current_presence(true, false),
+            Some(OwnershipState::AmbiguousBinding(ref reason))
+                if reason == "service and private multiplexer target are only partially present"
+        ));
+        assert!(matches!(
+            reconcile_current_presence(false, true),
+            Some(OwnershipState::AmbiguousBinding(ref reason))
+                if reason == "service and private multiplexer target are only partially present"
+        ));
+        assert!(matches!(
+            reconcile_current_presence(false, false),
+            Some(OwnershipState::StaleBinding(ref reason))
+                if reason == "service and private multiplexer target are both absent"
+        ));
+        assert!(reconcile_current_presence(true, true).is_none());
+    }
+
+    #[test]
     fn zellij_pty_has_a_usable_path_and_initial_window_size() {
         let pty = open_pty_stdio().unwrap();
         assert!(pty.tty_path.starts_with("/dev/pts/"));
@@ -2665,7 +2712,7 @@ mod tests {
                 args: vec!["new-session".into()],
                 working_directory: PathBuf::from("/tmp"),
                 environment: Vec::new(),
-                limits: ResourceLimits::default(),
+                limits: ResourceLimits::standard_defaults(),
                 pty_stdio: None,
             },
             mux_target: MuxTarget::TmuxPrivate {
@@ -2729,6 +2776,22 @@ mod tests {
             workload_anchor: None,
             launch_boot_id: None,
         }
+    }
+
+    fn current_receipt() -> BindingReceipt {
+        let mut receipt = stale_receipt();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        receipt.schema_version = RECEIPT_SCHEMA_VERSION;
+        receipt.limits = ResourceLimits::standard_defaults();
+        receipt.session_kind = Some(SessionKind::Shell);
+        receipt.workload_anchor = Some(WorkloadAnchorProof {
+            protocol_version: ANCHOR_PROTOCOL_VERSION,
+            nonce: nonce.into(),
+            marker_path: PathBuf::from(format!("/tmp/portagenty/workloads/{nonce}.marker.toml")),
+            pid: 123,
+            start_time_ticks: 456,
+        });
+        receipt
     }
 
     fn fake_backend(unit: Option<SystemdUnitIdentity>) -> LinuxSystemdBackend {
@@ -3214,11 +3277,30 @@ mod tests {
 
     #[test]
     fn non_force_stop_treats_an_absent_exact_invocation_as_complete() {
-        let receipt = stale_receipt();
+        let receipt = current_receipt();
         let backend = fake_backend(None);
         let result = backend.stop_unit(&receipt).unwrap();
         assert!(result.completed);
         assert!(result.attempted.is_empty());
+    }
+
+    #[test]
+    fn incomplete_policy_receipt_is_attach_only_for_reconcile_metrics_and_control() {
+        let mut receipt = current_receipt();
+        receipt.limits = ResourceLimits::default();
+
+        assert!(matches!(
+            reconcile_verified_containment(&receipt, Ok(ContainmentStatus::Verified)),
+            OwnershipState::LegacyRestartRequired(reason)
+                if reason.contains("complete automatic resource policy")
+                    && reason.contains("attach-only")
+        ));
+
+        let backend = fake_backend(None);
+        let snapshot_error = backend.snapshot(&receipt, None).unwrap_err();
+        assert!(format!("{snapshot_error:#}").contains("incomplete legacy resource policy"));
+        let stop_error = backend.stop_unit(&receipt).unwrap_err();
+        assert!(format!("{stop_error:#}").contains("incomplete legacy resource policy"));
     }
 
     #[test]
@@ -3377,12 +3459,12 @@ mod tests {
     }
 
     #[test]
-    fn containment_classifier_rejects_escaped_root_and_background_descendant() {
+    fn containment_classifier_rejects_escaped_root_and_agent_work_descendant() {
         let expected = "/user.slice/u/app.slice/example.service";
         assert!(matches!(
             classify_containment_paths(
                 expected,
-                "/user.slice/u/background.slice/run.scope",
+                "/user.slice/u/agent-work.slice/run.scope",
                 &[],
             )
             .unwrap(),
@@ -3392,11 +3474,11 @@ mod tests {
             classify_containment_paths(
                 expected,
                 expected,
-                &[(42, "/user.slice/u/background.slice/build.scope".into())],
+                &[(42, "/user.slice/u/agent-work.slice/build.scope".into())],
             )
             .unwrap(),
             ContainmentStatus::Split(reason)
-                if reason.contains("intentional external background scope")
+                if reason.contains("intentional external agent-work scope")
                     && reason.contains("not owned")
         ));
         assert_eq!(

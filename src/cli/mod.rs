@@ -692,12 +692,6 @@ fn parse_resource_limits(
     Ok(limits)
 }
 
-pub(crate) enum RoutineSupervisedLaunch {
-    #[cfg(target_os = "linux")]
-    ClientReturned(ClientCompletion<()>),
-    FallbackSafe(anyhow::Error),
-}
-
 #[cfg(target_os = "linux")]
 pub(crate) fn launch_supervised_resolved(
     sess: Session,
@@ -707,10 +701,7 @@ pub(crate) fn launch_supervised_resolved(
     fresh: bool,
     limits: ResourceLimits,
 ) -> Result<ClientCompletion<()>> {
-    match launch_supervised_inner(sess, ws, dry_run, mode, fresh, limits, false)? {
-        RoutineSupervisedLaunch::ClientReturned(completion) => Ok(completion),
-        RoutineSupervisedLaunch::FallbackSafe(error) => Err(error),
-    }
+    launch_supervised_inner(sess, ws, dry_run, mode, fresh, limits)
 }
 
 #[cfg(target_os = "linux")]
@@ -719,8 +710,8 @@ pub(crate) fn launch_supervised_routine_resolved(
     ws: Workspace,
     mode: AttachMode,
     limits: ResourceLimits,
-) -> Result<RoutineSupervisedLaunch> {
-    launch_supervised_inner(sess, ws, false, mode, false, limits, true)
+) -> Result<ClientCompletion<()>> {
+    launch_supervised_inner(sess, ws, false, mode, false, limits)
 }
 
 #[cfg(target_os = "linux")]
@@ -731,8 +722,7 @@ fn launch_supervised_inner(
     mode: AttachMode,
     fresh: bool,
     limits: ResourceLimits,
-    allow_fallback: bool,
-) -> Result<RoutineSupervisedLaunch> {
+) -> Result<ClientCompletion<()>> {
     let workspace_id = ws.id.as_deref().ok_or_else(|| {
         anyhow!(
             "supervised launch requires a workspace UUID; open the workspace in the TUI, press `S` on an idle session, and confirm adding a stable ID (reopen before retrying only if you cancel after assignment)"
@@ -758,15 +748,13 @@ fn launch_supervised_inner(
                 "  fresh:       refused if an owned supervision receipt already exists"
             )?;
         }
-        return Ok(RoutineSupervisedLaunch::ClientReturned(
-            ClientCompletion::Returned(()),
-        ));
+        return Ok(ClientCompletion::Returned(()));
     }
 
     let store = crate::supervision::ReceiptStore::standard()?;
     if let Some(pending) = store.find_pending(&logical_id)? {
         bail!(
-            "a pending supervision launch blocks ordinary fallback and new creation: unit={:?}, target={:?}, last_error={:?}; inspect with `pa resources status {:?}` and clear only proven-dead evidence with `pa resources cleanup {:?}`",
+            "a pending supervision launch blocks attach and new creation: unit={:?}, target={:?}, last_error={:?}; inspect with `pa resources status {:?}` and clear only proven-dead evidence with `pa resources cleanup {:?}`",
             pending.unit_name,
             pending.mux_target,
             pending.last_error,
@@ -785,15 +773,8 @@ fn launch_supervised_inner(
         }
     }
 
-    let backend = match crate::supervision::LinuxSystemdBackend::connect() {
-        Ok(backend) => backend,
-        Err(error) if allow_fallback && existing.is_none() => {
-            return Ok(RoutineSupervisedLaunch::FallbackSafe(error.context(
-                "connecting to Linux systemd user supervision before any workload was created",
-            )));
-        }
-        Err(error) => return Err(error),
-    };
+    let backend = crate::supervision::LinuxSystemdBackend::connect()
+        .context("connecting to Linux systemd user supervision before any workload was created")?;
     let capabilities = backend.capabilities();
     let unavailable = if capabilities.overall != CapabilityState::Supported {
         Some(anyhow!(
@@ -822,9 +803,6 @@ fn launch_supervised_inner(
         })
     };
     if let Some(error) = unavailable {
-        if allow_fallback && existing.is_none() {
-            return Ok(RoutineSupervisedLaunch::FallbackSafe(error));
-        }
         return Err(error);
     }
     if fresh && existing.is_some() {
@@ -837,20 +815,16 @@ fn launch_supervised_inner(
         match backend.reconcile(receipt)? {
             OwnershipState::LegacyRestartRequired(reason) => {
                 eprintln!("pa: legacy supervised service is attach-only: {reason}");
-                return Ok(RoutineSupervisedLaunch::ClientReturned(
-                    attach_receipted_target(&receipt.mux_target, mode)?,
-                ));
+                return attach_receipted_target(&receipt.mux_target, mode);
             }
             OwnershipState::SplitContainment(reason) => {
                 eprintln!("pa: split containment; attaching without resource ownership: {reason}");
-                return Ok(RoutineSupervisedLaunch::ClientReturned(
-                    attach_receipted_target(&receipt.mux_target, mode)?,
-                ));
+                return attach_receipted_target(&receipt.mux_target, mode);
             }
             OwnershipState::OwnedVerified(_) => {}
             state => bail!("existing supervision receipt is not attachable: {state:?}"),
         }
-        if !allow_fallback && !limits.is_empty() && receipt.limits != limits {
+        if receipt.limits != limits {
             bail!(
                 "this supervised session already exists with different resource limits; stop it before launching with new limits"
             );
@@ -880,7 +854,7 @@ fn launch_supervised_inner(
     if let Ok(after) = backend.snapshot(&receipt, before.as_ref()) {
         print_resource_event_notice(before.as_ref(), &after);
     }
-    Ok(RoutineSupervisedLaunch::ClientReturned(completion))
+    Ok(completion)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -903,10 +877,10 @@ pub(crate) fn launch_supervised_routine_resolved(
     _ws: Workspace,
     _mode: AttachMode,
     _limits: ResourceLimits,
-) -> Result<RoutineSupervisedLaunch> {
-    Ok(RoutineSupervisedLaunch::FallbackSafe(anyhow!(
+) -> Result<ClientCompletion<()>> {
+    bail!(
         "resource supervision is currently implemented only on Linux with systemd user services and cgroup v2"
-    )))
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -2780,10 +2754,10 @@ mod return_banner_tests {
             effective_stale_replacement_limits(
                 Some(crate::domain::SessionKind::Shell),
                 true,
-                ResourceLimits::claude_defaults(),
+                ResourceLimits::default(),
             )
             .unwrap(),
-            ResourceLimits::default()
+            ResourceLimits::standard_defaults()
         );
     }
 

@@ -49,7 +49,7 @@ Explicitly **not** in v1:
    with workspace definitions and surfaces three row states — Live,
    NotStarted, Untracked — each with a distinct color marker.
    Enter routes to exact owned attach for verified receipts, ordinary `attach`
-   for Live/Untracked, supervision-first creation for eligible idle UUID-backed
+   for Live/Untracked, supervision-required creation for eligible idle UUID-backed
    rows, and ordinary `create_and_attach` for legacy/invalid/unsupported idle rows.
 6. **State/activity decorations.** Delivered alongside untracked
    adoption: ● (green) live, ○ (dim) idle, ? (yellow) untracked,
@@ -431,8 +431,8 @@ real projects:
 ## Experimental Linux resource supervision — Claude containment integration implemented
 
 The capability-aware supervision milestone now has an explicit kind-selected
-Claude policy. Eligible idle UUID-backed TUI rows use supervision-first Enter,
-while CLI supervision remains explicit. On supported Linux hosts, Portagenty
+Claude integration policy. Eligible idle UUID-backed TUI rows require supervision
+on Enter, while CLI supervision remains explicit. On supported Linux hosts, Portagenty
 creates fresh tmux or Zellij workloads as transient systemd **user services**
 backed by cgroup v2. Stable logical identity (`workspace UUID + declared session
 name`), opaque private targets, a pending-launch journal, versioned machine-local
@@ -442,9 +442,9 @@ The implementation includes:
 
 - `pa launch <session> --supervise`, plus typed `--memory-high`,
   `--memory-max`, `--memory-swap-max`, `--cpu-quota`, and `--tasks-max` limits;
-- explicit `kind = "claude-code"` selection of `3G` MemoryHigh, `5G` MemoryMax,
-  `512MiB` MemorySwapMax, `800%` CPU, and `1200` tasks; names and command strings
-  never select Claude policy, and overrides may only be equal or stricter;
+- complete `3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU,
+  and `1200` task defaults for every supervised kind; explicit `kind = "claude-code"`
+  alone selects Claude placement/resume/oomd integration and stricter override rules;
 - Claude service placement beneath externally provisioned `claude-code.slice`,
   aggregate-slice structural preflight, `ManagedOOMPreference=omit`, and service
   placement/limit read-back before v2 ownership persistence;
@@ -453,7 +453,7 @@ The implementation includes:
   `/proc/<pid>/task/<pid>/children` without a global process scan;
 - split-containment reporting when the root or descendants escape, including an
   explicit external-bounded-scope explanation for `build-contained` descendants
-  beneath `background.slice`; split rows may attach but receive no whole-workload
+  beneath `agent-work.slice`; split rows may attach but receive no whole-workload
   metrics, stop, or force-kill authority;
 - mixed receipt transition semantics: new launches write v2 evidence plus an
   optional canonical Linux launch-boot UUID copied from the pending journal's
@@ -476,8 +476,8 @@ The implementation includes:
 - `pa resources capabilities|status|stop|kill --force` and TUI ownership labels,
   editable five-field limits, bounded sampling, event warnings, and separately
   confirmed force-kill only for complete owned-and-verified v2 containment;
-- loud ordinary fallback only from proven-safe non-creating capability preflight,
-  with every ownership ambiguity and post-creation failure remaining fail-closed;
+- fail-closed routine Enter when ownership, capability, or runtime preflight cannot
+  prove a safe supervised launch, with no ordinary target created as a fallback;
 - graceful target shutdown followed by non-force systemd stop, preserving
   `OOMPolicy=continue`, `ExitType=cgroup`, `KillMode=control-group`, and
   `SendSIGKILL=no`; picker-wide stop skips legacy, split, stale, and ambiguous

@@ -71,7 +71,9 @@ root cgroup agreement. Descendants are followed only through bounded
 Traversal and symlink escapes from `/sys/fs/cgroup` are rejected. An escaped root
 cannot become owned. Escaped descendants produce split containment, withholding
 whole-workload metrics and control; a `build-contained` descendant in
-`background.slice` is identified as an external bounded scope rather than claimed.
+`agent-work.slice` is identified as an external bounded scope rather than claimed.
+
+TUI ownership reconciliation runs off the render thread with a hard per-sample deadline and explicit cancellation. A timeout, cancellation, worker failure, or unreadable external evidence produces an actionable fail-closed row rather than authorizing stale cleanup, ordinary creation, attach fallback, or control. Automatic sampling remains blocked after a timeout until the user retries; completion and interruption reload the machine-local evidence when it changed, so external signal-free cleanup can return the row to idle without weakening partial-presence ambiguity.
 
 Existing v1 services remain legacy/restart-required exact-target attach-only until
 they exit and are launched normally under v2. Portagenty does not auto-stop,
@@ -89,7 +91,9 @@ means confirmed graceful/non-force stop, and unmanaged live means confirmed
 multiplexer-native kill. `X` remains separately confirmed force-kill. No stale
 receipt or boot hint causes startup or bulk launch.
 Pending launches record exact creator process proof and block attach, fallback,
-creation, stop, and kill. A valid unequal stored/current boot ID proves only that
+creation, stop, and kill. Eligible UUID-backed routine Enter never converts a
+supervision preflight or runtime failure into ordinary creation. A valid unequal
+stored/current boot ID proves only that
 the creator is gone; same, missing, invalid, or unreadable boot evidence retains
 the PID/start-time check. They may be signal-free cleaned only when the creator,
 exact unit, exact private target, and exact owner-runtime marker are all absent;
@@ -117,16 +121,7 @@ stripped before launch; a validated runtime directory and declared session env
 remain. Workspace commands are still user-authored code and execute with the
 user's permissions.
 
-Only explicit `kind = "claude-code"` selects Claude containment; names and
-commands do not. Claude-kind services request `claude-code.slice`,
-`ManagedOOMPreference=omit`, `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, CPU quota,
-and a finite per-service `TasksMax`. Portagenty first verifies that the externally managed aggregate
-slice exists beneath `/claude.slice/claude-code.slice` with finite positive
-`MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, consistent memory
-controls, and oomd-omit metadata. Aggregate `TasksMax` is optional and may remain
-infinity; Portagenty never creates or modifies that slice. Claude overrides may only tighten the standard `3G`/`5G`/`512MiB`/
-`800%`/`1200` policy. Generic sessions remain outside the Claude slice and receive
-no inferred defaults.
+Every supervised session kind receives the complete standard `3G`/`5G`/`512MiB`/`800%`/`1200` policy; incomplete current receipts remain exact-target attach-only until restart and cannot expose owned metrics or control. Only explicit `kind = "claude-code"` selects Claude containment; names and commands do not. Claude-kind services additionally request `claude-code.slice` and `ManagedOOMPreference=omit`. Portagenty first verifies that the externally managed aggregate slice exists beneath `/claude.slice/claude-code.slice` with finite positive `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, consistent memory controls, and oomd-omit metadata. Aggregate `TasksMax` is optional and may remain infinity; Portagenty never creates or modifies that slice. Claude overrides may only tighten the standard policy. Generic sessions remain outside the Claude slice but retain the same finite per-service baseline.
 
 `MemoryHigh` is a reclaim threshold; `MemoryMax` and `MemorySwapMax` are hard
 ceilings; CPU quota throttles aggregate CPU; `TasksMax` rejects new tasks. These

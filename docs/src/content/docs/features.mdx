@@ -207,7 +207,7 @@ root and every bounded descendant remains in the service cgroup.
   <Card title="Safe transitions and escapes" icon="random">
     Live v1 services are legacy/restart-required exact-target attach-only. Escaped
     descendants produce split containment; external `build-contained` children in
-    `background.slice` stay externally bounded and prevent whole-workload control.
+    `agent-work.slice` stay externally bounded and prevent whole-workload control.
     Partial unit/target presence remains ambiguous and fail-closed.
   </Card>
 </CardGrid>

@@ -207,7 +207,7 @@ fn claude_policy_rejects_weaker_override() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn generic_session_does_not_inherit_claude_defaults_from_its_name() {
+fn generic_session_receives_complete_standard_supervision_defaults() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let path = tmp.child("generic.portagenty.toml");
     path.write_str(
@@ -230,9 +230,11 @@ command = "claude"
         .arg(path.path())
         .assert()
         .success()
-        .stdout(contains("memory high: not set"))
-        .stdout(contains("memory max:  not set"))
-        .stdout(contains("swap max:    not set"));
+        .stdout(contains("memory high: 3.00 GiB"))
+        .stdout(contains("memory max:  5.00 GiB"))
+        .stdout(contains("swap max:    512.00 MiB"))
+        .stdout(contains("CPU quota:  800%"))
+        .stdout(contains("tasks max:  1200"));
 }
 
 #[test]
