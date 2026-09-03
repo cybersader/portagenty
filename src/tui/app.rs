@@ -356,6 +356,14 @@ enum PendingAction {
         display_name: String,
         receipt: Box<BindingReceipt>,
         force: bool,
+        /// The confirmation was opened from a split-containment row, so a
+        /// non-force stop may close only the exact private target and verified
+        /// service cgroup. External descendant scopes remain out of bounds.
+        allow_split: bool,
+        /// The confirmation was opened from a current v2 receipt that predates
+        /// the complete automatic limit policy. Metrics and force-kill remain
+        /// unavailable, but exact-target non-force stop is still safe.
+        allow_restart_required: bool,
     },
     /// Remove one exact receipt only after the backend proves both its
     /// systemd invocation and private multiplexer target are absent.
@@ -1255,6 +1263,8 @@ impl App {
                     display_name: row.display_name.clone(),
                     receipt: Box::new(receipt),
                     force: false,
+                    allow_split: false,
+                    allow_restart_required: false,
                 });
             }
             #[cfg(not(target_os = "linux"))]
@@ -1264,14 +1274,44 @@ impl App {
                 );
             }
             RowOwnership::LegacyRestartRequired => {
-                self.set_status(
-                    "x: legacy v1 service is attach-only; exit it normally to transition",
-                );
+                let Some(logical_id) = row.logical_id.clone() else {
+                    self.set_status("x: restart-required row is missing its logical identity");
+                    return;
+                };
+                let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+                    self.set_status("x: restart-required row is missing its binding receipt");
+                    return;
+                };
+                if receipt.is_legacy() {
+                    self.set_status(
+                        "x: legacy v1 service is attach-only; exit it normally to transition",
+                    );
+                    return;
+                }
+                self.pending = Some(PendingAction::StopOwned {
+                    display_name: row.display_name.clone(),
+                    receipt: Box::new(receipt),
+                    force: false,
+                    allow_split: false,
+                    allow_restart_required: true,
+                });
             }
             RowOwnership::SplitContainment => {
-                self.set_status(
-                    "x: split containment disables whole-workload stop; external descendants remain separately bounded",
-                );
+                let Some(logical_id) = row.logical_id.clone() else {
+                    self.set_status("x: split row is missing its logical identity");
+                    return;
+                };
+                let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+                    self.set_status("x: split row is missing its binding receipt");
+                    return;
+                };
+                self.pending = Some(PendingAction::StopOwned {
+                    display_name: row.display_name.clone(),
+                    receipt: Box::new(receipt),
+                    force: false,
+                    allow_split: true,
+                    allow_restart_required: false,
+                });
             }
             RowOwnership::Pending => {
                 self.set_status(
@@ -1334,6 +1374,8 @@ impl App {
             display_name: row.display_name.clone(),
             receipt: Box::new(receipt),
             force: true,
+            allow_split: false,
+            allow_restart_required: false,
         });
     }
 
@@ -1386,13 +1428,13 @@ impl App {
             }
             RowOwnership::LegacyRestartRequired => {
                 self.set_status(
-                    "S: legacy v1 service is attach-only; exit it normally, then relaunch for v2 ownership",
+                    "S: limits cannot change live; current v2 receipts may use x for non-force stop, while v1 must exit normally",
                 );
                 return;
             }
             RowOwnership::SplitContainment => {
                 self.set_status(
-                    "S: containment is split by external descendants; whole-workload ownership is disabled",
+                    "S: containment is split; use x for exact-target/non-force stop without signalling external scopes",
                 );
                 return;
             }
@@ -2088,11 +2130,17 @@ impl App {
                 display_name,
                 receipt,
                 force,
+                allow_split,
+                allow_restart_required,
             } => {
                 let outcome = (|| -> Result<crate::supervision::ActionResult> {
                     let backend = crate::supervision::LinuxSystemdBackend::connect()?;
                     match backend.reconcile(&receipt)? {
                         crate::supervision::OwnershipState::OwnedVerified(_) => {}
+                        crate::supervision::OwnershipState::SplitContainment(_)
+                            if allow_split && !force => {}
+                        crate::supervision::OwnershipState::LegacyRestartRequired(_)
+                            if allow_restart_required && !receipt.is_legacy() && !force => {}
                         state => {
                             anyhow::bail!("ownership changed before control action: {state:?}")
                         }
@@ -2120,7 +2168,15 @@ impl App {
                             self.resource_snapshots.remove(&receipt.logical_id);
                             self.reload_workspace();
                         }
-                        self.set_status(format!("{display_name:?}: {}", result.final_state));
+                        let scope_note = if allow_split {
+                            "; external descendant scopes were not signalled"
+                        } else {
+                            ""
+                        };
+                        self.set_status(format!(
+                            "{display_name:?}: {}{scope_note}",
+                            result.final_state
+                        ));
                     }
                     Err(error) => {
                         self.set_status(format!("resource control failed: {error:#}"));
@@ -3558,6 +3614,8 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
         PendingAction::StopOwned {
             display_name,
             force,
+            allow_split,
+            allow_restart_required,
             ..
         } => {
             if *force {
@@ -3566,6 +3624,24 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
                     format!(
                         "Send SIGKILL to every process in the verified control group for {display_name:?}? \
                          This is a separate irreversible escalation and can lose unsaved work."
+                    ),
+                )
+            } else if *allow_split {
+                (
+                    "Stop split session target".into(),
+                    format!(
+                        "Gracefully close the exact private multiplexer target for {display_name:?}, then \
+                         request a non-force stop of its verified Portagenty service? External descendant \
+                         scopes are not signalled and may remain; force-kill stays unavailable."
+                    ),
+                )
+            } else if *allow_restart_required {
+                (
+                    "Stop restart-required session".into(),
+                    format!(
+                        "Gracefully close the exact private multiplexer target for {display_name:?}, then \
+                         request a non-force stop of its verified Portagenty service? Metrics and force-kill \
+                         remain unavailable until the session is relaunched with the complete policy."
                     ),
                 )
             } else {
@@ -5578,6 +5654,82 @@ mod tests {
             Some(AppOutcome::Launch(LaunchKind::AttachOwned { target, .. }))
                 if target == receipt.mux_target
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_row_offers_exact_target_stop_but_refuses_force_kill() {
+        let receipt = current_test_receipt(None);
+        let mut app = supervised_app();
+        app.receipts
+            .insert(receipt.logical_id.clone(), receipt.clone());
+        app.rows[0].ownership = RowOwnership::SplitContainment;
+        app.rows[0].state = SessionState::Live;
+        app.rows[0].mux_target = Some(receipt.mux_target);
+
+        app.open_kill_prompt();
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::StopOwned {
+                force: false,
+                allow_split: true,
+                allow_restart_required: false,
+                ..
+            })
+        ));
+        let (title, copy) = confirm_copy(app.pending.as_ref().unwrap(), "x");
+        assert!(title.contains("split session target"), "title: {title}");
+        assert!(
+            copy.contains("External descendant scopes are not signalled"),
+            "copy: {copy}"
+        );
+        assert!(copy.contains("may remain"), "copy: {copy}");
+
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        app.open_force_kill_prompt();
+        assert!(app.pending.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("owned-and-verified")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_v2_row_offers_non_force_stop_while_v1_stays_attach_only() {
+        let current = current_test_receipt(None);
+        let mut app = supervised_app();
+        app.receipts
+            .insert(current.logical_id.clone(), current.clone());
+        app.rows[0].ownership = RowOwnership::LegacyRestartRequired;
+
+        app.open_kill_prompt();
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::StopOwned {
+                force: false,
+                allow_split: false,
+                allow_restart_required: true,
+                ..
+            })
+        ));
+        let (title, copy) = confirm_copy(app.pending.as_ref().unwrap(), "x");
+        assert!(title.contains("restart-required"), "title: {title}");
+        assert!(
+            copy.contains("Metrics and force-kill remain unavailable"),
+            "copy: {copy}"
+        );
+
+        let mut legacy = supervised_app();
+        let v1 = test_receipt();
+        legacy.receipts.insert(v1.logical_id.clone(), v1);
+        legacy.rows[0].ownership = RowOwnership::LegacyRestartRequired;
+        legacy.open_kill_prompt();
+        assert!(legacy.pending.is_none());
+        assert!(legacy
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("legacy v1") && text.contains("attach-only")));
     }
 
     #[cfg(target_os = "linux")]

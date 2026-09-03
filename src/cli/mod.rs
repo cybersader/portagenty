@@ -349,7 +349,8 @@ pub enum ResourcesCommand {
         workspace: Option<PathBuf>,
     },
     /// Gracefully stop the exact receipted multiplexer target, then stop its
-    /// verified systemd unit if descendants remain. Never sends SIGKILL.
+    /// verified systemd unit if descendants remain. Split-containment stops do
+    /// not signal external scopes. Never sends SIGKILL.
     Stop {
         session: String,
         #[arg(short = 'w', long = "workspace")]
@@ -814,7 +815,11 @@ fn launch_supervised_inner(
     if let Some(receipt) = &existing {
         match backend.reconcile(receipt)? {
             OwnershipState::LegacyRestartRequired(reason) => {
-                eprintln!("pa: legacy supervised service is attach-only: {reason}");
+                if receipt.is_legacy() {
+                    eprintln!("pa: legacy v1 supervised service is attach-only: {reason}");
+                } else {
+                    eprintln!("pa: restart-required supervised service; attaching without metrics or force-kill: {reason}");
+                }
                 return attach_receipted_target(&receipt.mux_target, mode);
             }
             OwnershipState::SplitContainment(reason) => {
@@ -1303,13 +1308,17 @@ fn print_resource_status(
             println!("ownership: legacy-restart-required");
             println!("reason: {reason}");
             println!("target: {:?}", receipt.mux_target);
-            println!("note: attach is allowed; metrics and resource control are withheld");
+            if receipt.is_legacy() {
+                println!("note: v1 receipt is attach-only; exit normally and relaunch");
+            } else {
+                println!("note: attach and exact-target non-force stop are allowed; metrics and force-kill remain unavailable until relaunch");
+            }
         }
         OwnershipState::SplitContainment(reason) => {
             println!("ownership: split-containment");
             println!("reason: {reason}");
             println!("target: {:?}", receipt.mux_target);
-            println!("note: attach is allowed; external descendants are not covered by service stop or force-kill");
+            println!("note: attach and exact-target graceful stop are allowed; external descendants are not covered and force-kill remains unavailable");
         }
         OwnershipState::AmbiguousBinding(reason) => {
             println!("ownership: ambiguous-binding");
@@ -1412,13 +1421,16 @@ fn metric_debug<T: std::fmt::Debug>(metric: &MetricValue<T>) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn owned_resource_binding(
+fn resource_control_binding(
     session: &str,
     workspace: Option<&PathBuf>,
+    allow_split_stop: bool,
+    allow_restart_required_stop: bool,
 ) -> Result<(
     BindingReceipt,
     crate::supervision::LinuxSystemdBackend,
     crate::supervision::ReceiptStore,
+    Option<String>,
 )> {
     let (declared, ws) = resolve(session, workspace)?;
     let workspace_id = ws
@@ -1440,7 +1452,15 @@ fn owned_resource_binding(
         .ok_or_else(|| anyhow!("session {session:?} has no Portagenty supervision receipt"))?;
     let backend = crate::supervision::LinuxSystemdBackend::connect()?;
     match backend.reconcile(&receipt)? {
-        OwnershipState::OwnedVerified(_) => Ok((receipt, backend, store)),
+        OwnershipState::OwnedVerified(_) => Ok((receipt, backend, store, None)),
+        OwnershipState::SplitContainment(reason) if allow_split_stop => {
+            Ok((receipt, backend, store, Some(reason)))
+        }
+        OwnershipState::LegacyRestartRequired(_)
+            if allow_restart_required_stop && !receipt.is_legacy() =>
+        {
+            Ok((receipt, backend, store, None))
+        }
         OwnershipState::StaleBinding(reason) => {
             bail!("refusing resource control for a stale binding: {reason}")
         }
@@ -1497,13 +1517,21 @@ fn resources_cleanup(_session: &str, _workspace: Option<&PathBuf>) -> Result<()>
 
 #[cfg(target_os = "linux")]
 fn resources_stop(session: &str, workspace: Option<&PathBuf>) -> Result<()> {
-    let (receipt, backend, store) = owned_resource_binding(session, workspace)?;
+    let (receipt, backend, store, split_reason) =
+        resource_control_binding(session, workspace, true, true)?;
+    if let Some(reason) = &split_reason {
+        eprintln!("pa: split containment; stopping only the exact private target and verified Portagenty service: {reason}");
+        eprintln!("pa: external descendant scopes will not be signalled and may remain active");
+    }
     if let Err(error) = graceful_stop_target(&receipt.mux_target) {
         eprintln!("warning: graceful multiplexer shutdown failed: {error:#}");
         eprintln!("continuing with a non-force systemd stop for the verified control group");
     }
     let result = backend.stop_unit(&receipt)?;
     println!("{}", result.final_state);
+    if split_reason.is_some() {
+        println!("external descendant scopes were not signalled");
+    }
     if result.completed {
         let _ = store.remove(&receipt.logical_id)?;
     }
@@ -1520,7 +1548,8 @@ fn resources_kill(session: &str, force: bool, workspace: Option<&PathBuf>) -> Re
     if !force {
         bail!("force-kill requires the explicit --force flag");
     }
-    let (receipt, backend, store) = owned_resource_binding(session, workspace)?;
+    let (receipt, backend, store, _split_reason) =
+        resource_control_binding(session, workspace, false, false)?;
     let result = backend.force_kill(&receipt)?;
     println!("{}", result.final_state);
     if result.completed {

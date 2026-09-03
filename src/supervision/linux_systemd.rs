@@ -62,6 +62,9 @@ pub struct SystemdUnitIdentity {
     pub active_state: String,
     pub sub_state: String,
     pub transient: bool,
+    pub exit_type: String,
+    pub kill_mode: String,
+    pub send_sigkill: bool,
     pub slice: String,
     pub memory_high: u64,
     pub memory_max: u64,
@@ -223,6 +226,15 @@ impl DbusSystemdApi {
             transient: unit
                 .get_property("Transient")
                 .context("reading systemd Transient property")?,
+            exit_type: service
+                .get_property("ExitType")
+                .context("reading systemd ExitType")?,
+            kill_mode: service
+                .get_property("KillMode")
+                .context("reading systemd KillMode")?,
+            send_sigkill: service
+                .get_property("SendSIGKILL")
+                .context("reading systemd SendSIGKILL")?,
             slice: service
                 .get_property("Slice")
                 .context("reading systemd Slice")?,
@@ -1467,7 +1479,7 @@ impl LinuxSystemdBackend {
         }
         if !receipt.limits.is_complete() {
             bail!(
-                "supervised service has an incomplete legacy resource policy and is attach-only until restart"
+                "supervised service has an incomplete legacy resource policy; metrics and force-kill are unavailable until restart"
             );
         }
         let identity = self.verified_identity(receipt)?;
@@ -1513,6 +1525,15 @@ impl LinuxSystemdBackend {
         let manager = self.api.manager_info()?;
         self.validated_cgroup_path(&manager.control_group, &identity.control_group)?;
         if receipt.schema_version == RECEIPT_SCHEMA_VERSION {
+            if identity.exit_type != "cgroup" {
+                bail!("systemd service no longer has ExitType=cgroup");
+            }
+            if identity.kill_mode != "control-group" {
+                bail!("systemd service no longer has KillMode=control-group");
+            }
+            if identity.send_sigkill {
+                bail!("systemd service no longer has SendSIGKILL=no");
+            }
             if let Some(requested_slice) = &receipt.requested_slice {
                 if identity.slice != *requested_slice {
                     bail!("systemd slice no longer matches the receipt");
@@ -1626,7 +1647,7 @@ fn reconcile_verified_containment(
     match containment {
         Ok(ContainmentStatus::Verified) if !receipt.limits.is_complete() => {
             OwnershipState::LegacyRestartRequired(
-                "supervised service predates the complete automatic resource policy; attach-only until it exits and is relaunched".into(),
+                "supervised service predates the complete automatic resource policy; attach and exact-target non-force stop remain available, but metrics and force-kill require relaunch".into(),
             )
         }
         Ok(ContainmentStatus::Verified) => OwnershipState::OwnedVerified(Box::new(receipt.clone())),
@@ -1700,10 +1721,8 @@ impl SupervisionBackend for LinuxSystemdBackend {
     }
 
     fn stop_unit(&self, receipt: &BindingReceipt) -> Result<ActionResult> {
-        if !receipt.limits.is_complete() {
-            bail!(
-                "supervised service has an incomplete legacy resource policy and is attach-only until restart"
-            );
+        if receipt.is_legacy() {
+            bail!("legacy v1 receipt is attach-only and requires restart for resource ownership");
         }
         let invocation_id = decode_hex(&receipt.invocation_id)?;
         if self.identity_if_present(receipt)?.is_none() {
@@ -2841,6 +2860,9 @@ mod tests {
             active_state: "active".into(),
             sub_state: "running".into(),
             transient: true,
+            exit_type: "cgroup".into(),
+            kill_mode: "control-group".into(),
+            send_sigkill: false,
             slice: "app.slice".into(),
             memory_high: UINT64_MAX,
             memory_max: UINT64_MAX,
@@ -3756,7 +3778,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_policy_receipt_is_attach_only_for_reconcile_metrics_and_control() {
+    fn incomplete_policy_receipt_is_restart_required_but_non_force_stoppable() {
         let mut receipt = current_receipt();
         receipt.limits = ResourceLimits::default();
 
@@ -3764,14 +3786,17 @@ mod tests {
             reconcile_verified_containment(&receipt, Ok(ContainmentStatus::Verified)),
             OwnershipState::LegacyRestartRequired(reason)
                 if reason.contains("complete automatic resource policy")
-                    && reason.contains("attach-only")
+                    && reason.contains("non-force stop")
         ));
 
         let backend = fake_backend(None);
         let snapshot_error = backend.snapshot(&receipt, None).unwrap_err();
         assert!(format!("{snapshot_error:#}").contains("incomplete legacy resource policy"));
-        let stop_error = backend.stop_unit(&receipt).unwrap_err();
-        assert!(format!("{stop_error:#}").contains("incomplete legacy resource policy"));
+        let stop = backend.stop_unit(&receipt).unwrap();
+        assert!(stop.completed);
+        assert!(stop.attempted.is_empty());
+        let force_error = backend.force_kill(&receipt).unwrap_err();
+        assert!(format!("{force_error:#}").contains("incomplete legacy resource policy"));
     }
 
     #[test]

@@ -453,12 +453,14 @@ The implementation includes:
   `/proc/<pid>/task/<pid>/children` without a global process scan;
 - split-containment reporting when the root or descendants escape, including an
   explicit external-bounded-scope explanation for `build-contained` descendants
-  beneath `agent-work.slice`; split rows may attach but receive no whole-workload
-  metrics, stop, or force-kill authority;
+  beneath `agent-work.slice`; split rows may attach and use confirmed exact-target/
+  non-force service stop, but receive no whole-workload metrics or force-kill
+  authority and never signal external scopes;
 - mixed receipt transition semantics: new launches write v2 evidence plus an
   optional canonical Linux launch-boot UUID copied from the pending journal's
   single best-effort observation; live v1 services are legacy/restart-required
-  exact-target attach-only, both unit and target absent may stale-clean, and
+  exact-target attach-only, current v2 incomplete-policy services permit only
+  exact-target/non-force stop, both unit and target absent may stale-clean, and
   partial presence remains ambiguous. Boot provenance is non-authoritative and
   does not gate stale-row Enter;
 - direct routine Enter for any idle declared stale row after an error-free exact
@@ -466,7 +468,8 @@ The implementation includes:
   the unchanged receipt, pending absence, unit, target, marker, capabilities,
   limits, and ordinary-target races before cleanup or creation and sends no signal
   to an old workload. Pending, ambiguous, errored, and unreconciled evidence blocks
-  Enter, while split containment attaches only to its exact private target;
+  Enter, while split containment attaches only to its exact private target and
+  row-scoped `x` may stop that target/service without signalling external scopes;
 - pending creator reconciliation where a valid boot mismatch proves only creator
   absence and cleanup still requires exact unit and private-target absence;
   missing/invalid/read-failed boot evidence retains PID/start-time checks;
@@ -494,8 +497,9 @@ bulk startup relaunch. Portagenty observes but does not create or modify the
 aggregate Claude slice. Existing services and live ordinary multiplexer sessions
 are not stopped, migrated, upgraded, or retroactively claimed. `S` remains custom
 limit editing. `x` means confirmed signal-free cleanup-only on stale rows,
-confirmed graceful/non-force stop on owned rows, and confirmed multiplexer-native kill on
-unmanaged live rows. `X` remains separately confirmed force-kill. `MemoryHigh`
+confirmed graceful/non-force stop on owned rows, narrower exact-target/non-force
+stop on split or current v2 incomplete-policy rows, and confirmed multiplexer-native
+kill on unmanaged live rows. `X` remains separately confirmed force-kill. `MemoryHigh`
 remains a reclaim threshold; `MemoryMax` and
 `MemorySwapMax` are hard ceilings.
 
