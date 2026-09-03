@@ -48,7 +48,7 @@ pressing `Esc` from the session list.
 | `A` | Toggle the archived-workspaces view |
 | `d` | Unregister workspace from global index (file stays on disk) |
 | `D` | Delete workspace file and unregister (with confirm) |
-| `X` | Preview and stop workspace sessions: verified owned workloads use graceful + non-force systemd stop, unmanaged targets use mpx-native kill, and stale/ambiguous receipts are skipped. No bulk force escalation. |
+| `X` | Preview and stop workspace sessions: owned, split-containment, and current v2 incomplete-policy receipts use exact-target + non-force systemd stop; unmanaged targets use mpx-native kill; legacy v1, stale, pending, and ambiguous receipts are skipped. External scopes are never signalled, and no bulk force escalation occurs. |
 | `Ctrl+R` | Refresh live-session counts |
 | `?` | Help overlay |
 | `q` / `Esc` | Exit `pa` |

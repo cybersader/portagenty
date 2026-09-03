@@ -126,7 +126,7 @@ stripped before launch; a validated runtime directory and declared session env
 remain. Workspace commands are still user-authored code and execute with the
 user's permissions.
 
-Every supervised session kind receives the complete standard `3G`/`5G`/`512MiB`/`800%`/`1200` policy; incomplete current receipts remain exact-target attach-only until restart and cannot expose owned metrics or control. Only explicit `kind = "claude-code"` selects Claude containment; names and commands do not. Claude-kind services additionally request `claude-code.slice` and `ManagedOOMPreference=omit`. Portagenty first verifies that the externally managed aggregate slice exists beneath `/claude.slice/claude-code.slice` with finite positive `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, consistent memory controls, and oomd-omit metadata. Aggregate `TasksMax` is optional and may remain infinity; Portagenty never creates or modifies that slice. Claude overrides may only tighten the standard policy. Generic sessions remain outside the Claude slice but retain the same finite per-service baseline.
+Every supervised session kind receives the complete standard `3G`/`5G`/`512MiB`/`800%`/`1200` policy; incomplete current receipts remain exact-target attachable and non-force stoppable until restart but cannot expose owned metrics or force-kill. Only explicit `kind = "claude-code"` selects Claude containment; names and commands do not. Claude-kind services additionally request `claude-code.slice` and `ManagedOOMPreference=omit`. Portagenty first verifies that the externally managed aggregate slice exists beneath `/claude.slice/claude-code.slice` with finite positive `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, consistent memory controls, and oomd-omit metadata. Aggregate `TasksMax` is optional and may remain infinity; Portagenty never creates or modifies that slice. Claude overrides may only tighten the standard policy. Generic sessions remain outside the Claude slice but retain the same finite per-service baseline.
 
 `MemoryHigh` is a reclaim threshold; `MemoryMax` and `MemorySwapMax` are hard
 ceilings; CPU quota throttles aggregate CPU; `TasksMax` rejects new tasks. These
@@ -134,8 +134,9 @@ limits reduce damage but are not a data-safety guarantee. Ordinary stop performs
 exact multiplexer shutdown followed by revalidated non-force `StopUnit`;
 `SendSIGKILL=no` prevents implicit escalation. Whole-cgroup SIGKILL is a separate
 explicitly confirmed action available only for complete owned-and-verified v2
-containment. Bulk stop never force-escalates and skips legacy, split, pending,
-stale, and ambiguous targets.
+containment. Bulk stop may apply the same non-force path to owned, split, and
+current v2 incomplete-policy targets, but never signals external descendant scopes
+or force-escalates; legacy v1, pending, stale, and ambiguous targets remain skipped.
 
 Resource observation reads numeric cgroup files only. Portagenty does not inspect
 terminal contents, prompts, command output, or agent logs, and does not retain

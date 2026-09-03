@@ -487,9 +487,9 @@ The implementation includes:
   prove a safe supervised launch, with no ordinary target created as a fallback;
 - graceful target shutdown followed by non-force systemd stop, preserving
   `OOMPolicy=continue`, `ExitType=cgroup`, `KillMode=control-group`, and
-  `SendSIGKILL=no`; picker-wide stop skips legacy, split, stale, and ambiguous
-  receipts and never bulk-force-kills, while a pending journal blocks duplicate
-  supervised creation without granting control.
+  `SendSIGKILL=no`; picker-wide stop includes owned, split, and current v2
+  incomplete-policy receipts, skips legacy v1/stale/pending/ambiguous states,
+  never signals external scopes, and never bulk-force-kills.
 
 This does **not** add a Portagenty daemon, listener, GUI, history database, log
 monitor, restart manager, unattended telemetry service, TUI-startup mutation, or

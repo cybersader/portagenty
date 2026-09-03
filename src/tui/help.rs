@@ -125,7 +125,7 @@ fn help_body(ctx: HelpContext) -> Vec<Line<'static>> {
             lines.push(row("D", "delete workspace file (destructive)"));
             lines.push(row(
                 "X",
-                "stop workspace sessions; previews owned/mux-native/skipped",
+                "stop workspace sessions; previews non-force/mux-native/skipped",
             ));
             lines.push(row(
                 "a",

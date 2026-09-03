@@ -87,9 +87,9 @@ impl StatusLine {
 }
 
 /// One target of a workspace-wide stop operation. Every row carries the exact
-/// control path that confirmation will authorize: receipt-owned workloads use
-/// graceful + non-force systemd stop, unmanaged shared targets use the native
-/// multiplexer kill, and stale or ambiguous receipts are shown but skipped.
+/// control path that confirmation will authorize: current receipted workloads
+/// use graceful + non-force systemd stop, unmanaged shared targets use the
+/// native multiplexer kill, and unsafe receipt states are shown but skipped.
 #[derive(Debug, Clone)]
 struct KillTarget {
     /// Display label — the declared TOML session name for tracked entries, or
@@ -98,10 +98,21 @@ struct KillTarget {
     control: KillControl,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptedStopClass {
+    Owned,
+    SplitContainment,
+    IncompletePolicy,
+}
+
 #[derive(Debug, Clone)]
 enum KillControl {
     #[cfg(target_os = "linux")]
-    Owned(Box<crate::supervision::BindingReceipt>),
+    ReceiptedNonForce {
+        receipt: Box<crate::supervision::BindingReceipt>,
+        class: ReceiptedStopClass,
+    },
     MuxNative {
         mpx_name: String,
         tracked: bool,
@@ -133,9 +144,9 @@ enum PickerPending {
     /// writes the TOML `tags` array; Esc cancels.
     EditTags { path: PathBuf, input: String },
     /// Stop every controllable live session belonging to this workspace.
-    /// Triggered by `X` in the picker. Owned workloads use graceful +
-    /// non-force systemd stop, unmanaged targets use multiplexer-native kill,
-    /// and stale or ambiguous receipts are previewed but skipped.
+    /// Triggered by `X` in the picker. Current v2 owned, split-containment, and
+    /// incomplete-policy receipts use graceful + non-force systemd stop;
+    /// unmanaged targets use multiplexer-native kill; unsafe states are skipped.
     KillAllSessions {
         ws_display_name: String,
         mpx: crate::domain::Multiplexer,
@@ -775,9 +786,9 @@ pub fn run(
                 }
             }
             // X: stop every controllable live session under the highlighted
-            // workspace. The confirmation previews owned non-force stops,
-            // unmanaged multiplexer kills, and stale bindings that will be
-            // skipped. Zero targets short-circuits without a modal.
+            // workspace. The confirmation previews current-v2 non-force stops,
+            // unmanaged multiplexer kills, and unsafe receipt states that will
+            // be skipped. Zero targets short-circuits without a modal.
             (KeyCode::Char('X'), _) => {
                 let Some(path) = selected_workspace(&workspaces, &visible, &state, has_sentinel)
                 else {
@@ -1200,15 +1211,7 @@ fn classify_receipted_bulk_target(
 
     match backend {
         Ok(backend) => match backend.reconcile(receipt) {
-            Ok(crate::supervision::OwnershipState::OwnedVerified(_)) => {
-                KillControl::Owned(Box::new(receipt.clone()))
-            }
-            Ok(crate::supervision::OwnershipState::StaleBinding(reason)) => {
-                KillControl::Skipped { reason }
-            }
-            Ok(state) => KillControl::Skipped {
-                reason: format!("ownership is {state:?}"),
-            },
+            Ok(state) => classify_reconciled_bulk_target(receipt, state),
             Err(error) => KillControl::Skipped {
                 reason: format!("ownership revalidation failed: {error:#}"),
             },
@@ -1216,6 +1219,38 @@ fn classify_receipted_bulk_target(
         Err(error) => KillControl::Skipped {
             reason: format!("supervision backend unavailable: {error:#}"),
         },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_reconciled_bulk_target(
+    receipt: &crate::supervision::BindingReceipt,
+    state: crate::supervision::OwnershipState,
+) -> KillControl {
+    use crate::supervision::OwnershipState;
+
+    let class = match state {
+        OwnershipState::OwnedVerified(_) => ReceiptedStopClass::Owned,
+        OwnershipState::SplitContainment(_) => ReceiptedStopClass::SplitContainment,
+        OwnershipState::LegacyRestartRequired(_) if !receipt.is_legacy() => {
+            ReceiptedStopClass::IncompletePolicy
+        }
+        OwnershipState::LegacyRestartRequired(_) => {
+            return KillControl::Skipped {
+                reason: "legacy v1 receipt is attach-only".into(),
+            };
+        }
+        OwnershipState::StaleBinding(reason) => return KillControl::Skipped { reason },
+        state => {
+            return KillControl::Skipped {
+                reason: format!("ownership is {state:?}"),
+            };
+        }
+    };
+
+    KillControl::ReceiptedNonForce {
+        receipt: Box::new(receipt.clone()),
+        class,
     }
 }
 
@@ -1258,14 +1293,17 @@ fn perform_kill_all_sessions(
                 )),
             },
             #[cfg(target_os = "linux")]
-            KillControl::Owned(receipt) => {
+            KillControl::ReceiptedNonForce { receipt, .. } => {
                 use crate::supervision::SupervisionBackend as _;
                 let result = (|| -> anyhow::Result<()> {
                     let backend = supervision_backend.as_ref().map_err(|error| {
                         anyhow::anyhow!("supervision backend unavailable: {error:#}")
                     })?;
                     match backend.reconcile(receipt)? {
-                        crate::supervision::OwnershipState::OwnedVerified(_) => {}
+                        crate::supervision::OwnershipState::OwnedVerified(_)
+                        | crate::supervision::OwnershipState::SplitContainment(_) => {}
+                        crate::supervision::OwnershipState::LegacyRestartRequired(_)
+                            if !receipt.is_legacy() => {}
                         state => {
                             anyhow::bail!("ownership changed before non-force stop: {state:?}")
                         }
@@ -1980,21 +2018,69 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
             #[cfg(target_os = "linux")]
             let owned = targets
                 .iter()
-                .filter(|target| matches!(&target.control, KillControl::Owned(_)))
+                .filter(|target| {
+                    matches!(
+                        &target.control,
+                        KillControl::ReceiptedNonForce {
+                            class: ReceiptedStopClass::Owned,
+                            ..
+                        }
+                    )
+                })
                 .count();
             #[cfg(not(target_os = "linux"))]
             let owned = 0usize;
+            #[cfg(target_os = "linux")]
+            let split = targets
+                .iter()
+                .filter(|target| {
+                    matches!(
+                        &target.control,
+                        KillControl::ReceiptedNonForce {
+                            class: ReceiptedStopClass::SplitContainment,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            #[cfg(not(target_os = "linux"))]
+            let split = 0usize;
+            #[cfg(target_os = "linux")]
+            let incomplete = targets
+                .iter()
+                .filter(|target| {
+                    matches!(
+                        &target.control,
+                        KillControl::ReceiptedNonForce {
+                            class: ReceiptedStopClass::IncompletePolicy,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            #[cfg(not(target_os = "linux"))]
+            let incomplete = 0usize;
             let mux_native = targets
                 .iter()
                 .filter(|target| matches!(&target.control, KillControl::MuxNative { .. }))
                 .count();
-            let skipped = n - owned - mux_native;
+            let skipped = n - owned - split - incomplete - mux_native;
             let list = targets
                 .iter()
                 .map(|target| {
                     let tag = match &target.control {
                         #[cfg(target_os = "linux")]
-                        KillControl::Owned(_) => "owned: graceful + non-force systemd stop".into(),
+                        KillControl::ReceiptedNonForce { class, .. } => match class {
+                            ReceiptedStopClass::Owned => {
+                                "owned: graceful + non-force systemd stop".into()
+                            }
+                            ReceiptedStopClass::SplitContainment => {
+                                "split: exact-target + non-force service stop; external scopes remain out of bounds".into()
+                            }
+                            ReceiptedStopClass::IncompletePolicy => {
+                                "restart-required: exact-target + non-force service stop".into()
+                            }
+                        },
                         KillControl::MuxNative { tracked, .. } => format!(
                             "{}: multiplexer-native kill",
                             if *tracked { "tracked" } else { "unmanaged" }
@@ -2009,10 +2095,12 @@ fn picker_confirm_copy(p: &PickerPending) -> (String, String) {
                 "Stop all live sessions".into(),
                 format!(
                     "Stop {n} session target{plural} under {ws_display_name:?}? \
-                     ({owned} owned, {mux_native} mux-native, {skipped} skipped)\n\
+                     ({owned} owned, {split} split, {incomplete} restart-required, \
+                     {mux_native} mux-native, {skipped} skipped)\n\
                      \n{list}\n\
                      \n\
-                     No force escalation occurs. Running state may be lost.",
+                     No force escalation occurs. External descendant scopes are never \
+                     signalled and may remain. Running state may be lost.",
                     plural = if n == 1 { "" } else { "s" },
                 ),
             )
@@ -2315,10 +2403,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn bulk_stop_confirmation_names_each_control_path_and_skips_ambiguity() {
-        let receipt = crate::supervision::BindingReceipt {
-            schema_version: crate::supervision::model::LEGACY_RECEIPT_SCHEMA_VERSION,
+    fn bulk_test_receipt() -> crate::supervision::BindingReceipt {
+        crate::supervision::BindingReceipt {
+            schema_version: crate::supervision::model::RECEIPT_SCHEMA_VERSION,
             logical_id: crate::supervision::LogicalSessionId::new(
                 "550e8400-e29b-41d4-a716-446655440000",
                 "owned",
@@ -2339,14 +2426,37 @@ mod tests {
             requested_slice: None,
             workload_anchor: None,
             launch_boot_id: None,
-        };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bulk_stop_confirmation_names_each_safe_control_path_and_skips_ambiguity() {
+        let receipt = bulk_test_receipt();
         let pending = PickerPending::KillAllSessions {
             ws_display_name: "example".into(),
             mpx: crate::domain::Multiplexer::Tmux,
             targets: vec![
                 KillTarget {
                     display: "owned".into(),
-                    control: KillControl::Owned(Box::new(receipt)),
+                    control: KillControl::ReceiptedNonForce {
+                        receipt: Box::new(receipt.clone()),
+                        class: ReceiptedStopClass::Owned,
+                    },
+                },
+                KillTarget {
+                    display: "split".into(),
+                    control: KillControl::ReceiptedNonForce {
+                        receipt: Box::new(receipt.clone()),
+                        class: ReceiptedStopClass::SplitContainment,
+                    },
+                },
+                KillTarget {
+                    display: "restart".into(),
+                    control: KillControl::ReceiptedNonForce {
+                        receipt: Box::new(receipt),
+                        class: ReceiptedStopClass::IncompletePolicy,
+                    },
                 },
                 KillTarget {
                     display: "shared".into(),
@@ -2366,9 +2476,56 @@ mod tests {
 
         let (title, body) = picker_confirm_copy(&pending);
         assert_eq!(title, "Stop all live sessions");
+        assert!(body.contains("1 owned, 1 split, 1 restart-required"));
         assert!(body.contains("owned: graceful + non-force systemd stop"));
+        assert!(body.contains("split: exact-target + non-force service stop"));
+        assert!(body.contains("external scopes remain out of bounds"));
+        assert!(body.contains("restart-required: exact-target + non-force service stop"));
         assert!(body.contains("tracked: multiplexer-native kill"));
         assert!(body.contains("SKIP: receipt mismatch"));
         assert!(body.contains("No force escalation occurs"));
+        assert!(body.contains("External descendant scopes are never signalled and may remain"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bulk_classification_accepts_safe_v2_stops_but_skips_legacy_v1() {
+        use crate::supervision::OwnershipState;
+
+        let current = bulk_test_receipt();
+        let split = classify_reconciled_bulk_target(
+            &current,
+            OwnershipState::SplitContainment("external descendant".into()),
+        );
+        assert!(matches!(
+            split,
+            KillControl::ReceiptedNonForce {
+                class: ReceiptedStopClass::SplitContainment,
+                ..
+            }
+        ));
+
+        let incomplete = classify_reconciled_bulk_target(
+            &current,
+            OwnershipState::LegacyRestartRequired("incomplete policy".into()),
+        );
+        assert!(matches!(
+            incomplete,
+            KillControl::ReceiptedNonForce {
+                class: ReceiptedStopClass::IncompletePolicy,
+                ..
+            }
+        ));
+
+        let mut legacy = current;
+        legacy.schema_version = crate::supervision::model::LEGACY_RECEIPT_SCHEMA_VERSION;
+        let legacy = classify_reconciled_bulk_target(
+            &legacy,
+            OwnershipState::LegacyRestartRequired("legacy".into()),
+        );
+        assert!(matches!(
+            legacy,
+            KillControl::Skipped { reason } if reason.contains("legacy v1")
+        ));
     }
 }

@@ -208,8 +208,9 @@ root and every bounded descendant remains in the service cgroup.
     Live v1 services are legacy/restart-required exact-target attach-only. Current
     v2 incomplete-policy services may stop non-force but withhold metrics/force-kill.
     Escaped descendants produce split containment; external `build-contained`
-    children in `agent-work.slice` stay externally bounded. Split rows may stop the
-    exact target and verified service non-force, but never signal external scopes.
+    children in `agent-work.slice` stay externally bounded. Row-scoped and
+    workspace-wide actions may stop the exact target and verified service non-force,
+    but never signal external scopes.
     Partial unit/target presence remains ambiguous and fail-closed.
   </Card>
 </CardGrid>

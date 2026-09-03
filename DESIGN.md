@@ -253,7 +253,7 @@ The control ladder stays explicit:
 2. Revalidate and request non-force systemd `StopUnit` for a current v2 receipt. This step is available to owned, split-containment, and incomplete-policy v2 rows; split descendants outside the Portagenty service are not signalled and may remain.
 3. Only a separately confirmed force action may call whole-cgroup `KillUnit(..., SIGKILL)`, and only for complete owned-and-verified containment.
 
-Row-scoped `x` may use steps 1–2 for split and current v2 incomplete-policy rows with the narrower warnings above. Picker-wide stop remains conservative: verified owned workloads use steps 1–2, unmanaged shared sessions use multiplexer-native kill, and legacy, split, stale, pending, or ambiguous receipts are shown and skipped. A pending-launch journal blocks another supervised creation for the same logical session but is not treated as an owned control target. Bulk control never force-escalates.
+Row-scoped `x` and picker-wide `X` may use steps 1–2 for split and current v2 incomplete-policy rows with the narrower warnings above. Picker-wide confirmation previews owned, split, restart-required, multiplexer-native, and skipped targets before acting. Legacy v1, stale, pending, ambiguous, and otherwise unsafe receipts remain skipped. A pending-launch journal blocks another supervised creation for the same logical session but is not treated as a control target. Bulk control never force-escalates or signals external descendant scopes.
 
 ---
 
