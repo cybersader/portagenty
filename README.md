@@ -129,6 +129,10 @@ pa                        # open the TUI
 
 A setup failure before the multiplexer client starts reopens the same workspace and logical session row instead of dropping back to the picker or shell. Once a client actually runs and returns—normally, nonzero, by signal, or because the user was forced out—Portagenty prints the human `workspace / session` identity before any abnormal-exit diagnostics.
 
+New `kind = "claude-code"` launches from either `pa launch` or the TUI give direct `claude` commands a readable peer-session label such as `portagenty-session-labels` (`<workspace>-<session>`, lowercase ASCII words joined by hyphens). Explicit `--name` / `-n` labels win. Custom wrappers and compound shell commands keep their original arguments; set their label in the command if the wrapper supports it. Existing sessions and multiplexer IDs are unchanged.
+
+These launches also use `env -u … bash -c …` at the workload boundary to remove inherited Claude session/IPC markers and worker-scope markers, including when `pa` runs inside another Claude session. This prevents inherited child-session state from suppressing transcripts or peer discovery. Provider credentials, model selection, proxy settings, and model locks remain intact; generic session kinds are untouched. See [DESIGN.md §7](./DESIGN.md#7-agent-integration--agnostic-core-explicit-policy-selectors) for the exact marker list.
+
 **Still roadmapped**: Custom ordered groups, `pa up` eager-launch, datetime column, jump-back-to-pa from inside a session, non-Linux supervision adapters, and any external graphical resource dashboard. See [ROADMAP.md](./ROADMAP.md).
 
 ## What it is

@@ -584,6 +584,7 @@ pub fn launch(
         return finish_client_return(result, &workspace_name, &session_name);
     }
 
+    let sess = crate::launch::prepare_session(&ws.name, &sess);
     let workspace_name = ws.name.clone();
     let session_name = sess.name.clone();
     let mux = build_mux(ws.multiplexer)?;
@@ -724,6 +725,7 @@ fn launch_supervised_inner(
     fresh: bool,
     limits: ResourceLimits,
 ) -> Result<ClientCompletion<()>> {
+    let sess = crate::launch::prepare_session(&ws.name, &sess);
     let workspace_id = ws.id.as_deref().ok_or_else(|| {
         anyhow!(
             "supervised launch requires a workspace UUID; open the workspace in the TUI, press `S` on an idle session, and confirm adding a stable ID (reopen before retrying only if you cancel after assignment)"
@@ -909,6 +911,7 @@ pub(crate) fn replace_stale_supervised_resolved(
     mode: AttachMode,
     limits: ResourceLimits,
 ) -> Result<ClientCompletion<()>> {
+    let sess = crate::launch::prepare_session(&ws.name, &sess);
     let limits = effective_stale_replacement_limits(sess.kind, expected.is_legacy(), limits)?;
     let workspace_id = ws
         .id

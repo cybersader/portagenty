@@ -38,6 +38,8 @@ Explicitly **not** in v1:
 
 ### Shipped
 
+- **Readable Claude peer-session labels.** New explicitly `claude-code` CLI/TUI launches (including supervised creation) add a sanitized `<workspace>-<session>` name to direct `claude` commands unless a name is already supplied. Custom wrappers/compound commands keep their arguments. Workload-local `env -u` removes inherited parent-session/IPC and worker-scope markers while retaining provider/model/proxy routing and model locks. Multiplexer IDs and ownership proof stay unchanged. Cross-workspace running-peer lookup is deferred.
+
 1. **zellij adapter.** List/has/kill via imperative CLI; create +
    attach via generated KDL layout files. Inside-zellij detection
    returns a clear "detach first" error instead of the opaque

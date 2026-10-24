@@ -440,8 +440,7 @@ fn run_session_tui(
             print_launch_banner(mpx_kind, &session.name);
             let session_name = session.name.clone();
             classify_launch_result(
-                mux.create_and_attach(&session, &mpx_name, mode)
-                    .map(|completion| completion.map(|_| ())),
+                create_ordinary_session(mux.as_ref(), &workspace_name, &session, &mpx_name, mode),
                 workspace_for_resume.clone(),
                 declared_selection(&workspace_for_resume, &session_name),
                 workspace_name,
@@ -558,6 +557,18 @@ fn run_session_tui(
     })
 }
 
+fn create_ordinary_session(
+    mux: &dyn crate::mux::Multiplexer,
+    workspace_name: &str,
+    session: &crate::domain::Session,
+    mpx_name: &str,
+    mode: crate::mux::AttachMode,
+) -> Result<ClientCompletion<()>> {
+    let prepared = crate::launch::prepare_session(workspace_name, session);
+    mux.create_and_attach(&prepared, mpx_name, mode)
+        .map(|completion| completion.map(|_| ()))
+}
+
 fn finalize_launch(
     completion: ClientCompletion<()>,
     workspace_name: &str,
@@ -644,6 +655,58 @@ fn print_launch_banner(mpx: crate::domain::Multiplexer, session: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_tui_launch_prepares_labels_preserves_custom_names_and_cleans_environment() {
+        for (command, payload) in [
+            (
+                "claude --continue",
+                "'claude --name portagenty-session-labels --continue'",
+            ),
+            ("claude --name=chosen", "'claude --name=chosen'"),
+            ("claude -n chosen", "'claude -n chosen'"),
+            ("cc --continue", "'cc --continue'"),
+        ] {
+            let session = crate::domain::Session {
+                name: "session-labels".into(),
+                cwd: std::env::temp_dir(),
+                command: command.into(),
+                kind: Some(crate::domain::SessionKind::ClaudeCode),
+                env: Default::default(),
+                description: None,
+            };
+            let mut mux = crate::mux::MockMultiplexer::new();
+            mux.expect_create_and_attach()
+                .withf(move |prepared, target, mode| {
+                    prepared.command.ends_with(payload)
+                        && prepared.command.contains("-u CLAUDE_CODE_CHILD_SESSION")
+                        && prepared
+                            .command
+                            .contains("-u AGENT_GUARD_INHERITED_SUBAGENT_MODEL")
+                        && prepared.name == "session-labels"
+                        && target == "unchanged-mux-target"
+                        && *mode == crate::mux::AttachMode::Takeover
+                })
+                .times(1)
+                .returning(|_, _, _| {
+                    Ok(ClientCompletion::Returned(
+                        crate::mux::CreationDisposition::Created,
+                    ))
+                });
+            assert_eq!(
+                create_ordinary_session(
+                    &mux,
+                    "Portagenty",
+                    &session,
+                    "unchanged-mux-target",
+                    crate::mux::AttachMode::Takeover
+                )
+                .unwrap(),
+                ClientCompletion::Returned(())
+            );
+            assert_eq!(session.command, command);
+        }
+    }
 
     #[test]
     fn bare_pa_starts_at_global_picker() {

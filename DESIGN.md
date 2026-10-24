@@ -271,6 +271,19 @@ kind = "claude-code"
 
 Implemented kind values are `claude-code`, `opencode`, `shell`, `editor`, `dev-server`, and `other`. Kinds drive TUI markers; `claude-code` also drives kind-aware resume and, for supervised launches, the Claude slice/default resource policy. No other kind and no command/name inference may select that policy.
 
+### Claude launch labels and fresh session environment
+
+On creation (ordinary or supervised, CLI or TUI), `kind = "claude-code"` enables a launch-local copy of the command. A simple direct `claude` invocation (including an explicit executable path) receives `--name <workspace>-<session>` before its arguments. Label components are lowercase ASCII alphanumeric words joined by hyphens, with `workspace` / `session` fallbacks for empty components. Existing `--name`, `--name=…`, `-n`, and attached `-n…` forms win. Wrappers such as `cc`, compound shell commands, and commands requiring shell expansion are not rewritten: their flag contracts are unknown. Supply a name in those custom commands when supported. Config, logical session identity, multiplexer IDs/hashes, receipt ownership, and attach behavior do not change; already-running sessions are not renamed.
+
+The prepared command is wrapped as `env -u NAME … bash -c '<quoted command>'`. Cleanup happens after multiplexer/session environment setup because an existing server can retain markers even if the `pa` client removes them from its own environment. Shell quoting preserves custom commands, operators, and exit status. The exact removed names are:
+
+- `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`
+- `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`
+- `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF`
+- `AGENT_GUARD_WORKER_SCOPE`, `AGENT_GUARD_INHERITED_SUBAGENT_MODEL`
+
+This avoids parent-session state suppressing transcript persistence and peer discovery. Cleanup applies only to this kind and only at workload creation, never to the parent process. Other variables, including provider credentials, `ANTHROPIC_*`, model/proxy routing, and model-lock controls, are preserved. No environment values are logged. Read-only joining of running Claude records across registered workspaces remains deferred; `pa list` still lists resolved workspace configuration rather than claiming live peer ownership.
+
 A full plugin runtime — where third-party adapters register themselves via some extension mechanism — is a v2+ question. Not a v1 problem.
 
 ---
