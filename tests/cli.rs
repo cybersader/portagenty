@@ -2,6 +2,7 @@
 
 use assert_cmd::Command;
 use assert_fs::prelude::*;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 /// Shared tempdir used as the test process's XDG_CONFIG_HOME. Pointing
@@ -122,6 +123,81 @@ fn launch_dry_run_prints_what_would_happen() {
         .stdout(contains("takeover"));
 }
 
+#[test]
+fn claude_launch_labels_and_cleanup_cover_both_multiplexers_and_creation_modes() {
+    for mpx in ["tmux", "zellij"] {
+        for supervised in [false, true] {
+            if supervised && !cfg!(target_os = "linux") {
+                continue;
+            }
+            let tmp = assert_fs::TempDir::new().unwrap();
+            let path = tmp.child("labels.portagenty.toml");
+            path.write_str(&format!(
+                r#"
+name = "Portagenty"
+id = "550e8400-e29b-41d4-a716-446655440000"
+multiplexer = "{mpx}"
+[[session]]
+name = "session-labels"
+cwd = "."
+command = "claude --continue"
+kind = "claude-code"
+"#
+            ))
+            .unwrap();
+            let mut command = pa_cmd();
+            command
+                .args(["launch", "session-labels", "--dry-run", "--workspace"])
+                .arg(path.path());
+            if supervised {
+                command.arg("--supervise");
+            }
+            command
+                .assert()
+                .success()
+                .stdout(contains(
+                    "claude --name portagenty-session-labels --continue",
+                ))
+                .stdout(contains("env -u CLAUDECODE"))
+                .stdout(contains("-u CLAUDE_CODE_CHILD_SESSION"))
+                .stdout(contains("-u AGENT_GUARD_INHERITED_SUBAGENT_MODEL"));
+        }
+    }
+}
+
+#[test]
+fn claude_launch_preserves_explicit_names_and_custom_commands() {
+    for (original, expected) in [
+        ("claude --name=chosen", "'claude --name=chosen'"),
+        ("claude -n chosen", "'claude -n chosen'"),
+        ("cc --continue", "'cc --continue'"),
+        ("printf custom", "'printf custom'"),
+    ] {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = tmp.child("labels.portagenty.toml");
+        path.write_str(&format!(
+            r#"
+name = "Portagenty"
+multiplexer = "tmux"
+[[session]]
+name = "session-labels"
+cwd = "."
+command = "{original}"
+kind = "claude-code"
+"#
+        ))
+        .unwrap();
+        pa_cmd()
+            .args(["launch", "session-labels", "--dry-run", "--workspace"])
+            .arg(path.path())
+            .assert()
+            .success()
+            .stdout(contains(expected))
+            .stdout(contains("env -u CLAUDECODE"))
+            .stdout(predicates::str::contains("--name portagenty-session-labels").not());
+    }
+}
+
 fn write_supervised_workspace(tmp: &assert_fs::TempDir) -> std::path::PathBuf {
     tmp.child("supervised.portagenty.toml")
         .write_str(
@@ -207,7 +283,7 @@ fn claude_policy_rejects_weaker_override() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn generic_session_does_not_inherit_claude_defaults_from_its_name() {
+fn generic_session_receives_complete_standard_supervision_defaults() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let path = tmp.child("generic.portagenty.toml");
     path.write_str(
@@ -230,9 +306,11 @@ command = "claude"
         .arg(path.path())
         .assert()
         .success()
-        .stdout(contains("memory high: not set"))
-        .stdout(contains("memory max:  not set"))
-        .stdout(contains("swap max:    not set"));
+        .stdout(contains("memory high: 3.00 GiB"))
+        .stdout(contains("memory max:  5.00 GiB"))
+        .stdout(contains("swap max:    512.00 MiB"))
+        .stdout(contains("CPU quota:  800%"))
+        .stdout(contains("tasks max:  1200"));
 }
 
 #[test]

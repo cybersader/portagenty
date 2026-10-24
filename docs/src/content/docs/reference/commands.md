@@ -48,7 +48,7 @@ pressing `Esc` from the session list.
 | `A` | Toggle the archived-workspaces view |
 | `d` | Unregister workspace from global index (file stays on disk) |
 | `D` | Delete workspace file and unregister (with confirm) |
-| `X` | Preview and stop workspace sessions: verified owned workloads use graceful + non-force systemd stop, unmanaged targets use mpx-native kill, and stale/ambiguous receipts are skipped. No bulk force escalation. |
+| `X` | Preview and stop workspace sessions: owned, split-containment, and current v2 incomplete-policy receipts use exact-target + non-force systemd stop; unmanaged targets use mpx-native kill; legacy v1, stale, pending, and ambiguous receipts are skipped. External scopes are never signalled, and no bulk force escalation occurs. |
 | `Ctrl+R` | Refresh live-session counts |
 | `?` | Help overlay |
 | `q` / `Esc` | Exit `pa` |
@@ -108,7 +108,7 @@ mouse poorly, so don't rely on it there).
 | `k` / `↑` / `Alt+K` | Previous session |
 | `g` / `Home` | First session |
 | `G` / `End` | Last session |
-| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, supervision-first start an eligible idle UUID-backed row (Claude kind: `3G` / `5G` / `512MiB` / `800%` / `1200`), directly relaunch any safely reconciled idle stale row through the existing exact signal-free coordinator, or ordinarily create a no-ID/invalid/unsupported idle row |
+| `Enter` / `l` / `→` | Attach a live/owned exact target, attach a legacy-v1 or split target without granting resource control, require supervision with the complete `3G` / `5G` / `512MiB` / `800%` / `1200` baseline when starting an eligible idle UUID-backed row, directly relaunch any safely reconciled idle stale row through the existing exact signal-free coordinator, or ordinarily create a no-ID/invalid/unsupported idle row |
 | `Ctrl+D` / `Ctrl+U` | Half-page down / up |
 | `PgDn` / `PgUp` | 10-row jumps |
 | `a` | Add a new session (2-stage name → command modal) |
@@ -116,7 +116,7 @@ mouse poorly, so don't rely on it there).
 | `d` | Delete session from workspace TOML (with confirm) |
 | `S` | Advanced/custom supervision. Edit the same recommended limits, confirm-add a UUID to a legacy row, customize a stale replacement, or confirm a terminate-then-fresh-relaunch flow for a live shared row. Existing process trees are never migrated or claimed; `S` never silently falls back ordinary. |
 | `r` | Refresh resources for the selected owned workload |
-| `x` | Owned row: confirm graceful + non-force stop. Stale row: confirm receipt-only cleanup after proving the exact unit and target are absent (no signal is sent). Unmanaged row: confirm mpx-native kill. |
+| `x` | Owned row: confirm graceful + non-force stop. Split row: confirm exact-target/non-force service stop without signalling external scopes. Current v2 incomplete-policy row: allow the same non-force stop while metrics/force-kill stay unavailable. Stale row: confirm receipt-only cleanup after proving the exact unit and target are absent (no signal is sent). Unmanaged row: confirm mpx-native kill. |
 | `X` | Separately confirm whole-cgroup SIGKILL for an owned-and-verified workload |
 | `z` | Toggle expand-on-select (see below) |
 | `m` | Switch workspace multiplexer (tmux ↔ zellij) |
@@ -130,8 +130,10 @@ A receipt-backed row is non-attachable until exact reconciliation finishes. A v2
 owned row requires exact unit/InvocationID/cgroup/target plus workload
 PID/start-time/nonce proof and bounded descendant containment. A live v1 row becomes
 `legacy/restart`, attaches only to its exact target, and exposes no resource stop or
-force-kill. A `split` row can also attach to its exact target but withholds
-whole-workload metrics and control. `ambiguous` rows expose no action; a pending-launch journal blocks another supervised creation until its evidence is reconciled.
+force-kill. A current v2 incomplete-policy row uses the same label but permits
+exact-target/non-force stop while withholding metrics and force-kill. A `split` row
+can attach and use that same confirmed stop path, but withholds whole-workload
+metrics and force-kill; external scopes are never signalled and may remain. `ambiguous` rows expose no action; a pending-launch journal blocks another supervised creation until its evidence is reconciled.
 Optional launch/creator boot UUIDs are non-authoritative provenance: malformed,
 missing, or unreadable values do not invalidate otherwise complete receipt state or
 gate stale-row Enter.
@@ -149,8 +151,10 @@ Pending, ambiguous, worker-error, and unreconciled evidence blocks Enter; split
 containment attaches only to its exact private target. Prior nonempty limits are
 reused; an empty prior policy resolves from the declared session kind. `S` exposes
 those values for editing. `x` means confirmed cleanup-only on a stale row, confirmed
-graceful/non-force stop on an owned row, and confirmed multiplexer-native kill on an
-unmanaged live row; `X` remains separately confirmed force-kill. If a real ordinary
+graceful/non-force stop on an owned row, confirmed exact-target/non-force stop on a
+split or current v2 incomplete-policy row, and confirmed multiplexer-native kill on
+an unmanaged live row; `X` remains separately confirmed force-kill only for complete
+owned containment. If a real ordinary
 target is live beside the stale receipt, Enter attaches it normally instead of
 cleaning, stopping, or claiming it. Portagenty does not launch stale rows at TUI
 startup and provides no bulk startup relaunch.
@@ -236,27 +240,30 @@ pa launch claude --memory-high 2G --memory-max 4G --memory-swap-max 256MiB \
 
 Resource-limit flags imply supervision. Explicit CLI supervision requires a valid
 workspace UUID and a supported Linux systemd-user/cgroup-v2 environment; it never
-falls back ordinary. Exactly `kind = "claude-code"` selects the Claude defaults and
-`claude-code.slice`; a session merely named or commanded `claude` stays generic.
-Claude fields cannot be cleared and overrides must be equal to or stricter than
+falls back ordinary. Every supervised kind resolves missing fields from the complete
 `3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, and `1200`
-tasks, with MemoryHigh not exceeding MemoryMax. Generic sessions stay in normal
-user-manager placement and retain unset fields unless flags are supplied.
+task baseline. Exactly `kind = "claude-code"` additionally selects
+`claude-code.slice`, resume behavior, and oomd metadata; a session merely named or
+commanded `claude` stays generic. Claude fields cannot be cleared and overrides must
+be equal to or stricter than the baseline, with MemoryHigh not exceeding MemoryMax.
+Generic sessions stay in normal user-manager placement with the same finite baseline.
 
 Before a Claude-kind service is created, Portagenty verifies that the externally
 provisioned aggregate slice is structurally beneath `/claude.slice/claude-code.slice`
 with finite positive memory high/max, swap max, CPU quota, and
 `ManagedOOMPreference=omit`; aggregate `TasksMax` is optional and may be infinity,
 while every Claude service still receives finite `TasksMax`. Portagenty never
-creates or modifies the slice. Only after receipt and pending-launch state are known and non-creating
-preflight proves supervision capability/runtime unavailable does routine TUI Enter
-print a loud notice and launch ordinarily. Receipt ambiguity and every failure after
-creation may have begun remain fail-closed. Pending launches block attach, ordinary
+creates or modifies the slice. Eligible UUID-backed routine TUI Enter is
+supervision-required: unavailable capability/runtime, receipt ambiguity, identity or
+target races, and every failure after creation may have begun return to the same
+actionable row without creating an ordinary target. Pending launches block attach,
 fallback, creation, stop, and kill until reconciled. A valid unequal stored/current
 boot UUID proves only that the pending creator is gone; otherwise PID/start-time
-proof remains required. `Dead` still requires the exact unit, private target, and
-marker all absent, and probe errors or partial presence stay ambiguous. Private tmux
-servers are launched without user-bus/runtime variables to
+proof remains required. Cleanup requires exact unit and private-target absence. An
+absent marker is already clean; an exact marker may be removed only after its full
+owner-runtime identity is revalidated and its recorded anchor PID/start time is
+proven dead. Probe errors, live anchors, mismatches, and partial presence stay
+ambiguous. Private tmux servers are launched without user-bus/runtime variables to
 prevent sibling tmux scopes, while the pane receives the exact restored user bus.
 
 `S` edits all five limits or resolves cleared fields from the declared kind, can
@@ -289,8 +296,8 @@ pa resources kill claude --force
 |---|---|
 | `capabilities` | Reports backend, available metrics/actions, all five resource-limit kinds, and degraded or unsupported reasons. |
 | `status [session]` | Shows pending (active, dead-cleanable, or ambiguous), `owned`, `legacy-restart-required`, `split-containment`, `ambiguous-binding`, or `stale-binding` plus exact evidence, applied limits, and available/unavailable metrics. With no session, reports all declared sessions. |
-| `cleanup <session>` | Signal-free cleanup only. Removes a pending journal when its creator is proven gone and its exact unit, private target, and marker are all absent, or removes a receipt after exact unit and target absence is revalidated. Exact runtime/path/nonce shape is checked first; an absent `portagenty` directory, `workloads` directory, or marker succeeds without creating directories, while existing components retain owner/mode/type/content checks. Refuses partial, live, or probe-error evidence. |
-| `stop <session>` | For owned-and-verified v2 containment only: revalidates ownership, requests graceful shutdown of the exact private multiplexer target, then performs a non-force systemd stop if needed. Never silently escalates to SIGKILL. |
+| `cleanup <session>` | Signal-free cleanup only. Removes a pending journal when its creator, exact unit, and private target are proven gone and its marker is either absent or exactly validated with a dead recorded anchor; removes a receipt after exact unit and target absence is revalidated. Exact runtime/path/nonce shape is checked first; absent runtime components succeed without being recreated, while existing components retain owner/mode/type/protocol/nonce/PID/start-time checks. Refuses partial, live, mismatched, or probe-error evidence. |
+| `stop <session>` | Revalidates a current v2 receipt, requests graceful shutdown of the exact private multiplexer target, then performs a non-force systemd stop if needed. Also accepts split and incomplete-policy v2 rows; split external scopes are not signalled and may remain. Legacy v1 stays attach-only. Never silently escalates to SIGKILL. |
 | `kill <session> --force` | For owned-and-verified v2 containment only: separately explicit whole-cgroup SIGKILL after immediate ownership revalidation. Refuses without `--force`. |
 
 Metrics include CPU totals/rate, cgroup-charged memory current/peak/events, swap

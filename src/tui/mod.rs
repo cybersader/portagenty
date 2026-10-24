@@ -440,8 +440,7 @@ fn run_session_tui(
             print_launch_banner(mpx_kind, &session.name);
             let session_name = session.name.clone();
             classify_launch_result(
-                mux.create_and_attach(&session, &mpx_name, mode)
-                    .map(|completion| completion.map(|_| ())),
+                create_ordinary_session(mux.as_ref(), &workspace_name, &session, &mpx_name, mode),
                 workspace_for_resume.clone(),
                 declared_selection(&workspace_for_resume, &session_name),
                 workspace_name,
@@ -457,40 +456,12 @@ fn run_session_tui(
             print_launch_banner(mpx_kind, &session.name);
             let session_name = session.name.clone();
             let result = match intent {
-                SupervisionIntent::RoutineEnter => {
-                    match crate::cli::launch_supervised_routine_resolved(
-                        session.clone(),
-                        workspace_for_supervision,
-                        mode,
-                        limits.clone(),
-                    ) {
-                        #[cfg(target_os = "linux")]
-                        Ok(crate::cli::RoutineSupervisedLaunch::ClientReturned(completion)) => {
-                            Ok(completion)
-                        }
-                        Ok(crate::cli::RoutineSupervisedLaunch::FallbackSafe(reason)) => {
-                            print_supervision_fallback_notice(
-                                &workspace_name,
-                                &session_name,
-                                &limits,
-                                &reason,
-                            );
-                            if let Some(path) = &workspace_file {
-                                let _ = crate::state::record_launch(path, &session.name);
-                            }
-                            let mpx_name =
-                                crate::mux::workspace_session_name(&workspace_name, &session.name);
-                            mux.create_and_attach(&session, &mpx_name, mode)
-                                .map(|completion| completion.map(|_| ()))
-                                .map_err(|ordinary_error| {
-                                    anyhow::anyhow!(
-                                        "supervision preflight was unavailable ({reason:#}); ordinary fallback also failed: {ordinary_error:#}"
-                                    )
-                                })
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
+                SupervisionIntent::RoutineEnter => crate::cli::launch_supervised_routine_resolved(
+                    session.clone(),
+                    workspace_for_supervision,
+                    mode,
+                    limits.clone(),
+                ),
                 SupervisionIntent::ExplicitCustom => crate::cli::launch_supervised_resolved(
                     session,
                     workspace_for_supervision,
@@ -586,50 +557,16 @@ fn run_session_tui(
     })
 }
 
-fn supervision_fallback_notice(
+fn create_ordinary_session(
+    mux: &dyn crate::mux::Multiplexer,
     workspace_name: &str,
-    session_name: &str,
-    limits: &crate::supervision::ResourceLimits,
-    reason: &anyhow::Error,
-) -> String {
-    let memory = limits
-        .memory_high_bytes
-        .map(|bytes| format!("{:.0} GiB", bytes as f64 / 1024_f64.powi(3)))
-        .unwrap_or_else(|| "unset".into());
-    let memory_max = limits
-        .memory_max_bytes
-        .map(|bytes| format!("{:.0} GiB", bytes as f64 / 1024_f64.powi(3)))
-        .unwrap_or_else(|| "unset".into());
-    let swap_max = limits
-        .memory_swap_max_bytes
-        .map(|bytes| format!("{:.0} MiB", bytes as f64 / 1024_f64.powi(2)))
-        .unwrap_or_else(|| "unset".into());
-    let cpu = limits
-        .cpu_quota_percent
-        .map(|value| format!("{value}%"))
-        .unwrap_or_else(|| "unset".into());
-    let tasks = limits
-        .tasks_max
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unset".into());
-    format!(
-        "  pa: RESOURCE SUPERVISION UNAVAILABLE\n      launching {:?} ordinarily without cgroup resource limits\n      omitted limits: MemoryHigh {memory} · MemoryMax {memory_max} · SwapMax {swap_max} · CPU {cpu} · TasksMax {tasks}\n      reason: {reason:#}",
-        format!("{workspace_name} / {session_name}")
-    )
-}
-
-fn print_supervision_fallback_notice(
-    workspace_name: &str,
-    session_name: &str,
-    limits: &crate::supervision::ResourceLimits,
-    reason: &anyhow::Error,
-) {
-    eprintln!();
-    eprintln!(
-        "{}",
-        supervision_fallback_notice(workspace_name, session_name, limits, reason)
-    );
-    eprintln!();
+    session: &crate::domain::Session,
+    mpx_name: &str,
+    mode: crate::mux::AttachMode,
+) -> Result<ClientCompletion<()>> {
+    let prepared = crate::launch::prepare_session(workspace_name, session);
+    mux.create_and_attach(&prepared, mpx_name, mode)
+        .map(|completion| completion.map(|_| ()))
 }
 
 fn finalize_launch(
@@ -720,6 +657,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ordinary_tui_launch_prepares_labels_preserves_custom_names_and_cleans_environment() {
+        for (command, payload) in [
+            (
+                "claude --continue",
+                "'claude --name portagenty-session-labels --continue'",
+            ),
+            ("claude --name=chosen", "'claude --name=chosen'"),
+            ("claude -n chosen", "'claude -n chosen'"),
+            ("cc --continue", "'cc --continue'"),
+        ] {
+            let session = crate::domain::Session {
+                name: "session-labels".into(),
+                cwd: std::env::temp_dir(),
+                command: command.into(),
+                kind: Some(crate::domain::SessionKind::ClaudeCode),
+                env: Default::default(),
+                description: None,
+            };
+            let mut mux = crate::mux::MockMultiplexer::new();
+            mux.expect_create_and_attach()
+                .withf(move |prepared, target, mode| {
+                    prepared.command.ends_with(payload)
+                        && prepared.command.contains("-u CLAUDE_CODE_CHILD_SESSION")
+                        && prepared
+                            .command
+                            .contains("-u AGENT_GUARD_INHERITED_SUBAGENT_MODEL")
+                        && prepared.name == "session-labels"
+                        && target == "unchanged-mux-target"
+                        && *mode == crate::mux::AttachMode::Takeover
+                })
+                .times(1)
+                .returning(|_, _, _| {
+                    Ok(ClientCompletion::Returned(
+                        crate::mux::CreationDisposition::Created,
+                    ))
+                });
+            assert_eq!(
+                create_ordinary_session(
+                    &mux,
+                    "Portagenty",
+                    &session,
+                    "unchanged-mux-target",
+                    crate::mux::AttachMode::Takeover
+                )
+                .unwrap(),
+                ClientCompletion::Returned(())
+            );
+            assert_eq!(session.command, command);
+        }
+    }
+
+    #[test]
     fn bare_pa_starts_at_global_picker() {
         assert_eq!(initial_screen(false), InitialScreen::Picker);
     }
@@ -751,25 +740,6 @@ mod tests {
             workload_anchor: None,
             launch_boot_id: None,
         }
-    }
-
-    #[test]
-    fn loud_fallback_notice_names_identity_and_omitted_limits() {
-        let notice = supervision_fallback_notice(
-            "workspace",
-            "shell",
-            &crate::supervision::ResourceLimits::claude_defaults(),
-            &anyhow::anyhow!("systemd unavailable"),
-        );
-        assert!(notice.contains("RESOURCE SUPERVISION UNAVAILABLE"));
-        assert!(notice.contains("workspace / shell"));
-        assert!(notice.contains("ordinarily without cgroup resource limits"));
-        assert!(notice.contains("MemoryHigh 3 GiB"));
-        assert!(notice.contains("MemoryMax 5 GiB"));
-        assert!(notice.contains("SwapMax 512 MiB"));
-        assert!(notice.contains("CPU 800%"));
-        assert!(notice.contains("TasksMax 1200"));
-        assert!(notice.contains("systemd unavailable"));
     }
 
     #[test]

@@ -191,7 +191,7 @@ impl ResourceLimits {
     pub const GIB: u64 = 1024 * 1024 * 1024;
     pub const MIB: u64 = 1024 * 1024;
 
-    pub fn claude_defaults() -> Self {
+    pub fn standard_defaults() -> Self {
         Self {
             memory_high_bytes: Some(3 * Self::GIB),
             memory_max_bytes: Some(5 * Self::GIB),
@@ -201,28 +201,24 @@ impl ResourceLimits {
         }
     }
 
-    pub fn defaults_for_kind(kind: Option<SessionKind>) -> Self {
-        if kind == Some(SessionKind::ClaudeCode) {
-            Self::claude_defaults()
-        } else {
-            Self::default()
-        }
+    pub fn claude_defaults() -> Self {
+        Self::standard_defaults()
+    }
+
+    pub fn defaults_for_kind(_kind: Option<SessionKind>) -> Self {
+        Self::standard_defaults()
     }
 
     pub fn resolve_for_kind(&self, kind: Option<SessionKind>) -> Result<Self> {
-        let resolved = if kind == Some(SessionKind::ClaudeCode) {
-            let defaults = Self::claude_defaults();
-            Self {
-                memory_high_bytes: self.memory_high_bytes.or(defaults.memory_high_bytes),
-                memory_max_bytes: self.memory_max_bytes.or(defaults.memory_max_bytes),
-                memory_swap_max_bytes: self
-                    .memory_swap_max_bytes
-                    .or(defaults.memory_swap_max_bytes),
-                cpu_quota_percent: self.cpu_quota_percent.or(defaults.cpu_quota_percent),
-                tasks_max: self.tasks_max.or(defaults.tasks_max),
-            }
-        } else {
-            self.clone()
+        let defaults = Self::defaults_for_kind(kind);
+        let resolved = Self {
+            memory_high_bytes: self.memory_high_bytes.or(defaults.memory_high_bytes),
+            memory_max_bytes: self.memory_max_bytes.or(defaults.memory_max_bytes),
+            memory_swap_max_bytes: self
+                .memory_swap_max_bytes
+                .or(defaults.memory_swap_max_bytes),
+            cpu_quota_percent: self.cpu_quota_percent.or(defaults.cpu_quota_percent),
+            tasks_max: self.tasks_max.or(defaults.tasks_max),
         };
         resolved.validate_consistency()?;
         if kind == Some(SessionKind::ClaudeCode) {
@@ -304,6 +300,14 @@ impl ResourceLimits {
             && self.memory_swap_max_bytes.is_none()
             && self.cpu_quota_percent.is_none()
             && self.tasks_max.is_none()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.memory_high_bytes.is_some()
+            && self.memory_max_bytes.is_some()
+            && self.memory_swap_max_bytes.is_some()
+            && self.cpu_quota_percent.is_some()
+            && self.tasks_max.is_some()
     }
 }
 
@@ -732,20 +736,44 @@ mod tests {
     }
 
     #[test]
-    fn claude_defaults_are_selected_only_by_explicit_kind() {
+    fn supervised_defaults_are_complete_for_every_session_kind() {
+        let expected = ResourceLimits {
+            memory_high_bytes: Some(3 * 1024_u64.pow(3)),
+            memory_max_bytes: Some(5 * 1024_u64.pow(3)),
+            memory_swap_max_bytes: Some(512 * 1024_u64.pow(2)),
+            cpu_quota_percent: Some(800.0),
+            tasks_max: Some(1200),
+        };
         assert!(ResourceLimits::default().is_empty());
-        assert!(ResourceLimits::defaults_for_kind(None).is_empty());
-        assert!(ResourceLimits::defaults_for_kind(Some(SessionKind::Shell)).is_empty());
+        assert_eq!(ResourceLimits::defaults_for_kind(None), expected);
+        assert_eq!(
+            ResourceLimits::defaults_for_kind(Some(SessionKind::Shell)),
+            expected
+        );
         assert_eq!(
             ResourceLimits::defaults_for_kind(Some(SessionKind::ClaudeCode)),
-            ResourceLimits {
-                memory_high_bytes: Some(3 * 1024_u64.pow(3)),
-                memory_max_bytes: Some(5 * 1024_u64.pow(3)),
-                memory_swap_max_bytes: Some(512 * 1024_u64.pow(2)),
-                cpu_quota_percent: Some(800.0),
-                tasks_max: Some(1200),
-            }
+            expected
         );
+        assert!(expected.is_complete());
+    }
+
+    #[test]
+    fn generic_partial_overrides_resolve_against_standard_defaults() {
+        let resolved = ResourceLimits {
+            memory_high_bytes: Some(2 * ResourceLimits::GIB),
+            ..ResourceLimits::default()
+        }
+        .resolve_for_kind(Some(SessionKind::Shell))
+        .unwrap();
+        assert_eq!(resolved.memory_high_bytes, Some(2 * ResourceLimits::GIB));
+        assert_eq!(resolved.memory_max_bytes, Some(5 * ResourceLimits::GIB));
+        assert_eq!(
+            resolved.memory_swap_max_bytes,
+            Some(512 * ResourceLimits::MIB)
+        );
+        assert_eq!(resolved.cpu_quota_percent, Some(800.0));
+        assert_eq!(resolved.tasks_max, Some(1200));
+        assert!(resolved.is_complete());
     }
 
     #[test]

@@ -23,9 +23,13 @@ use crate::supervision::{BindingReceipt, LogicalSessionId, ResourceLimits};
 use crate::supervision::{MetricValue, ResourceSnapshot, SupervisionBackend};
 use crate::tui::view::{build_rows, RowOwnership, SessionRow, SessionState};
 
-/// Why the user requested a supervised launch. Only the routine Enter path is
-/// eligible for an automatic ordinary fallback when non-creating preflight
-/// proves supervision itself is unavailable.
+#[cfg(target_os = "linux")]
+type SupervisionEvidence = (Vec<BindingReceipt>, Vec<crate::supervision::PendingLaunch>);
+#[cfg(target_os = "linux")]
+type SupervisionEvidenceLoader = fn(Option<&str>) -> Result<SupervisionEvidence>;
+
+/// Why the user requested a supervised launch. Routine Enter is supervision-required
+/// for eligible UUID-backed rows; the other variants preserve their explicit intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisionIntent {
     RoutineEnter,
@@ -187,11 +191,15 @@ pub struct App {
     #[cfg(target_os = "linux")]
     resource_snapshots: BTreeMap<LogicalSessionId, ResourceSnapshot>,
     #[cfg(target_os = "linux")]
-    resource_refresh_pending: HashSet<LogicalSessionId>,
+    resource_refresh_pending: BTreeMap<LogicalSessionId, crate::tui::resources::SampleCancellation>,
+    #[cfg(target_os = "linux")]
+    resource_auto_refresh_blocked: HashSet<LogicalSessionId>,
     #[cfg(target_os = "linux")]
     last_resource_sample: std::time::Instant,
     #[cfg(target_os = "linux")]
     resource_worker: Option<crate::tui::resources::ResourceWorker>,
+    #[cfg(target_os = "linux")]
+    supervision_evidence_loader: SupervisionEvidenceLoader,
     supervising: Option<SuperviseState>,
     supervision_preflight: fn() -> Result<()>,
     supervision_evidence_available: bool,
@@ -263,6 +271,15 @@ fn supervise_limit_fields(limits: &ResourceLimits) -> (String, String, String, S
         cpu_quota,
         tasks_max,
     )
+}
+
+#[cfg(target_os = "linux")]
+fn default_supervision_evidence_loader(workspace_id: Option<&str>) -> Result<SupervisionEvidence> {
+    let file = crate::supervision::ReceiptStore::standard()?.load()?;
+    Ok((
+        super::receipts_for_workspace(workspace_id, file.bindings),
+        super::pending_for_workspace(workspace_id, file.pending_launches),
+    ))
 }
 
 #[cfg(not(test))]
@@ -339,6 +356,14 @@ enum PendingAction {
         display_name: String,
         receipt: Box<BindingReceipt>,
         force: bool,
+        /// The confirmation was opened from a split-containment row, so a
+        /// non-force stop may close only the exact private target and verified
+        /// service cgroup. External descendant scopes remain out of bounds.
+        allow_split: bool,
+        /// The confirmation was opened from a current v2 receipt that predates
+        /// the complete automatic limit policy. Metrics and force-kill remain
+        /// unavailable, but exact-target non-force stop is still safe.
+        allow_restart_required: bool,
     },
     /// Remove one exact receipt only after the backend proves both its
     /// systemd invocation and private multiplexer target are absent.
@@ -407,11 +432,15 @@ impl App {
             #[cfg(target_os = "linux")]
             resource_snapshots: BTreeMap::new(),
             #[cfg(target_os = "linux")]
-            resource_refresh_pending: HashSet::new(),
+            resource_refresh_pending: BTreeMap::new(),
+            #[cfg(target_os = "linux")]
+            resource_auto_refresh_blocked: HashSet::new(),
             #[cfg(target_os = "linux")]
             last_resource_sample: std::time::Instant::now(),
             #[cfg(target_os = "linux")]
             resource_worker: None,
+            #[cfg(target_os = "linux")]
+            supervision_evidence_loader: default_supervision_evidence_loader,
             supervising: None,
             supervision_preflight: default_supervision_preflight,
             supervision_evidence_available: true,
@@ -803,11 +832,25 @@ impl App {
                         RowOwnership::Owned
                             | RowOwnership::LegacyRestartRequired
                             | RowOwnership::SplitContainment
+                            | RowOwnership::Ambiguous
                             | RowOwnership::Stale
+                            | RowOwnership::Unsupported
                     )
                 {
                     self.set_status(
-                        "Enter: verifying the ownership receipt; wait for the row to become owned or stale",
+                        "Enter: verifying the ownership receipt; press r to cancel or refresh",
+                    );
+                    return None;
+                }
+                if ownership == RowOwnership::Ambiguous {
+                    self.set_status(
+                        "Enter: ownership is ambiguous and remains fail-closed; inspect details or press r to retry verification",
+                    );
+                    return None;
+                }
+                if ownership == RowOwnership::Unsupported && receipt_backed {
+                    self.set_status(
+                        "Enter: receipt ownership could not be verified on this backend; press r to retry",
                     );
                     return None;
                 }
@@ -832,7 +875,7 @@ impl App {
                 if ownership == RowOwnership::IdleSupported && !self.supervision_evidence_available
                 {
                     self.set_status(
-                        "Enter: supervision evidence could not be loaded, so supervised creation and ordinary fallback are blocked",
+                        "Enter: supervision evidence could not be loaded, so supervised creation is blocked without ordinary creation",
                     );
                     return None;
                 }
@@ -939,9 +982,14 @@ impl App {
     }
 
     #[cfg(target_os = "linux")]
-    fn request_resource_refresh(&mut self, logical_id: &LogicalSessionId) -> bool {
+    fn request_resource_refresh(
+        &mut self,
+        logical_id: &LogicalSessionId,
+        allow_blocked: bool,
+    ) -> bool {
         if self.pending_launches.contains_key(logical_id)
-            || self.resource_refresh_pending.contains(logical_id)
+            || self.resource_refresh_pending.contains_key(logical_id)
+            || (!allow_blocked && self.resource_auto_refresh_blocked.contains(logical_id))
         {
             return false;
         }
@@ -949,36 +997,97 @@ impl App {
             return false;
         };
         let previous = self.resource_snapshots.get(logical_id).cloned();
-        let queued = self
+        let cancellation = self
             .resource_worker
             .as_ref()
-            .is_some_and(|worker| worker.request(receipt, previous));
-        if queued {
-            self.resource_refresh_pending.insert(logical_id.clone());
+            .and_then(|worker| worker.request(receipt, previous));
+        if let Some(cancellation) = cancellation {
+            self.resource_refresh_pending
+                .insert(logical_id.clone(), cancellation);
+            true
+        } else {
+            false
         }
-        queued
     }
 
     #[cfg(target_os = "linux")]
     fn request_all_resource_refreshes(&mut self) {
         let ids: Vec<LogicalSessionId> = self.receipts.keys().cloned().collect();
         for logical_id in ids {
-            let _ = self.request_resource_refresh(&logical_id);
+            let _ = self.request_resource_refresh(&logical_id, false);
         }
     }
 
     #[cfg(target_os = "linux")]
     fn request_selected_resource_refresh(&mut self) {
         let logical_id = self.selected_row().and_then(|row| row.logical_id.clone());
-        if let Some(logical_id) = logical_id {
-            if self.request_resource_refresh(&logical_id) {
-                self.set_status("resource refresh queued");
-            } else {
-                self.set_status("r: refresh not queued (missing, busy, or already pending)");
-            }
-        } else {
+        let Some(logical_id) = logical_id else {
             self.set_status("r: selected row has no owned resource binding");
+            return;
+        };
+        if let Some(cancellation) = self.resource_refresh_pending.get(&logical_id) {
+            cancellation.cancel();
+            self.set_status("resource verification cancellation requested");
+            return;
         }
+        match self.refresh_supervision_evidence_from_store() {
+            Ok(true) if !self.receipts.contains_key(&logical_id) => {
+                self.set_status("ownership evidence changed on disk; row refreshed");
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.set_status(format!("r: ownership evidence refresh failed: {error:#}"));
+                return;
+            }
+        }
+        self.resource_auto_refresh_blocked.remove(&logical_id);
+        if self.request_resource_refresh(&logical_id, true) {
+            self.set_status("resource refresh queued");
+        } else {
+            self.set_status("r: refresh not queued (missing, busy, or already pending)");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refresh_supervision_evidence_from_store(&mut self) -> Result<bool> {
+        let (receipts, pending_launches) = (self.supervision_evidence_loader)(self.workspace_id())?;
+        let receipts: BTreeMap<_, _> = receipts
+            .into_iter()
+            .map(|receipt| (receipt.logical_id.clone(), receipt))
+            .collect();
+        let pending_launches: BTreeMap<_, _> = pending_launches
+            .into_iter()
+            .map(|pending| (pending.logical_id.clone(), pending))
+            .collect();
+        if receipts == self.receipts && pending_launches == self.pending_launches {
+            return Ok(false);
+        }
+
+        let live = self.mux.list_sessions()?;
+        let selection = self.selection_identity();
+        for cancellation in self.resource_refresh_pending.values() {
+            cancellation.cancel();
+        }
+        self.resource_refresh_pending.clear();
+        self.resource_auto_refresh_blocked.clear();
+        self.resource_snapshots
+            .retain(|logical_id, _| receipts.contains_key(logical_id));
+        self.receipts = receipts;
+        self.pending_launches = pending_launches;
+
+        self.rows = build_rows(&self.workspace, &live, self.untracked_scope);
+        self.apply_receipt_annotations(&BTreeMap::new());
+        self.apply_pending_annotations();
+        if let Some(selection) = selection {
+            self.restore_selection(&selection);
+        } else if self.rows.is_empty() {
+            self.list_state.select(None);
+        } else {
+            self.list_state.select(Some(0));
+        }
+        self.request_all_resource_refreshes();
+        Ok(true)
     }
 
     #[cfg(target_os = "linux")]
@@ -989,9 +1098,37 @@ impl App {
             .map(|worker| worker.drain().collect())
             .unwrap_or_default();
         let mut rebuild_from_mux = false;
+        let mut status_notice = None;
         for result in results {
             self.resource_refresh_pending.remove(&result.logical_id);
-            if self.pending_launches.contains_key(&result.logical_id) {
+            let interrupted = matches!(
+                result.completion,
+                crate::tui::resources::SampleCompletion::TimedOut
+                    | crate::tui::resources::SampleCompletion::Cancelled
+            );
+            if interrupted {
+                self.resource_auto_refresh_blocked
+                    .insert(result.logical_id.clone());
+                match self.refresh_supervision_evidence_from_store() {
+                    Ok(true) => {
+                        status_notice =
+                            Some("ownership evidence changed on disk; row refreshed".into());
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        status_notice = Some(format!(
+                            "ownership verification ended fail-closed; evidence refresh failed: {error:#}"
+                        ));
+                    }
+                }
+            } else {
+                self.resource_auto_refresh_blocked
+                    .remove(&result.logical_id);
+            }
+            if self.pending_launches.contains_key(&result.logical_id)
+                || !self.receipts.contains_key(&result.logical_id)
+            {
                 continue;
             }
             let ownership = match &result.ownership {
@@ -1058,18 +1195,25 @@ impl App {
                         row.mux_target = Some(receipt.mux_target.clone());
                     }
                 }
-                if let Some(error) = result.error {
+                if let Some(error) = result.error.clone() {
                     row.resource_summary = Some(format!("resource error: {error}"));
                 }
             }
-            if let Some(notice) = event_notice {
-                self.set_status(format!("resource event: {notice}"));
+            if interrupted {
+                if status_notice.is_none() {
+                    status_notice = result.error;
+                }
+            } else if let Some(notice) = event_notice {
+                status_notice = Some(format!("resource event: {notice}"));
             }
         }
         if rebuild_from_mux {
             if let Ok(live) = self.mux.list_sessions() {
                 self.rebuild_rows(&live);
             }
+        }
+        if let Some(notice) = status_notice {
+            self.set_status(notice);
         }
     }
 
@@ -1101,7 +1245,7 @@ impl App {
                     | RowOwnership::Stale
             )
         {
-            self.set_status("x: verifying the ownership receipt; wait for a final state");
+            self.set_status("x: verifying the ownership receipt; press r to cancel or refresh");
             return;
         }
         match row.ownership {
@@ -1119,6 +1263,8 @@ impl App {
                     display_name: row.display_name.clone(),
                     receipt: Box::new(receipt),
                     force: false,
+                    allow_split: false,
+                    allow_restart_required: false,
                 });
             }
             #[cfg(not(target_os = "linux"))]
@@ -1128,14 +1274,44 @@ impl App {
                 );
             }
             RowOwnership::LegacyRestartRequired => {
-                self.set_status(
-                    "x: legacy v1 service is attach-only; exit it normally to transition",
-                );
+                let Some(logical_id) = row.logical_id.clone() else {
+                    self.set_status("x: restart-required row is missing its logical identity");
+                    return;
+                };
+                let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+                    self.set_status("x: restart-required row is missing its binding receipt");
+                    return;
+                };
+                if receipt.is_legacy() {
+                    self.set_status(
+                        "x: legacy v1 service is attach-only; exit it normally to transition",
+                    );
+                    return;
+                }
+                self.pending = Some(PendingAction::StopOwned {
+                    display_name: row.display_name.clone(),
+                    receipt: Box::new(receipt),
+                    force: false,
+                    allow_split: false,
+                    allow_restart_required: true,
+                });
             }
             RowOwnership::SplitContainment => {
-                self.set_status(
-                    "x: split containment disables whole-workload stop; external descendants remain separately bounded",
-                );
+                let Some(logical_id) = row.logical_id.clone() else {
+                    self.set_status("x: split row is missing its logical identity");
+                    return;
+                };
+                let Some(receipt) = self.receipts.get(&logical_id).cloned() else {
+                    self.set_status("x: split row is missing its binding receipt");
+                    return;
+                };
+                self.pending = Some(PendingAction::StopOwned {
+                    display_name: row.display_name.clone(),
+                    receipt: Box::new(receipt),
+                    force: false,
+                    allow_split: true,
+                    allow_restart_required: false,
+                });
             }
             RowOwnership::Pending => {
                 self.set_status(
@@ -1198,6 +1374,8 @@ impl App {
             display_name: row.display_name.clone(),
             receipt: Box::new(receipt),
             force: true,
+            allow_split: false,
+            allow_restart_required: false,
         });
     }
 
@@ -1237,7 +1415,7 @@ impl App {
                     | RowOwnership::Stale
             )
         {
-            self.set_status("S: verifying the ownership receipt; wait for a final state");
+            self.set_status("S: verifying the ownership receipt; press r to cancel or refresh");
             return;
         }
 
@@ -1250,13 +1428,13 @@ impl App {
             }
             RowOwnership::LegacyRestartRequired => {
                 self.set_status(
-                    "S: legacy v1 service is attach-only; exit it normally, then relaunch for v2 ownership",
+                    "S: limits cannot change live; current v2 receipts may use x for non-force stop, while v1 must exit normally",
                 );
                 return;
             }
             RowOwnership::SplitContainment => {
                 self.set_status(
-                    "S: containment is split by external descendants; whole-workload ownership is disabled",
+                    "S: containment is split; use x for exact-target/non-force stop without signalling external scopes",
                 );
                 return;
             }
@@ -1952,11 +2130,17 @@ impl App {
                 display_name,
                 receipt,
                 force,
+                allow_split,
+                allow_restart_required,
             } => {
                 let outcome = (|| -> Result<crate::supervision::ActionResult> {
                     let backend = crate::supervision::LinuxSystemdBackend::connect()?;
                     match backend.reconcile(&receipt)? {
                         crate::supervision::OwnershipState::OwnedVerified(_) => {}
+                        crate::supervision::OwnershipState::SplitContainment(_)
+                            if allow_split && !force => {}
+                        crate::supervision::OwnershipState::LegacyRestartRequired(_)
+                            if allow_restart_required && !receipt.is_legacy() && !force => {}
                         state => {
                             anyhow::bail!("ownership changed before control action: {state:?}")
                         }
@@ -1984,7 +2168,15 @@ impl App {
                             self.resource_snapshots.remove(&receipt.logical_id);
                             self.reload_workspace();
                         }
-                        self.set_status(format!("{display_name:?}: {}", result.final_state));
+                        let scope_note = if allow_split {
+                            "; external descendant scopes were not signalled"
+                        } else {
+                            ""
+                        };
+                        self.set_status(format!(
+                            "{display_name:?}: {}{scope_note}",
+                            result.final_state
+                        ));
                     }
                     Err(error) => {
                         self.set_status(format!("resource control failed: {error:#}"));
@@ -3422,6 +3614,8 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
         PendingAction::StopOwned {
             display_name,
             force,
+            allow_split,
+            allow_restart_required,
             ..
         } => {
             if *force {
@@ -3430,6 +3624,24 @@ fn confirm_copy(pending: &PendingAction, workspace_name: &str) -> (String, Strin
                     format!(
                         "Send SIGKILL to every process in the verified control group for {display_name:?}? \
                          This is a separate irreversible escalation and can lose unsaved work."
+                    ),
+                )
+            } else if *allow_split {
+                (
+                    "Stop split session target".into(),
+                    format!(
+                        "Gracefully close the exact private multiplexer target for {display_name:?}, then \
+                         request a non-force stop of its verified Portagenty service? External descendant \
+                         scopes are not signalled and may remain; force-kill stays unavailable."
+                    ),
+                )
+            } else if *allow_restart_required {
+                (
+                    "Stop restart-required session".into(),
+                    format!(
+                        "Gracefully close the exact private multiplexer target for {display_name:?}, then \
+                         request a non-force stop of its verified Portagenty service? Metrics and force-kill \
+                         remain unavailable until the session is relaunched with the complete policy."
                     ),
                 )
             } else {
@@ -4975,6 +5187,202 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn resource_test_app() -> App {
+        let mut mock = MockMultiplexer::new();
+        mock.expect_list_sessions().returning(|| Ok(Vec::new()));
+        App::new(supervised_workspace(), Box::new(mock), vec![])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn one_test_receipt(
+        _workspace_id: Option<&str>,
+    ) -> Result<(Vec<BindingReceipt>, Vec<crate::supervision::PendingLaunch>)> {
+        Ok((vec![current_test_receipt(None)], Vec::new()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn no_test_receipts(
+        _workspace_id: Option<&str>,
+    ) -> Result<(Vec<BindingReceipt>, Vec<crate::supervision::PendingLaunch>)> {
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_resource_test_until_done(app: &mut App, logical_id: &LogicalSessionId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while app.resource_refresh_pending.contains_key(logical_id) {
+            app.poll_resource_results();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resource refresh did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.poll_resource_results();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resource_verification_completion_reconciles_row() {
+        let receipt = current_test_receipt(None);
+        let logical_id = receipt.logical_id.clone();
+        let mut app = resource_test_app();
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.apply_receipt_annotations(&BTreeMap::new());
+        app.resource_worker = Some(crate::tui::resources::ResourceWorker::start_with_sampler(
+            std::time::Duration::from_secs(1),
+            |receipt, _| crate::tui::resources::SampleResult {
+                logical_id: receipt.logical_id,
+                ownership: crate::supervision::OwnershipState::StaleBinding(
+                    "service and private multiplexer target are both absent".into(),
+                ),
+                snapshot: None,
+                error: None,
+                completion: crate::tui::resources::SampleCompletion::Completed,
+            },
+        ));
+
+        assert!(app.request_resource_refresh(&logical_id, false));
+        poll_resource_test_until_done(&mut app, &logical_id);
+
+        assert_eq!(app.rows[0].ownership, RowOwnership::Stale);
+        assert!(!app.resource_auto_refresh_blocked.contains(&logical_id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resource_verification_timeout_returns_fail_closed_actionable_row() {
+        let receipt = current_test_receipt(None);
+        let logical_id = receipt.logical_id.clone();
+        let mut app = resource_test_app();
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.apply_receipt_annotations(&BTreeMap::new());
+        app.supervision_evidence_loader = one_test_receipt;
+        app.resource_worker = Some(crate::tui::resources::ResourceWorker::start_with_sampler(
+            std::time::Duration::from_millis(20),
+            |receipt, _| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                crate::tui::resources::SampleResult {
+                    logical_id: receipt.logical_id,
+                    ownership: crate::supervision::OwnershipState::IdleSupported,
+                    snapshot: None,
+                    error: None,
+                    completion: crate::tui::resources::SampleCompletion::Completed,
+                }
+            },
+        ));
+
+        assert!(app.request_resource_refresh(&logical_id, false));
+        poll_resource_test_until_done(&mut app, &logical_id);
+
+        assert_eq!(app.rows[0].ownership, RowOwnership::Ambiguous);
+        assert!(app.resource_auto_refresh_blocked.contains(&logical_id));
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("timed out") && status.contains("press r")));
+        assert!(app.reduce_action(Action::LaunchSelected).is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("ambiguous")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resource_verification_can_be_cancelled_and_retried() {
+        let receipt = current_test_receipt(None);
+        let logical_id = receipt.logical_id.clone();
+        let mut app = resource_test_app();
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.apply_receipt_annotations(&BTreeMap::new());
+        app.supervision_evidence_loader = one_test_receipt;
+        app.resource_worker = Some(crate::tui::resources::ResourceWorker::start_with_sampler(
+            std::time::Duration::from_secs(1),
+            |receipt, _| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                crate::tui::resources::SampleResult {
+                    logical_id: receipt.logical_id,
+                    ownership: crate::supervision::OwnershipState::IdleSupported,
+                    snapshot: None,
+                    error: None,
+                    completion: crate::tui::resources::SampleCompletion::Completed,
+                }
+            },
+        ));
+
+        assert!(app.request_resource_refresh(&logical_id, false));
+        app.request_selected_resource_refresh();
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("cancellation requested")));
+        poll_resource_test_until_done(&mut app, &logical_id);
+
+        assert_eq!(app.rows[0].ownership, RowOwnership::Ambiguous);
+        assert!(app.resource_auto_refresh_blocked.contains(&logical_id));
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("cancelled")));
+
+        app.resource_worker = Some(crate::tui::resources::ResourceWorker::start_with_sampler(
+            std::time::Duration::from_secs(1),
+            |receipt, _| crate::tui::resources::SampleResult {
+                logical_id: receipt.logical_id,
+                ownership: crate::supervision::OwnershipState::StaleBinding(
+                    "service and private multiplexer target are both absent".into(),
+                ),
+                snapshot: None,
+                error: None,
+                completion: crate::tui::resources::SampleCompletion::Completed,
+            },
+        ));
+        app.request_selected_resource_refresh();
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("refresh queued")));
+        poll_resource_test_until_done(&mut app, &logical_id);
+        assert_eq!(app.rows[0].ownership, RowOwnership::Stale);
+        assert!(!app.resource_auto_refresh_blocked.contains(&logical_id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_refreshes_receipt_removed_by_external_cleanup() {
+        let receipt = current_test_receipt(None);
+        let logical_id = receipt.logical_id.clone();
+        let mut app = resource_test_app();
+        app.receipts.insert(logical_id.clone(), receipt);
+        app.apply_receipt_annotations(&BTreeMap::new());
+        app.supervision_evidence_loader = no_test_receipts;
+        app.resource_worker = Some(crate::tui::resources::ResourceWorker::start_with_sampler(
+            std::time::Duration::from_millis(20),
+            |receipt, _| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                crate::tui::resources::SampleResult {
+                    logical_id: receipt.logical_id,
+                    ownership: crate::supervision::OwnershipState::IdleSupported,
+                    snapshot: None,
+                    error: None,
+                    completion: crate::tui::resources::SampleCompletion::Completed,
+                }
+            },
+        ));
+
+        assert!(app.request_resource_refresh(&logical_id, false));
+        poll_resource_test_until_done(&mut app, &logical_id);
+
+        assert!(!app.receipts.contains_key(&logical_id));
+        assert_eq!(app.rows[0].ownership, RowOwnership::IdleSupported);
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("changed on disk")));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn unreadable_supervision_evidence_blocks_idle_enter() {
         let mut app = supervised_app();
@@ -5246,6 +5654,82 @@ mod tests {
             Some(AppOutcome::Launch(LaunchKind::AttachOwned { target, .. }))
                 if target == receipt.mux_target
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_row_offers_exact_target_stop_but_refuses_force_kill() {
+        let receipt = current_test_receipt(None);
+        let mut app = supervised_app();
+        app.receipts
+            .insert(receipt.logical_id.clone(), receipt.clone());
+        app.rows[0].ownership = RowOwnership::SplitContainment;
+        app.rows[0].state = SessionState::Live;
+        app.rows[0].mux_target = Some(receipt.mux_target);
+
+        app.open_kill_prompt();
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::StopOwned {
+                force: false,
+                allow_split: true,
+                allow_restart_required: false,
+                ..
+            })
+        ));
+        let (title, copy) = confirm_copy(app.pending.as_ref().unwrap(), "x");
+        assert!(title.contains("split session target"), "title: {title}");
+        assert!(
+            copy.contains("External descendant scopes are not signalled"),
+            "copy: {copy}"
+        );
+        assert!(copy.contains("may remain"), "copy: {copy}");
+
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        app.open_force_kill_prompt();
+        assert!(app.pending.is_none());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("owned-and-verified")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_v2_row_offers_non_force_stop_while_v1_stays_attach_only() {
+        let current = current_test_receipt(None);
+        let mut app = supervised_app();
+        app.receipts
+            .insert(current.logical_id.clone(), current.clone());
+        app.rows[0].ownership = RowOwnership::LegacyRestartRequired;
+
+        app.open_kill_prompt();
+        assert!(matches!(
+            app.pending,
+            Some(PendingAction::StopOwned {
+                force: false,
+                allow_split: false,
+                allow_restart_required: true,
+                ..
+            })
+        ));
+        let (title, copy) = confirm_copy(app.pending.as_ref().unwrap(), "x");
+        assert!(title.contains("restart-required"), "title: {title}");
+        assert!(
+            copy.contains("Metrics and force-kill remain unavailable"),
+            "copy: {copy}"
+        );
+
+        let mut legacy = supervised_app();
+        let v1 = test_receipt();
+        legacy.receipts.insert(v1.logical_id.clone(), v1);
+        legacy.rows[0].ownership = RowOwnership::LegacyRestartRequired;
+        legacy.open_kill_prompt();
+        assert!(legacy.pending.is_none());
+        assert!(legacy
+            .status
+            .as_deref()
+            .is_some_and(|text| text.contains("legacy v1") && text.contains("attach-only")));
     }
 
     #[cfg(target_os = "linux")]

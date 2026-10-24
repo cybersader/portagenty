@@ -38,6 +38,8 @@ Explicitly **not** in v1:
 
 ### Shipped
 
+- **Readable Claude peer-session labels.** New explicitly `claude-code` CLI/TUI launches (including supervised creation) add a sanitized `<workspace>-<session>` name to direct `claude` commands unless a name is already supplied. Custom wrappers/compound commands keep their arguments. Workload-local `env -u` removes inherited parent-session/IPC and worker-scope markers while retaining provider/model/proxy routing and model locks. Multiplexer IDs and ownership proof stay unchanged. Cross-workspace running-peer lookup is deferred.
+
 1. **zellij adapter.** List/has/kill via imperative CLI; create +
    attach via generated KDL layout files. Inside-zellij detection
    returns a clear "detach first" error instead of the opaque
@@ -49,7 +51,7 @@ Explicitly **not** in v1:
    with workspace definitions and surfaces three row states — Live,
    NotStarted, Untracked — each with a distinct color marker.
    Enter routes to exact owned attach for verified receipts, ordinary `attach`
-   for Live/Untracked, supervision-first creation for eligible idle UUID-backed
+   for Live/Untracked, supervision-required creation for eligible idle UUID-backed
    rows, and ordinary `create_and_attach` for legacy/invalid/unsupported idle rows.
 6. **State/activity decorations.** Delivered alongside untracked
    adoption: ● (green) live, ○ (dim) idle, ? (yellow) untracked,
@@ -431,8 +433,8 @@ real projects:
 ## Experimental Linux resource supervision — Claude containment integration implemented
 
 The capability-aware supervision milestone now has an explicit kind-selected
-Claude policy. Eligible idle UUID-backed TUI rows use supervision-first Enter,
-while CLI supervision remains explicit. On supported Linux hosts, Portagenty
+Claude integration policy. Eligible idle UUID-backed TUI rows require supervision
+on Enter, while CLI supervision remains explicit. On supported Linux hosts, Portagenty
 creates fresh tmux or Zellij workloads as transient systemd **user services**
 backed by cgroup v2. Stable logical identity (`workspace UUID + declared session
 name`), opaque private targets, a pending-launch journal, versioned machine-local
@@ -442,9 +444,9 @@ The implementation includes:
 
 - `pa launch <session> --supervise`, plus typed `--memory-high`,
   `--memory-max`, `--memory-swap-max`, `--cpu-quota`, and `--tasks-max` limits;
-- explicit `kind = "claude-code"` selection of `3G` MemoryHigh, `5G` MemoryMax,
-  `512MiB` MemorySwapMax, `800%` CPU, and `1200` tasks; names and command strings
-  never select Claude policy, and overrides may only be equal or stricter;
+- complete `3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU,
+  and `1200` task defaults for every supervised kind; explicit `kind = "claude-code"`
+  alone selects Claude placement/resume/oomd integration and stricter override rules;
 - Claude service placement beneath externally provisioned `claude-code.slice`,
   aggregate-slice structural preflight, `ManagedOOMPreference=omit`, and service
   placement/limit read-back before v2 ownership persistence;
@@ -453,12 +455,14 @@ The implementation includes:
   `/proc/<pid>/task/<pid>/children` without a global process scan;
 - split-containment reporting when the root or descendants escape, including an
   explicit external-bounded-scope explanation for `build-contained` descendants
-  beneath `background.slice`; split rows may attach but receive no whole-workload
-  metrics, stop, or force-kill authority;
+  beneath `agent-work.slice`; split rows may attach and use confirmed exact-target/
+  non-force service stop, but receive no whole-workload metrics or force-kill
+  authority and never signal external scopes;
 - mixed receipt transition semantics: new launches write v2 evidence plus an
   optional canonical Linux launch-boot UUID copied from the pending journal's
   single best-effort observation; live v1 services are legacy/restart-required
-  exact-target attach-only, both unit and target absent may stale-clean, and
+  exact-target attach-only, current v2 incomplete-policy services permit only
+  exact-target/non-force stop, both unit and target absent may stale-clean, and
   partial presence remains ambiguous. Boot provenance is non-authoritative and
   does not gate stale-row Enter;
 - direct routine Enter for any idle declared stale row after an error-free exact
@@ -466,23 +470,28 @@ The implementation includes:
   the unchanged receipt, pending absence, unit, target, marker, capabilities,
   limits, and ordinary-target races before cleanup or creation and sends no signal
   to an old workload. Pending, ambiguous, errored, and unreconciled evidence blocks
-  Enter, while split containment attaches only to its exact private target;
+  Enter, while split containment attaches only to its exact private target and
+  row-scoped `x` may stop that target/service without signalling external scopes;
 - pending creator reconciliation where a valid boot mismatch proves only creator
-  absence and `Dead` still requires exact unit, private target, and marker absence;
+  absence and cleanup still requires exact unit and private-target absence;
   missing/invalid/read-failed boot evidence retains PID/start-time checks;
 - signal-free marker cleanup that validates exact runtime/path/nonce shape first,
   accepts missing Portagenty/workloads/marker components without creating them,
-  and preserves all checks for components that exist;
+  and removes an existing marker only after owner/mode/type/protocol/nonce/PID/
+  start-time revalidation proves its exact recorded anchor dead; live anchors,
+  mismatches, partial presence, and probe errors remain ambiguous;
+- workload-anchor marker publication only after the exact random nonce is already
+  observable in the anchor process's `/proc` environment;
 - `pa resources capabilities|status|stop|kill --force` and TUI ownership labels,
   editable five-field limits, bounded sampling, event warnings, and separately
   confirmed force-kill only for complete owned-and-verified v2 containment;
-- loud ordinary fallback only from proven-safe non-creating capability preflight,
-  with every ownership ambiguity and post-creation failure remaining fail-closed;
+- fail-closed routine Enter when ownership, capability, or runtime preflight cannot
+  prove a safe supervised launch, with no ordinary target created as a fallback;
 - graceful target shutdown followed by non-force systemd stop, preserving
   `OOMPolicy=continue`, `ExitType=cgroup`, `KillMode=control-group`, and
-  `SendSIGKILL=no`; picker-wide stop skips legacy, split, stale, and ambiguous
-  receipts and never bulk-force-kills, while a pending journal blocks duplicate
-  supervised creation without granting control.
+  `SendSIGKILL=no`; picker-wide stop includes owned, split, and current v2
+  incomplete-policy receipts, skips legacy v1/stale/pending/ambiguous states,
+  never signals external scopes, and never bulk-force-kills.
 
 This does **not** add a Portagenty daemon, listener, GUI, history database, log
 monitor, restart manager, unattended telemetry service, TUI-startup mutation, or
@@ -490,8 +499,9 @@ bulk startup relaunch. Portagenty observes but does not create or modify the
 aggregate Claude slice. Existing services and live ordinary multiplexer sessions
 are not stopped, migrated, upgraded, or retroactively claimed. `S` remains custom
 limit editing. `x` means confirmed signal-free cleanup-only on stale rows,
-confirmed graceful/non-force stop on owned rows, and confirmed multiplexer-native kill on
-unmanaged live rows. `X` remains separately confirmed force-kill. `MemoryHigh`
+confirmed graceful/non-force stop on owned rows, narrower exact-target/non-force
+stop on split or current v2 incomplete-policy rows, and confirmed multiplexer-native
+kill on unmanaged live rows. `X` remains separately confirmed force-kill. `MemoryHigh`
 remains a reclaim threshold; `MemoryMax` and
 `MemorySwapMax` are hard ceilings.
 

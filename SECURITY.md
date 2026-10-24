@@ -71,7 +71,9 @@ root cgroup agreement. Descendants are followed only through bounded
 Traversal and symlink escapes from `/sys/fs/cgroup` are rejected. An escaped root
 cannot become owned. Escaped descendants produce split containment, withholding
 whole-workload metrics and control; a `build-contained` descendant in
-`background.slice` is identified as an external bounded scope rather than claimed.
+`agent-work.slice` is identified as an external bounded scope rather than claimed.
+
+TUI ownership reconciliation runs off the render thread with a hard per-sample deadline and explicit cancellation. A timeout, cancellation, worker failure, or unreadable external evidence produces an actionable fail-closed row rather than authorizing stale cleanup, ordinary creation, attach fallback, or control. Automatic sampling remains blocked after a timeout until the user retries; completion and interruption reload the machine-local evidence when it changed, so external signal-free cleanup can return the row to idle without weakening partial-presence ambiguity.
 
 Existing v1 services remain legacy/restart-required exact-target attach-only until
 they exit and are launched normally under v2. Portagenty does not auto-stop,
@@ -89,17 +91,24 @@ means confirmed graceful/non-force stop, and unmanaged live means confirmed
 multiplexer-native kill. `X` remains separately confirmed force-kill. No stale
 receipt or boot hint causes startup or bulk launch.
 Pending launches record exact creator process proof and block attach, fallback,
-creation, stop, and kill. A valid unequal stored/current boot ID proves only that
+creation, stop, and kill. Eligible UUID-backed routine Enter never converts a
+supervision preflight or runtime failure into ordinary creation. A valid unequal
+stored/current boot ID proves only that
 the creator is gone; same, missing, invalid, or unreadable boot evidence retains
 the PID/start-time check. They may be signal-free cleaned only when the creator,
-exact unit, exact private target, and exact owner-runtime marker are all absent;
-artifact probe errors and partial presence remain ambiguous. Existing shared
-tmux/Zellij sessions are never retroactively claimed.
+exact unit, and exact private target are absent. An absent owner-runtime marker is
+already clean; an exact marker may be unlinked only after its full path, owner,
+mode, type, protocol, nonce, PID, and start-time proof is revalidated and its
+recorded anchor is proven dead. Artifact probe errors, live exact anchors,
+mismatches, and partial presence remain ambiguous. Existing shared tmux/Zellij
+sessions are never retroactively claimed.
 
 Supervised tmux uses a private mode-`0700` runtime/socket directory and one server
 per logical session. Supervised Zellij uses an exact validated runtime directory,
 a mode-`0600` generated layout, and PTY file descriptors passed through D-Bus.
-Both launch the same owner-only one-shot workload-anchor protocol. Launch specs
+Both launch the same owner-only one-shot workload-anchor protocol. The hidden
+anchor starts with its random nonce already observable in `/proc`; it refuses to
+publish a marker until that exact process environment is verified. Launch specs
 and markers are constrained to `$XDG_RUNTIME_DIR/portagenty/workloads` with exact
 nonce filenames; marker protocol, nonce, PID, and start time are verified before
 unlink. Cleanup validates the exact runtime/path/nonce shape first. An absent
@@ -117,16 +126,7 @@ stripped before launch; a validated runtime directory and declared session env
 remain. Workspace commands are still user-authored code and execute with the
 user's permissions.
 
-Only explicit `kind = "claude-code"` selects Claude containment; names and
-commands do not. Claude-kind services request `claude-code.slice`,
-`ManagedOOMPreference=omit`, `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, CPU quota,
-and a finite per-service `TasksMax`. Portagenty first verifies that the externally managed aggregate
-slice exists beneath `/claude.slice/claude-code.slice` with finite positive
-`MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, consistent memory
-controls, and oomd-omit metadata. Aggregate `TasksMax` is optional and may remain
-infinity; Portagenty never creates or modifies that slice. Claude overrides may only tighten the standard `3G`/`5G`/`512MiB`/
-`800%`/`1200` policy. Generic sessions remain outside the Claude slice and receive
-no inferred defaults.
+Every supervised session kind receives the complete standard `3G`/`5G`/`512MiB`/`800%`/`1200` policy; incomplete current receipts remain exact-target attachable and non-force stoppable until restart but cannot expose owned metrics or force-kill. Only explicit `kind = "claude-code"` selects Claude containment; names and commands do not. Claude-kind services additionally request `claude-code.slice` and `ManagedOOMPreference=omit`. Portagenty first verifies that the externally managed aggregate slice exists beneath `/claude.slice/claude-code.slice` with finite positive `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and CPU quota, consistent memory controls, and oomd-omit metadata. Aggregate `TasksMax` is optional and may remain infinity; Portagenty never creates or modifies that slice. Claude overrides may only tighten the standard policy. Generic sessions remain outside the Claude slice but retain the same finite per-service baseline.
 
 `MemoryHigh` is a reclaim threshold; `MemoryMax` and `MemorySwapMax` are hard
 ceilings; CPU quota throttles aggregate CPU; `TasksMax` rejects new tasks. These
@@ -134,8 +134,9 @@ limits reduce damage but are not a data-safety guarantee. Ordinary stop performs
 exact multiplexer shutdown followed by revalidated non-force `StopUnit`;
 `SendSIGKILL=no` prevents implicit escalation. Whole-cgroup SIGKILL is a separate
 explicitly confirmed action available only for complete owned-and-verified v2
-containment. Bulk stop never force-escalates and skips legacy, split, pending,
-stale, and ambiguous targets.
+containment. Bulk stop may apply the same non-force path to owned, split, and
+current v2 incomplete-policy targets, but never signals external descendant scopes
+or force-escalates; legacy v1, pending, stale, and ambiguous targets remain skipped.
 
 Resource observation reads numeric cgroup files only. Portagenty does not inspect
 terminal contents, prompts, command output, or agent logs, and does not retain
