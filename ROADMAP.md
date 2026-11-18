@@ -454,8 +454,8 @@ The implementation includes:
   `/proc` start time, and cgroup evidence, plus bounded descendant traversal via
   `/proc/<pid>/task/<pid>/children` without a global process scan;
 - split-containment reporting when the root or descendants escape, including an
-  explicit external-bounded-scope explanation for `build-contained` descendants
-  beneath `agent-work.slice`; split rows may attach and use confirmed exact-target/
+  explicit external-bounded-scope explanation for descendants launched into
+  a separate resource-limited scope; split rows may attach and use confirmed exact-target/
   non-force service stop, but receive no whole-workload metrics or force-kill
   authority and never signal external scopes;
 - mixed receipt transition semantics: new launches write v2 evidence plus an

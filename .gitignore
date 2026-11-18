@@ -21,6 +21,7 @@ docs/.bun/
 docs/bun.lockb.bak
 
 # Misc
+/CLAUDE.local.md
 *.log
 .env
 .env.local

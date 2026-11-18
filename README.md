@@ -160,7 +160,7 @@ bacon test                   # watch loop
 cargo build --release        # release binary → target/release/pa
 ```
 
-CI runs `fmt`, `clippy -D warnings`, `nextest`, and `build` on Linux + macOS for every push and PR.
+See [Contributing](./CONTRIBUTING.md) for the prerequisites and checks to run before opening a pull request.
 
 ## Docs site
 
