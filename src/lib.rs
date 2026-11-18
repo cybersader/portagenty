@@ -75,6 +75,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             fresh,
         ),
         Some(Command::Resources(command)) => cli::resources(command),
+        Some(Command::Permissions(command)) => cli::permissions(command),
         Some(Command::List { workspace }) => cli::list(workspace.as_ref()),
         Some(Command::Export {
             workspace,

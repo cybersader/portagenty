@@ -1,8 +1,9 @@
 //! CLI parsing and one-shot subcommands. The bare `pa` invocation drops into
 //! the TUI; subcommands here are scriptable equivalents.
 
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -142,6 +143,10 @@ pub enum Command {
     /// Inspect and safely control Portagenty-owned resource containers.
     #[command(subcommand)]
     Resources(ResourcesCommand),
+    /// Experimental: review external permission requests for this workspace.
+    /// Requires the optional `agent-permissions-controller` on PATH.
+    #[command(subcommand)]
+    Permissions(PermissionsCommand),
     /// Print the currently-resolved workspace (name, multiplexer,
     /// sessions) to stdout.
     List {
@@ -335,6 +340,32 @@ pub enum Command {
         /// verbatim to `pconv`.
         #[arg(value_name = "PCONV_ARGS")]
         args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PermissionsCommand {
+    /// Print the existing canonical directories used for workspace review.
+    Roots {
+        /// Explicit path to a `*.portagenty.toml` file.
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+    },
+    /// Experimental: open the optional `agent-permissions-controller`,
+    /// filtered to this workspace.
+    Review {
+        /// Explicit path to a `*.portagenty.toml` file.
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Option<PathBuf>,
+        /// List matching requests without deciding any of them.
+        #[arg(long = "list")]
+        list: bool,
+        /// Further restrict review to one permission context id.
+        #[arg(long = "context")]
+        context: Option<String>,
+        /// Use an explicit permission store path.
+        #[arg(long = "store")]
+        store: Option<PathBuf>,
     },
 }
 
@@ -2487,6 +2518,172 @@ pub fn list(workspace: Option<&PathBuf>) -> Result<()> {
             s.cwd.display(),
             s.command
         )?;
+    }
+    Ok(())
+}
+
+// ─── pa permissions ─────────────────────────────────────────────────────
+
+pub fn permissions(command: PermissionsCommand) -> Result<()> {
+    match command {
+        PermissionsCommand::Roots { workspace } => permissions_roots(workspace.as_ref()),
+        PermissionsCommand::Review {
+            workspace,
+            list,
+            context,
+            store,
+        } => permissions_review(
+            workspace.as_ref(),
+            list,
+            context.as_deref(),
+            store.as_deref(),
+        ),
+    }
+}
+
+fn resolved_permission_roots(workspace: Option<&PathBuf>) -> Result<Vec<PathBuf>> {
+    let workspace_path = resolve_workspace_path(workspace)?;
+    let ws = load(&LoadOptions {
+        workspace_path: Some(workspace_path),
+        ..Default::default()
+    })?;
+    workspace_permission_roots(&ws)
+}
+
+fn workspace_permission_roots(ws: &Workspace) -> Result<Vec<PathBuf>> {
+    let candidates = ws
+        .projects
+        .iter()
+        .chain(ws.sessions.iter().map(|session| &session.cwd));
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    for candidate in candidates {
+        let canonical = std::fs::canonicalize(candidate).with_context(|| {
+            format!(
+                "workspace review root {} is missing or cannot be resolved",
+                candidate.display()
+            )
+        })?;
+        if !canonical.is_dir() {
+            bail!(
+                "workspace review root {} is not a directory",
+                candidate.display()
+            );
+        }
+        if seen.insert(canonical.clone()) {
+            roots.push(canonical);
+        }
+    }
+
+    if roots.is_empty() {
+        bail!(
+            "workspace {:?} declares no existing project paths or session working directories; \
+             refusing permission review without an explicit workspace root",
+            ws.name
+        );
+    }
+    Ok(roots)
+}
+
+fn print_permission_roots(out: &mut dyn Write, roots: &[PathBuf]) -> Result<()> {
+    writeln!(out, "workspace roots:")?;
+    for root in roots {
+        writeln!(out, "  {}", root.display())?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+pub fn permissions_roots(workspace: Option<&PathBuf>) -> Result<()> {
+    let roots = resolved_permission_roots(workspace)?;
+    print_permission_roots(&mut io::stdout().lock(), &roots)
+}
+
+fn build_permissions_controller_argv(
+    roots: &[PathBuf],
+    list: bool,
+    context: Option<&str>,
+    store: Option<&Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = vec![std::ffi::OsString::from("--terminal")];
+    for root in roots {
+        args.push(std::ffi::OsString::from("--workspace-root"));
+        args.push(root.as_os_str().to_owned());
+    }
+    if list {
+        args.push(std::ffi::OsString::from("--list"));
+    }
+    if let Some(context) = context {
+        args.push(std::ffi::OsString::from("--context"));
+        args.push(std::ffi::OsString::from(context));
+    }
+    if let Some(store) = store {
+        args.push(std::ffi::OsString::from("--store"));
+        args.push(store.as_os_str().to_owned());
+    }
+    args
+}
+
+fn child_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
+}
+
+pub fn permissions_review(
+    workspace: Option<&PathBuf>,
+    list: bool,
+    context: Option<&str>,
+    store: Option<&Path>,
+) -> Result<()> {
+    if !list && !io::stdin().is_terminal() {
+        bail!(
+            "interactive permission review requires a real TTY on stdin; \
+             use `pa permissions review --list` for read-only output"
+        );
+    }
+
+    let roots = resolved_permission_roots(workspace)?;
+    // stderr, so piped `--list` output contains only the controller's output.
+    print_permission_roots(&mut io::stderr().lock(), &roots)?;
+    let args = build_permissions_controller_argv(&roots, list, context, store);
+    let status = match std::process::Command::new("agent-permissions-controller")
+        .args(&args)
+        .status()
+    {
+        Ok(status) => status,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "`agent-permissions-controller` was not found on PATH. Install the reviewed \
+                 portable permission core before using `pa permissions review`; no unfiltered \
+                 fallback was attempted."
+            ));
+        }
+        Err(err) => {
+            return Err(anyhow::Error::from(err)
+                .context("spawning `agent-permissions-controller` for workspace-scoped review"));
+        }
+    };
+
+    if !status.success() {
+        let code = child_exit_code(status);
+        if code == 2 {
+            eprintln!(
+                "permission controller rejected the workspace-scoped arguments. Install a \
+                 controller version that supports repeatable `--workspace-root`; no unfiltered \
+                 fallback was attempted."
+            );
+        }
+        std::process::exit(code);
     }
     Ok(())
 }
