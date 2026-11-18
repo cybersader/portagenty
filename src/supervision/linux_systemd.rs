@@ -2655,7 +2655,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(raw: &str) -> Result<Vec<u8>> {
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         bail!("invocation id has an odd number of hexadecimal digits");
     }
     raw.as_bytes()

@@ -890,7 +890,7 @@ impl SearchState {
     pub fn tick_animation(&mut self) {
         self.anim_tick = self.anim_tick.wrapping_add(1);
         // Advance 1 character every 2 ticks (= every 0.5s).
-        if self.anim_tick % 2 == 0 {
+        if self.anim_tick.is_multiple_of(2) {
             self.anim_offset += 1;
         }
     }
