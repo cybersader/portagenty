@@ -1273,6 +1273,7 @@ impl App {
                     "x: receipt-backed resource control is unsupported on this platform",
                 );
             }
+            #[cfg(target_os = "linux")]
             RowOwnership::LegacyRestartRequired => {
                 let Some(logical_id) = row.logical_id.clone() else {
                     self.set_status("x: restart-required row is missing its logical identity");
@@ -1296,6 +1297,7 @@ impl App {
                     allow_restart_required: true,
                 });
             }
+            #[cfg(target_os = "linux")]
             RowOwnership::SplitContainment => {
                 let Some(logical_id) = row.logical_id.clone() else {
                     self.set_status("x: split row is missing its logical identity");
@@ -1312,6 +1314,12 @@ impl App {
                     allow_split: true,
                     allow_restart_required: false,
                 });
+            }
+            #[cfg(not(target_os = "linux"))]
+            RowOwnership::LegacyRestartRequired | RowOwnership::SplitContainment => {
+                self.set_status(
+                    "x: receipt-backed resource control is unsupported on this platform",
+                );
             }
             RowOwnership::Pending => {
                 self.set_status(
