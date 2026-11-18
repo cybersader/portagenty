@@ -2655,14 +2655,16 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(raw: &str) -> Result<Vec<u8>> {
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         bail!("invocation id has an odd number of hexadecimal digits");
     }
     raw.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = hex_nibble(pair[0])?;
-            let low = hex_nibble(pair[1])?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| {
+            let high = hex_nibble(high)?;
+            let low = hex_nibble(low)?;
             Ok((high << 4) | low)
         })
         .collect()
