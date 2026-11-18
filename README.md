@@ -15,7 +15,7 @@ Hop between devices with `pa claim`. Single static Rust binary.
 
 ---
 
-> **v1.x feature-complete and usable daily.** See [what shipped](#whats-shipped) below and [ROADMAP.md](./ROADMAP.md) for what's next.
+> **Maintenance mode.** v1.x is feature-complete and still works. It gets bug fixes and dependency updates; no new features are planned. See [what shipped](#whats-shipped) below.
 
 ## The problem
 

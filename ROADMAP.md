@@ -1,5 +1,7 @@
 # portagenty — ROADMAP
 
+> **Status (2026-11): maintenance mode.** Portagenty is maintained with bug fixes and dependency updates. The unshipped items below are kept as a record and are not planned work.
+
 A sequence, not a promise. Each tier is roughly prioritized top-to-bottom; expect reshuffling as reality intrudes.
 
 Companion to [README.md](./README.md) and [DESIGN.md](./DESIGN.md).
@@ -307,6 +309,8 @@ real projects:
       the flag never overwrites user customizations.
 
 ### Still to ship (rough priority order)
+
+Not planned while the project is in maintenance mode (see the status note at the top).
 
 2. ~~**WezTerm adapter.**~~ **Deferred / not-the-right-fit.** WezTerm
    has a mux subsystem, but it's built around the GUI terminal
