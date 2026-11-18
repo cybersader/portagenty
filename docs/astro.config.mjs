@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig } from "astro/config";
+import { unified } from "@astrojs/markdown-remark";
 import starlight from "@astrojs/starlight";
 import starlightImageZoom from "starlight-image-zoom";
 import starlightThemeFlexoki from "starlight-theme-flexoki";
@@ -11,6 +12,8 @@ export default defineConfig({
   // public URL for when the project goes public; harmless if unused.
   site: "https://cybersader.github.io",
   base: "/portagenty",
+  // Image zoom needs the unified pipeline, not Astro 7's default Sätteri.
+  markdown: { processor: unified() },
   vite: {
     server: {
       // Allow access from Docker / Tailscale / LAN / cross-machine previews.
@@ -43,7 +46,7 @@ export default defineConfig({
       sidebar: [
         {
           label: "Getting started",
-          autogenerate: { directory: "getting-started" },
+          items: [{ autogenerate: { directory: "getting-started" } }],
         },
         {
           label: "Features",
@@ -51,11 +54,11 @@ export default defineConfig({
         },
         {
           label: "Concepts",
-          autogenerate: { directory: "concepts" },
+          items: [{ autogenerate: { directory: "concepts" } }],
         },
         {
           label: "Reference",
-          autogenerate: { directory: "reference" },
+          items: [{ autogenerate: { directory: "reference" } }],
         },
       ],
     }),
