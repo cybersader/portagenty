@@ -125,6 +125,7 @@ pa                        # open the TUI
 | **Resource supervision (experimental, Linux only)** | Enter is supervision-first for idle UUID-backed TUI rows. Only `kind = "claude-code"` selects Claude policy: `3G` MemoryHigh, `5G` MemoryMax, `512MiB` MemorySwapMax, `800%` CPU, finite per-service `1200` TasksMax, and placement beneath a pre-provisioned `claude-code.slice` whose aggregate TasksMax may remain unlimited; names and commands never imply it. Current v2 receipts prove the workload root by PID/start-time/nonce, exact tmux/Zellij target, and bounded all-thread descendant cgroup checks. Pending launches block fallback and control until reconciled; `pa resources cleanup` removes only proven-dead evidence without signalling. Legacy v1 services are exact-target attach-only until a normal restart; current v2 incomplete-policy services may stop non-force but remain metrics/force-kill restricted. Escaped descendants are reported as split containment, withholding whole-workload metrics and force-kill while still allowing confirmed row-scoped or workspace-wide exact-target/non-force service stop that never signals external scopes. `S` edits equal-or-stricter Claude limits. Ordinary live sessions are never claimed or migrated. No daemon or history service. |
 | **Workspace scoping** | Session names prefixed with workspace name in the mpx (`my-project-shell`). Auto-re-register on walk-up (folder move resilience). Auto-maintained `previous_paths` when moves are detected. |
 | **Portaconv integration** | `pa convos list` / `pa convos dump <id>` forwards to [portaconv](https://github.com/cybersader/portaconv) scoped to this workspace. `pa init --with-agent-hooks` scaffolds `.mcp.json` + `.claude/` so agents self-discover the conversation extractor. |
+| **Permission review** | `pa permissions roots` prints canonical existing roots from a workspace's configured projects and merged session working directories. `pa permissions review` opens the separately installed human controller with fixed workspace filters; `--list`, `--context`, and `--store` are the only forwarded options. Portagenty never approves, prepares, renews, or falls back to unfiltered review. |
 | **Extras** | Declarative export (`pa export`), onboarding wizard, shell completions, bundled bash snippets, per-session env vars. |
 
 A setup failure before the multiplexer client starts reopens the same workspace and logical session row instead of dropping back to the picker or shell. Once a client actually runs and returns—normally, nonzero, by signal, or because the user was forced out—Portagenty prints the human `workspace / session` identity before any abnormal-exit diagnostics.
@@ -147,7 +148,7 @@ These launches also use `env -u … bash -c …` at the workload boundary to rem
 ## What it is not
 
 - Not a VS Code extension. Not a browser app. Not a Portagenty daemon. Experimental Linux supervision delegates workload lifetime to the existing systemd user manager.
-- Not an agent framework. It launches agents; it does not replace them.
+- Not an agent framework or permission authority. It launches agents and can map workspace roots into an external human controller; it does not replace either system or make approval decisions.
 - Not a project scaffolder (workspace scaffolding is built in; project-level is someone else's job).
 - Not tied to one multiplexer.
 

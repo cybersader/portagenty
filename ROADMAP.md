@@ -305,6 +305,14 @@ real projects:
       extraction capabilities + the workspace contract without the
       user explaining. Existing files are skipped, so re-running
       the flag never overwrites user customizations.
+- **Workspace-scoped permission review.** `pa permissions roots`
+  resolves canonical existing directories from configured projects and
+  merged session working directories. `pa permissions review` passes
+  those roots through fixed argv to the optional human-operated
+  `agent-permissions-controller`; only list, context, and store filters
+  are accepted. There is no approval, store creation, arbitrary
+  passthrough, unfiltered fallback, workspace mutation, or UUID
+  migration in Portagenty.
 
 ### Still to ship (rough priority order)
 

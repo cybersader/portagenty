@@ -400,6 +400,19 @@ The net effect: a TUI that feels generous on a desktop but remains one-handed-on
   pconv — missing binary is a clear install hint, not a silent
   no-op.
 
+- **`pa permissions` bridge.** `roots` and `review` load the ordinary
+  merged workspace through the read-only config path. The review roots
+  are the ordered, exactly de-duplicated canonical existing project
+  paths followed by explicit merged session working directories. There
+  is no cwd, home, UUID, picker, or registration fallback. `review`
+  starts the optional external `agent-permissions-controller` with a
+  fixed argv containing `--terminal` and generated repeatable
+  `--workspace-root` values; only `--list`, `--context`, and `--store`
+  can follow. Real stdio and child status are preserved. Interactive use
+  requires a real stdin TTY, and a missing or older controller fails
+  without opening unfiltered review. Portagenty maps workspace facts; it
+  never prepares, decides, grants, renews, or edits permission state.
+
 ### What portagenty does NOT do
 
 portagenty does not read, write, or sync Claude Code's conversation
