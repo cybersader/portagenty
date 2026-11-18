@@ -26,8 +26,8 @@ name under `~/.claude/projects/`. Same project, two buckets:
 
 | Launch surface | CWD Claude Code sees | Encoded directory |
 |----------------|----------------------|-------------------|
-| WSL bash | `/mnt/c/Users/Cybersader/Documents/…/proj` | `-mnt-c-Users-Cybersader-Documents-…-proj` |
-| PowerShell / Windows | `C:\Users\Cybersader\Documents\…\proj` | `C--Users-Cybersader-Documents-…-proj` |
+| WSL bash | `/mnt/c/Users/<user>/Documents/…/proj` | `-mnt-c-Users-<user>-Documents-…-proj` |
+| PowerShell / Windows | `C:\Users\<user>\Documents\…\proj` | `C--Users-<user>-Documents-…-proj` |
 
 ### 1b. The deep problem: paths are baked into conversation content
 

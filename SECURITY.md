@@ -70,8 +70,8 @@ root cgroup agreement. Descendants are followed only through bounded
 `/proc/<pid>/task/<tid>/children` traversal for every thread ID; there is no global `/proc` scan.
 Traversal and symlink escapes from `/sys/fs/cgroup` are rejected. An escaped root
 cannot become owned. Escaped descendants produce split containment, withholding
-whole-workload metrics and control; a `build-contained` descendant in
-`agent-work.slice` is identified as an external bounded scope rather than claimed.
+whole-workload metrics and control; a descendant launched into a separate
+resource-limited scope is identified as an external bounded scope rather than claimed.
 
 TUI ownership reconciliation runs off the render thread with a hard per-sample deadline and explicit cancellation. A timeout, cancellation, worker failure, or unreadable external evidence produces an actionable fail-closed row rather than authorizing stale cleanup, ordinary creation, attach fallback, or control. Automatic sampling remains blocked after a timeout until the user retries; completion and interruption reload the machine-local evidence when it changed, so external signal-free cleanup can return the row to idle without weakening partial-presence ambiguity.
 
