@@ -400,7 +400,8 @@ The net effect: a TUI that feels generous on a desktop but remains one-handed-on
   pconv — missing binary is a clear install hint, not a silent
   no-op.
 
-- **`pa permissions` bridge.** `roots` and `review` load the ordinary
+- **`pa permissions` bridge (experimental).** The controller is an
+  optional external tool, not publicly distributed yet. `roots` and `review` load the ordinary
   merged workspace through the read-only config path. The review roots
   are the ordered, exactly de-duplicated canonical existing project
   paths followed by explicit merged session working directories. There

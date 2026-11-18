@@ -143,7 +143,8 @@ pub enum Command {
     /// Inspect and safely control Portagenty-owned resource containers.
     #[command(subcommand)]
     Resources(ResourcesCommand),
-    /// Review external permission requests attributed to this workspace.
+    /// Experimental: review external permission requests for this workspace.
+    /// Requires the optional `agent-permissions-controller` on PATH.
     #[command(subcommand)]
     Permissions(PermissionsCommand),
     /// Print the currently-resolved workspace (name, multiplexer,
@@ -350,7 +351,8 @@ pub enum PermissionsCommand {
         #[arg(short = 'w', long = "workspace")]
         workspace: Option<PathBuf>,
     },
-    /// Open the native human controller filtered to this workspace.
+    /// Experimental: open the optional `agent-permissions-controller`,
+    /// filtered to this workspace.
     Review {
         /// Explicit path to a `*.portagenty.toml` file.
         #[arg(short = 'w', long = "workspace")]

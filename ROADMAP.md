@@ -305,7 +305,7 @@ real projects:
       extraction capabilities + the workspace contract without the
       user explaining. Existing files are skipped, so re-running
       the flag never overwrites user customizations.
-- **Workspace-scoped permission review.** `pa permissions roots`
+- **Workspace-scoped permission review (experimental).** `pa permissions roots`
   resolves canonical existing directories from configured projects and
   merged session working directories. `pa permissions review` passes
   those roots through fixed argv to the optional human-operated
